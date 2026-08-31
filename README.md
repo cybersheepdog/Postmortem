@@ -1,4 +1,4 @@
-# bec_hunt
+# Postmortem
 
 **A forensic analyzer for Business Email Compromise (BEC) and phishing incidents.**
 
