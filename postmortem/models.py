@@ -131,6 +131,28 @@ class EmailRecord:
     scenario_reasons: list[str] = field(default_factory=list)
     tier: int = 3
 
+    # Header-hygiene / spoofing-alignment signals, computed from parsed headers.
+    # Deliberately weak (low weight): legitimate ESP-relayed mail trips the
+    # alignment checks, so these corroborate rather than convict on their own.
+    received_chain_anomaly: bool = False
+    received_chain_note: str = ""
+    message_id_mismatch: bool = False
+    date_anomaly: bool = False
+    date_anomaly_note: str = ""
+    dkim_domain_mismatch: bool = False
+    return_path_mismatch: bool = False
+    random_local_part: bool = False       # high-entropy sender local-part
+    bulk_mail: bool = False               # List-Unsubscribe / Precedence:bulk
+    newly_registered_domain: bool = False  # RDAP: sender domain registered recently
+    sender_domain_age_days: int = -1      # -1 = unknown/not checked
+
+    # Geolocation / ASN of the originating IP (populated only with --geoip-db).
+    origin_country: str = ""
+    origin_asn: str = ""
+    origin_org: str = ""
+    suspicious_geo: bool = False          # hop in an unexpected country
+    high_abuse_host: bool = False         # ASN/org matches a high-abuse hoster
+
     # Evidence provenance (chain of custody per finding). One dict per named
     # finding: {signal, category, source, matched, weight, severity}. Rebuilt
     # every run alongside `indicators`, never trusted from cache.

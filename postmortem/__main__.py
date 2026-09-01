@@ -167,6 +167,7 @@ from postmortem.scoring import (  # noqa: E402
 # ============================================================================
  
 from postmortem.clustering import build_campaign_clusters  # noqa: E402
+from postmortem.utils import registered_domain_approx  # noqa: E402
 # ============================================================================
 # ATTACK TIMELINE / PRECURSOR VERDICT
 # ============================================================================
@@ -497,7 +498,22 @@ from postmortem.reporting import (  # noqa: E402
     print_summary, print_initial_compromise, print_campaigns,
     print_run_manifest, build_run_manifest, generate_html_interactive,
     write_json, write_csv, print_attack_narrative, print_audit_summary,
+    print_top_domains, top_flagged_domains,
 )
+from postmortem import term  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def phase(label):
+    """Announce a potentially slow phase and report how long it took, so the
+    console never looks hung during clustering, deep analysis, geo/RDAP, etc."""
+    print(term.c(f">> {label}...", "cyan"))
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        print(term.c(f"   done: {label} ({time.monotonic() - start:.1f}s)", "green", "dim"))
 
 
 def _merge_audit_anchors(anchors, audit_summary):
@@ -692,6 +708,13 @@ def main():
         action="store_true",
         help="Ignore any existing cached results and re-parse every message fresh",
     )
+
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color in the console output (auto-disabled when not "
+             "a terminal or when NO_COLOR is set).",
+    )
  
     parser.add_argument(
         "--content-hash",
@@ -796,8 +819,70 @@ def main():
              "attacker IP/address/domain, rule keywords) are derived from it "
              "automatically and its attacker actions become confirmed evidence.",
     )
+    anchor_group.add_argument(
+        "--allowlist",
+        action="append",
+        metavar="DOMAIN",
+        help="Known-good sending domain(s) whose weak header-hygiene noise "
+             "(chronic auth failure, thin Received chain, missing Date) is "
+             "suppressed -- only when the message shows no active spoofing "
+             "signal. Alignment/impersonation/content checks are never "
+             "suppressed. Repeatable/comma-separated.",
+    )
+
+    parser.add_argument(
+        "--fail-on-tier",
+        type=int,
+        default=0,
+        metavar="N",
+        help="CI gating: exit with code 3 if any message lands in review tier N "
+             "or higher (1=prime suspects, 2=+secondary). Default 0 = always "
+             "exit 0 on a successful scan.",
+    )
+
+    enrich = parser.add_argument_group(
+        "optional enrichment",
+        "Opt-in passes over the Tier 1/2 suspects; some need extra packages or "
+        "network access.")
+    enrich.add_argument(
+        "--check-domain-age",
+        nargs="?", type=int, const=90, default=None, metavar="DAYS",
+        help="ONLINE: query RDAP for each suspect sender domain's registration "
+             "date and flag domains registered within DAYS of the message "
+             "(default 90). Results are cached on disk. Off unless given.",
+    )
+    enrich.add_argument(
+        "--yara-rules",
+        type=Path, metavar="FILE",
+        help="Scan suspect attachments with these compiled/uncompiled YARA "
+             "rules (needs the yara-python package; skipped with a warning if "
+             "absent).",
+    )
+    enrich.add_argument(
+        "--scan-qr",
+        action="store_true",
+        help="Decode QR codes in suspect image attachments and analyze the "
+             "linked URLs (needs pyzbar + Pillow; skipped with a warning if "
+             "absent).",
+    )
+    enrich.add_argument(
+        "--geoip-db",
+        action="append", type=Path, metavar="FILE",
+        help="Local MaxMind GeoLite2 .mmdb (City/Country and/or ASN). "
+             "Geolocates originating/Received IPs of suspects; repeatable. "
+             "Offline; needs the 'maxminddb' reader.",
+    )
+    enrich.add_argument(
+        "--expected-countries",
+        metavar="CC[,CC...]",
+        help="ISO country codes the org normally sends/receives from (e.g. "
+             "US,GB). With --geoip-db, a hop outside this set is flagged as "
+             "suspicious geography.",
+    )
 
     args = parser.parse_args()
+
+    term.set_enabled(not args.no_color and term.supports_color())
 
     run_started = time.monotonic()
 
@@ -1327,8 +1412,8 @@ def main():
     for record in records:
         record.attack_stage = classify_attack_stage(record)
 
-    print("Building indexed evidence relationships")
-    evidence_indexes = v6_build_indexes(records)
+    with phase("Building indexed evidence relationships"):
+        evidence_indexes = v6_build_indexes(records)
 
  
     # ------------------------------------------------------------------
@@ -1348,15 +1433,11 @@ def main():
     # ------------------------------------------------------------------
  
     print()
-    print(
-        "Clustering related messages..."
-    )
- 
-    campaigns = build_campaign_clusters(
-        records,
-        threshold=args.campaign_threshold,
-    )
- 
+    with phase("Clustering related messages"):
+        campaigns = build_campaign_clusters(
+            records,
+            threshold=args.campaign_threshold,
+        )
     print(
         f"Identified {len(campaigns)} "
         f"multi-message campaign(s)."
@@ -1382,12 +1463,61 @@ def main():
             audit_summary.pop("_compromise_dt", None)
             print_audit_summary(audit_summary)
 
+    allowlist = []
+    for value in (args.allowlist or []):
+        allowlist.extend(
+            registered_domain_approx(part.strip())
+            for part in str(value).split(",") if part.strip()
+        )
     scenario, scenario_reason, initial_verdict = run_scenario_analysis(
-        records, internal_domains, anchors, audit_summary
+        records, internal_domains, anchors, audit_summary, allowlist=allowlist
     )
     if audit_summary:
         initial_verdict["audit_log"] = audit_summary
     print(f"Scenario profile:  {scenario} ({scenario_reason})")
+
+    # Optional enrichment passes over the Tier 1/2 suspects. Each annotates and
+    # can promote a confirmed hit to Tier 1; run before IOC/clustering/reporting.
+    enriched = False
+    if getattr(args, "check_domain_age", None) is not None:
+        from postmortem.netcheck import DomainAgeChecker, annotate_records
+        with phase("Domain-age lookups (RDAP, online)"):
+            checker = DomainAgeChecker(
+                cache_path=scan_root / ".postmortem_domain_cache.json")
+            n = annotate_records(records, checker, args.check_domain_age)
+        print(f"Domain-age (RDAP): {n} newly-registered sender domain(s) "
+              f"(< {args.check_domain_age}d)")
+        enriched = enriched or bool(n)
+    if getattr(args, "yara_rules", None):
+        from postmortem.yara_scan import scan_records as yara_scan
+        with phase("YARA scan of suspect attachments"):
+            n = yara_scan(records, args.yara_rules)
+        print(f"YARA: {n} attachment match(es)")
+        enriched = enriched or bool(n)
+    if getattr(args, "scan_qr", False):
+        from postmortem.qr_scan import scan_records as qr_scan
+        with phase("QR-code decode of suspect images"):
+            n = qr_scan(records)
+        print(f"QR scan: {n} QR-code URL(s) in image attachments")
+        enriched = enriched or bool(n)
+    if getattr(args, "geoip_db", None):
+        from postmortem.geoip import GeoResolver, annotate_records as geo_annotate
+        from postmortem.config import CONFIG as _CFG
+        with phase("GeoIP / ASN lookups"):
+            resolver = GeoResolver(args.geoip_db)
+            geo_n = host_n = 0
+            if resolver.available():
+                expected = [c for c in (args.expected_countries or "").split(",") if c.strip()]
+                geo_n, host_n = geo_annotate(
+                    records, resolver, expected, _CFG.get("high_abuse_asn_keywords", []))
+                resolver.close()
+        if resolver.available():
+            print(f"GeoIP: {geo_n} suspicious-geography, {host_n} "
+                  f"high-abuse-hosting message(s)")
+            enriched = enriched or bool(geo_n or host_n)
+    if enriched:
+        initial_verdict["tier_counts"] = {
+            t: sum(1 for r in records if r.tier == t) for t in (1, 2, 3)}
 
     # Pivot-ready indicators of compromise from the Tier 1/2 suspects.
     iocs = extract_iocs(records)
@@ -1435,6 +1565,8 @@ def main():
 
     print_attack_narrative(initial_verdict.get("attack_narrative"))
 
+    print_top_domains(top_flagged_domains(records))
+
     print_campaigns(
         campaigns,
         records,
@@ -1444,17 +1576,17 @@ def main():
 
     if args.output:
 
-        generate_html_interactive(
-            records,
-            campaigns,
-            args.output,
-            timeline,
-            precursor_verdict,
-            initial_verdict,
-            limit=args.html_limit,
-        )
+        with phase("Generating interactive HTML report"):
+            generate_html_interactive(
+                records,
+                campaigns,
+                args.output,
+                timeline,
+                precursor_verdict,
+                initial_verdict,
+                limit=args.html_limit,
+            )
 
-        print()
         print(
             f"HTML report written to: "
             f"{args.output}"
@@ -1494,6 +1626,17 @@ def main():
         print(
             f"IOC list ({len(iocs)} indicators) written to: {args.ioc}"
         )
+
+    # CI gating: exit non-zero (3) when suspects meet the requested tier.
+    if args.fail_on_tier:
+        flagged = sum(1 for r in records if r.tier <= args.fail_on_tier)
+        if flagged:
+            print(
+                f"\n[fail-on-tier] {flagged} message(s) at tier <= "
+                f"{args.fail_on_tier}; exiting 3 for CI gating.",
+                file=sys.stderr,
+            )
+            return 3
 
     return 0
  

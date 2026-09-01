@@ -25,13 +25,75 @@ from postmortem.utils import (
     normalize_email, domain_of, normalize_message_id, clean_text,
 )
 from postmortem.urls import (
-    extract_urls, extract_url_domains, analyze_url, HTML_HREF_RE, HTML_LINK_RE,
+    extract_urls, extract_url_domains, analyze_url, HTML_LINK_RE,
 )
 
 EMAIL_RE = re.compile(
     r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
     re.I,
 )
+
+# BeautifulSoup gives more robust HTML handling (malformed markup, entities,
+# attribute quirks) than regex. Optional: fall back to regex when it is absent.
+try:
+    from bs4 import BeautifulSoup as _BeautifulSoup
+except Exception:
+    _BeautifulSoup = None
+
+
+def html_to_text(html: str) -> str:
+    """HTML -> readable text. Uses BeautifulSoup when available; else strips
+    <script>/<style> and tags with regex (the historical behavior)."""
+    if _BeautifulSoup is not None:
+        try:
+            soup = _BeautifulSoup(html, "html.parser")
+            for tag in soup(("script", "style")):
+                tag.decompose()
+            return clean_text(soup.get_text(" "))
+        except Exception:
+            pass
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return clean_text(text)
+
+
+def html_links(html: str):
+    """Yield (href, visible_text) for anchors in HTML. BeautifulSoup when
+    available (catches links the regex misses); else the regex fallback."""
+    if _BeautifulSoup is not None:
+        try:
+            soup = _BeautifulSoup(html, "html.parser")
+            out = []
+            for a in soup.find_all("a"):
+                href = (a.get("href") or "").strip()
+                if href:
+                    out.append((unquote(href), a.get_text(" ").strip()))
+            return out
+        except Exception:
+            pass
+    out = []
+    for match in HTML_LINK_RE.finditer(html):
+        href = unquote(match.group(2).strip())
+        visible = clean_text(re.sub(r"(?s)<[^>]+>", " ", match.group(3)))
+        if href:
+            out.append((href, visible))
+    return out
+
+
+def html_has_login_form(html: str) -> bool:
+    """True if the HTML contains a form or a password input."""
+    if _BeautifulSoup is not None:
+        try:
+            soup = _BeautifulSoup(html, "html.parser")
+            if soup.find("form"):
+                return True
+            return any((i.get("type") or "").lower() == "password"
+                       for i in soup.find_all("input"))
+        except Exception:
+            pass
+    low = html.lower()
+    return "<form" in low or bool(re.search(r'type\s*=\s*["\']?\s*password', low))
 
 
 def safe_decode(payload: bytes, charset: Optional[str]) -> str:
@@ -127,29 +189,8 @@ def extract_body(message) -> str:
         )
  
     if html_parts:
- 
-        text = "\n\n".join(html_parts)
- 
-        text = re.sub(
-            r"(?is)<script.*?>.*?</script>",
-            " ",
-            text,
-        )
- 
-        text = re.sub(
-            r"(?is)<style.*?>.*?</style>",
-            " ",
-            text,
-        )
- 
-        text = re.sub(
-            r"(?s)<[^>]+>",
-            " ",
-            text,
-        )
- 
-        return clean_text(text)
- 
+        return html_to_text("\n\n".join(html_parts))
+
     return ""
  
  
@@ -169,10 +210,46 @@ def extract_addresses(header_value: str) -> list[str]:
     return results
  
  
+# A run of base64 alphabet long enough to plausibly hide a URL, bounded so we
+# don't try to decode every long token in the body.
+_B64_BLOB_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{24,1024}={0,2}(?![A-Za-z0-9+/=])")
+_DATA_URI_RE = re.compile(r"data:[^;\s,]+;base64,[A-Za-z0-9+/=\s]+", re.I)
+
+
+def decode_base64_urls(text: str) -> list[str]:
+    """Find base64-looking blobs in body text, decode them, and return any URLs
+    they contain. Inline ``data:...;base64,...`` images are excluded (they are
+    the main source of false positives)."""
+    if not text:
+        return []
+    scrubbed = _DATA_URI_RE.sub(" ", text)
+    found = []
+    for m in _B64_BLOB_RE.finditer(scrubbed):
+        blob = m.group(0)
+        if len(blob) % 4:
+            continue
+        try:
+            decoded = base64.b64decode(blob, validate=True).decode("utf-8", "ignore")
+        except ValueError:  # binascii.Error subclasses ValueError
+            continue
+        for url in extract_urls(decoded):
+            if url not in found:
+                found.append(url)
+    return found
+
+
 def extract_url_analysis(message, subject: str, body: str) -> tuple[list[str], list[dict]]:
     urls = extract_urls(f"{subject}\n{body}")
     details = [analyze_url(u, "text") for u in urls]
     discovered = list(urls)
+    # Base64-obfuscated URLs hidden in the body (evades plain link scans).
+    for url in decode_base64_urls(body):
+        if url not in discovered:
+            discovered.append(url)
+            item = analyze_url(url, "base64_body")
+            item.setdefault("flags", []).append("URL recovered from base64-encoded body text")
+            item["risk_score"] = int(item.get("risk_score", 0)) + 4
+            details.append(item)
     parts = message.walk() if message.is_multipart() else [message]
     for part in parts:
         if part.get_content_type() != "text/html" or part.get_content_disposition() == "attachment": continue
@@ -180,17 +257,18 @@ def extract_url_analysis(message, subject: str, body: str) -> tuple[list[str], l
         except Exception: payload = None
         if not payload: continue
         html_text = safe_decode(payload, part.get_content_charset())
-        for match in HTML_HREF_RE.finditer(html_text):
-            href = unquote(match.group(2).strip())
-            if not href: continue
+        # BeautifulSoup-backed link extraction (falls back to regex). Captures
+        # both the href and its visible text, so a displayed-vs-actual hostname
+        # mismatch (classic phishing) is surfaced.
+        for href, visible in html_links(html_text):
+            if not href:
+                continue
+            displayed = extract_urls(visible)
             if href not in discovered:
-                discovered.append(href); details.append(analyze_url(href, "html_href"))
- 
-        for match in HTML_LINK_RE.finditer(html_text):
-            href = unquote(match.group(2).strip())
-            visible_text = clean_text(re.sub(r"(?s)<[^>]+>", " ", match.group(3)))
-            displayed = extract_urls(visible_text)
-            if href and displayed:
+                discovered.append(href)
+                details.append(analyze_url(href, "html_href",
+                                           displayed[0] if displayed else ""))
+            elif displayed:
                 target = next((item for item in details if item.get("url") == href), None)
                 if target:
                     target.update(analyze_url(href, "html_href", displayed[0]))
@@ -286,12 +364,117 @@ _MACRO_EXTENSIONS = (".docm", ".xlsm", ".pptm", ".dotm", ".xltm", ".potm", ".xla
 _ATTACH_INSPECT_MAX = 30 * 1024 * 1024
 
 
+# Magic-byte signatures -> a coarse content category. Order matters only in that
+# more specific signatures are listed; matching is by longest-prefix intent.
+_MAGIC_SIGNATURES = (
+    (b"MZ", "pe_executable"),
+    (b"\x7fELF", "elf_executable"),
+    (b"%PDF", "pdf"),
+    (b"PK\x03\x04", "zip"), (b"PK\x05\x06", "zip"), (b"PK\x07\x08", "zip"),
+    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "ole"),
+    (b"Rar!\x1a\x07", "rar"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"\x1f\x8b", "gzip"),
+    (b"GIF87a", "gif"), (b"GIF89a", "gif"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"BM", "bmp"),
+)
+
+# Content categories that are executable/script-like regardless of extension.
+_EXECUTABLE_KINDS = {"pe_executable", "elf_executable", "script"}
+
+# Extension -> the content category (or categories) it should confidently be.
+# Extensions without a confident mapping are never flagged (conservative).
+_EXT_EXPECTED_KIND = {
+    ".pdf": {"pdf"},
+    ".zip": {"zip"}, ".jar": {"zip"}, ".apk": {"zip"},
+    ".docx": {"zip"}, ".xlsx": {"zip"}, ".pptx": {"zip"},
+    ".docm": {"zip"}, ".xlsm": {"zip"}, ".pptm": {"zip"},
+    ".doc": {"ole"}, ".xls": {"ole"}, ".ppt": {"ole"}, ".msg": {"ole"},
+    ".png": {"png"}, ".jpg": {"jpeg"}, ".jpeg": {"jpeg"},
+    ".gif": {"gif"}, ".bmp": {"bmp"},
+    ".rar": {"rar"}, ".7z": {"7z"}, ".gz": {"gzip"}, ".tgz": {"gzip"},
+    ".exe": {"pe_executable"}, ".dll": {"pe_executable"}, ".scr": {"pe_executable"},
+}
+
+
+# Extensions that are dangerous to find *inside* an archive attachment.
+_ARCHIVE_DANGEROUS_EXT = {
+    ".exe", ".scr", ".com", ".pif", ".bat", ".cmd", ".js", ".jse", ".vbs",
+    ".vbe", ".wsf", ".wsh", ".hta", ".lnk", ".ps1", ".jar", ".msi", ".dll",
+    ".cpl", ".reg",
+}
+_NESTED_ARCHIVE_EXT = {".zip", ".7z", ".rar", ".gz", ".iso", ".img", ".cab"}
+
+
+def _inspect_archive_names(names, info, flags):
+    """Flag dangerous / nested entries listed inside an archive (no extraction)."""
+    entries = [n for n in names if not n.endswith("/")]
+    info["archive_entries"] = entries[:50]
+    danger = sorted({Path(n).suffix.lower() for n in entries
+                     if Path(n).suffix.lower() in _ARCHIVE_DANGEROUS_EXT})
+    nested = sorted({Path(n).suffix.lower() for n in entries
+                     if Path(n).suffix.lower() in _NESTED_ARCHIVE_EXT})
+    if danger:
+        info["archive_threat"] = True
+        flags.append("archive contains executable/script files: " + ", ".join(danger))
+    if nested:
+        flags.append("archive contains nested archive(s): " + ", ".join(nested))
+
+
+def _inspect_archive_generic(lower_name, payload, info, flags):
+    """Peek inside .7z/.rar when the optional reader is installed; else note it."""
+    names = None
+    try:
+        if lower_name.endswith(".7z"):
+            import py7zr
+            with py7zr.SevenZipFile(io.BytesIO(payload)) as archive:
+                names = archive.getnames()
+        elif lower_name.endswith(".rar"):
+            import rarfile
+            with rarfile.RarFile(io.BytesIO(payload)) as archive:
+                names = archive.namelist()
+    except Exception:
+        names = None
+    if names:
+        _inspect_archive_names(names, info, flags)
+    else:
+        flags.append(f"archive ({Path(lower_name).suffix}) not inspected "
+                     "(install py7zr/rarfile to peek inside)")
+
+
+def sniff_file_type(payload: bytes) -> str:
+    """Return a coarse content category from the leading magic bytes, or "".
+
+    A lightweight, dependency-free alternative to `python-magic` covering the
+    formats that matter for attachment triage (executables, archives, Office
+    containers, PDFs, common images, and HTML/scripts). Never executes anything.
+    """
+    if not payload:
+        return ""
+    head = payload[:16]
+    for sig, kind in _MAGIC_SIGNATURES:
+        if head.startswith(sig):
+            return kind
+    stripped = payload[:512].lstrip()
+    if stripped[:2] == b"#!":
+        return "script"
+    low = stripped[:256].lower()
+    if low.startswith(b"<!doctype html") or low.startswith(b"<html") or b"<script" in low:
+        return "html"
+    return ""
+
+
 def inspect_attachment(part, filename):
     """Offline content inspection of one attachment: macros, HTML login forms,
-    embedded links, forwarded messages, and deceptive filenames. No execution."""
+    embedded links, forwarded messages, deceptive filenames, and content that
+    does not match its extension (magic-byte sniff). No execution."""
     info = {
         "macro": False, "html_form": False, "forwarded_email": False,
         "suspicious_name": False, "embedded_urls": [], "attachment_flags": [],
+        "sniffed_type": "", "ext_mismatch": False,
+        "archive_entries": [], "archive_threat": False,
     }
     flags = info["attachment_flags"]
     name = filename or ""
@@ -327,22 +510,41 @@ def inspect_attachment(part, filename):
     if len(payload) > _ATTACH_INSPECT_MAX:
         return info
 
+    # Magic-byte vs extension: flag content that isn't what its name claims.
+    sniffed = sniff_file_type(payload)
+    info["sniffed_type"] = sniffed
+    ext = Path(lower_name).suffix
+    expected = _EXT_EXPECTED_KIND.get(ext)
+    if sniffed and expected and sniffed not in expected:
+        info["ext_mismatch"] = True
+        if sniffed in _EXECUTABLE_KINDS:
+            flags.append(f"content is {sniffed} but the extension is {ext} "
+                         "(executable disguised as a document)")
+        else:
+            flags.append(f"content ({sniffed}) does not match the {ext} extension")
+
     if lower_name.endswith(_MACRO_EXTENSIONS):
         info["macro"] = True
         flags.append("macro-enabled Office document")
     elif payload[:2] == b"PK":  # OOXML / zip container
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                if any("vbaproject.bin" in n.lower() for n in archive.namelist()):
+                names = archive.namelist()
+                if any("vbaproject.bin" in n.lower() for n in names):
                     info["macro"] = True
                     flags.append("embedded VBA macro project")
+                # For a plain .zip attachment (not an Office container), list the
+                # entries and flag dangerous payloads inside without extracting.
+                if lower_name.endswith((".zip",)):
+                    _inspect_archive_names(names, info, flags)
         except Exception:
             pass
+    elif lower_name.endswith((".zip", ".7z", ".rar")):
+        _inspect_archive_generic(lower_name, payload, info, flags)
 
     if ctype in ("text/html", "application/xhtml+xml") or lower_name.endswith((".html", ".htm", ".shtml")):
         html_text = safe_decode(payload, part.get_content_charset())
-        low = html_text.lower()
-        if "<form" in low or re.search(r'type\s*=\s*["\']?\s*password', low):
+        if html_has_login_form(html_text):
             info["html_form"] = True
             flags.append("HTML attachment contains a login/credential form")
         info["embedded_urls"] = extract_urls(html_text)[:20]
@@ -350,6 +552,29 @@ def inspect_attachment(part, filename):
             flags.append("HTML attachment contains links")
 
     return info
+
+
+def iter_attachment_payloads(path):
+    """Yield (filename, content_type, bytes) for each attachment in a .eml.
+
+    Used by the optional YARA/QR post-passes, which need the raw bytes that the
+    normal parse deliberately discards. Re-reads the file so nothing is retained
+    in memory across the whole corpus."""
+    try:
+        with open(path, "rb") as fh:
+            message = BytesParser(policy=policy.default).parse(fh)
+    except Exception:
+        return
+    if not message.is_multipart():
+        return
+    for part in message.walk():
+        if part.get_content_disposition() != "attachment":
+            continue
+        try:
+            payload = part.get_payload(decode=True) or b""
+        except Exception:
+            payload = b""
+        yield (part.get_filename() or "(unnamed)", part.get_content_type(), payload)
 
 
 def extract_attachment_details(message):
@@ -402,6 +627,38 @@ def attachment_fingerprint(part) -> dict[str, object]:
     }
  
  
+_AR_MECH_RE = re.compile(
+    r"^(spf|dkim|dmarc|compauth|arc)\s*=\s*([A-Za-z]+)\b(.*)$", re.I
+)
+# Per-mechanism results that count as a failure/anomaly for scoring.
+_AR_FAIL_RESULTS = {"fail", "softfail", "permerror", "temperror", "none"}
+
+
+def parse_authentication_results(values) -> dict:
+    """Split Authentication-Results into per-mechanism {result, reason}.
+
+    The header is a semicolon-delimited list of ``mechanism=result`` clauses,
+    each optionally followed by an explanatory reason (a parenthetical, a
+    ``reason=...``, or ``header.d=``/``smtp.mailfrom=`` context). The leading
+    authserv-id clause has no ``=mechanism`` and is skipped. First result per
+    mechanism wins. Also captures Microsoft 365's ``compauth`` verdict.
+    """
+    detail = {}
+    for header in (values or []):
+        for clause in str(header).split(";"):
+            m = _AR_MECH_RE.match(clause.strip())
+            if not m:
+                continue
+            mech = m.group(1).lower()
+            if mech in detail:
+                continue
+            detail[mech] = {
+                "result": m.group(2).lower(),
+                "reason": m.group(3).strip()[:200],
+            }
+    return detail
+
+
 def parse_authentication_headers(message) -> dict[str, object]:
     auth = {
         "authentication_results": message.get_all("Authentication-Results", []),
@@ -414,7 +671,13 @@ def parse_authentication_headers(message) -> dict[str, object]:
         "reply_to": message.get("Reply-To", ""),
         "received": message.get_all("Received", []),
         "x_originating_ip": message.get_all("X-Originating-IP", []),
+        "list_unsubscribe": message.get_all("List-Unsubscribe", []),
+        "precedence": message.get("Precedence", ""),
     }
+    # Bulk/marketing markers: a mild NEGATIVE signal for FP reduction.
+    auth["bulk_mail"] = bool(auth["list_unsubscribe"]) or (
+        str(auth["precedence"]).strip().lower() in ("bulk", "list", "junk")
+    )
     text = " ".join(
         str(v)
         for values in auth.values()
@@ -435,6 +698,12 @@ def parse_authentication_headers(message) -> dict[str, object]:
     auth["spf_pass"] = bool(re.search(r"\bspf\s*=\s*pass\b", text))
     auth["dkim_pass"] = bool(re.search(r"\bdkim\s*=\s*pass\b", text))
     auth["dmarc_pass"] = bool(re.search(r"\bdmarc\s*=\s*pass\b", text))
+    # Detailed per-mechanism results + reasons, and the M365 compauth verdict.
+    detail = parse_authentication_results(
+        list(auth["authentication_results"]) + list(auth["arc_authentication_results"])
+    )
+    auth["auth_detail"] = detail
+    auth["compauth_fail"] = detail.get("compauth", {}).get("result", "") == "fail"
     return auth
 
 

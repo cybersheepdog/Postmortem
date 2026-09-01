@@ -5,14 +5,26 @@
 # parsing a Microsoft 365 Unified Audit Log all work with NO third-party
 # packages installed.
 #
-# Everything below is optional. Uncomment what you need.
+# Everything below is optional and each degrades gracefully when absent.
+# Uncomment what you need.
+
+# --- Optional: parsing correctness / robustness -----------------------------
+# beautifulsoup4        # more robust HTML body/link/form parsing than regex
+# tldextract            # Public Suffix List-aware registrable-domain parsing
+
+# --- Optional: attachment / image analysis ----------------------------------
+# yara-python           # --yara-rules: scan attachments with YARA
+# pyzbar                # --scan-qr: decode QR codes (also needs Pillow + libzbar)
+# Pillow                # --scan-qr: image loading
+# py7zr                 # peek inside .7z archive attachments
+# rarfile               # peek inside .rar archive attachments
+
+# --- Optional: geolocation (offline, needs local GeoLite2 .mmdb files) -------
+# maxminddb             # --geoip-db: read MaxMind GeoLite2 City/Country/ASN
 
 # --- Optional: Outlook PST/OST ingestion ------------------------------------
-# Enables reading .pst / .ost containers directly. Without it, PST/OST inputs
-# are skipped with a message pointing you at `readpst`. MBOX needs nothing.
-# libpff-python>=20231205
+# libpff-python         # read .pst / .ost containers directly
 
 # --- Optional: development / testing ----------------------------------------
-# Run the test suite (`pytest -q`) and the lint sweep (`pyflakes`).
 # pytest>=7.0
 # pyflakes>=3.0

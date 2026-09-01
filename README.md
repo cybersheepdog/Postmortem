@@ -28,10 +28,15 @@ The core needs **only Python 3.10+** — no third-party packages.
 python -m postmortem --help
 ```
 
-Optional extras (see [`requirements.txt`](requirements.txt)):
+Optional extras (see [`requirements.txt`](requirements.txt)) — each degrades gracefully when absent:
 
+- **Parsing robustness** — `beautifulsoup4` (sturdier HTML body/link/form parsing) and `tldextract` (Public Suffix List–aware registrable domains).
 - **PST/OST ingestion** — `pip install libpff-python`. Without it, `.pst`/`.ost` inputs are skipped with instructions to convert via `readpst`. MBOX and `.eml` need nothing.
+- **Attachment/image analysis** — `yara-python` (`--yara-rules`), `pyzbar`+`Pillow` (`--scan-qr`), `py7zr`/`rarfile` (7z/rar peek).
+- **Geolocation** — `maxminddb` + local GeoLite2 `.mmdb` files (`--geoip-db`).
 - **Tests/lint** — `pip install pytest pyflakes`.
+
+The console output is **color-coded** by severity/tier when writing to a terminal (disable with `--no-color`, or the `NO_COLOR` env var), and prints **timed progress** for the slower phases (clustering, indexing, HTML generation, and any online/opt-in enrichment).
 
 ---
 
@@ -97,21 +102,43 @@ Anchors are ground-truth facts that focus the hunt. Supply any you know; the res
 
 All list flags are repeatable and comma-separatable.
 
+### Tuning & CI
+
+| Flag | Purpose |
+|---|---|
+| `--allowlist DOMAIN` | Known-good sending domain(s) whose **weak header-hygiene noise** (chronic auth failure, thin/absent Received chain, missing Date) is suppressed — **only** when the message shows no active spoofing signal. Alignment, impersonation, and content checks are never suppressed, so spoofing an allowlisted From address cannot launder an attack. Repeatable/comma-separated. |
+| `--fail-on-tier N` | CI gating: exit with **code 3** if any message lands in review tier ≤ N (1 = prime suspects, 2 = + secondary). Default `0` = always exit 0 on a successful scan. |
+
+**Exit codes:** `0` success · `1`/`2` usage/IO errors · `3` findings met `--fail-on-tier`.
+
 ---
 
 ## What it looks for
 
 Rather than trusting any single header, `postmortem` combines config-independent, attacker-controlled signals:
 
-- **Authentication deviation** — auth failure weighted against the sender's baseline, so chronically-misconfigured legitimate senders aren't promoted while a normally-authenticating sender that suddenly fails is.
+- **Authentication deviation** — auth failure weighted against the sender's baseline, so chronically-misconfigured legitimate senders aren't promoted while a normally-authenticating sender that suddenly fails is. SPF/DKIM/DMARC results are parsed with their **failure reasons** (and Microsoft 365's `compauth` composite verdict), which are shown inline with each finding.
 - **Self-spoofing** — mail failing auth while claiming one of the victim's own domains.
 - **Look-alike / homoglyph domains** and **display-name impersonation**.
 - **Reply-To divergence** from the sending domain.
 - **Sending-IP anomaly** — an established sender arriving from an unfamiliar origin.
 - **Thread injection** — a reply grafted into an existing thread from a new domain.
+- **Header hygiene / spoofing alignment** (weak corroborators, external senders): a forged **Received chain** (missing, single-hop, or out-of-order timestamps), **Message-ID**, **DKIM `d=`**, and **Return-Path** domains that don't align with the From domain, and an impossible **Date** (missing, unparseable, or later than delivery). Compared at the registrable-domain level, so legitimate subdomain signing doesn't trip them.
 - **Concealment** — messages deleted or moved to low-visibility folders, and messages matching a malicious rule's keywords.
-- **Attachment threats** — macro-enabled Office docs, HTML login forms, forwarded phish, deceptive double extensions (offline inspection, no execution).
+- **Attachment threats** — macro-enabled Office docs, HTML login forms, forwarded phish, deceptive double extensions, **content that doesn't match its extension** (magic-byte sniff — e.g. an executable named `invoice.pdf`), and **dangerous files inside archives** (a `.zip` peeked for `.exe`/`.js`/nested archives, no extraction). Offline inspection, no execution.
+- **Obfuscated & random signals** — URLs hidden in **base64-encoded body text** (decoded and run through the URL pipeline; inline `data:` images excluded), and **machine-generated sender local-parts** (high-entropy, corroboration-gated).
+- **Bulk-mail down-weighting** — legitimate marketing markers (`List-Unsubscribe`, `Precedence: bulk`) lower a message's priority, but never override a spoofing signal.
 - **Anchor matches** — anything tied to a known attacker IP/address/domain/account or a supplied/derived compromise window.
+
+### Optional enrichment (opt-in)
+
+| Flag | What it adds |
+|---|---|
+| `--check-domain-age [DAYS]` | **Online (RDAP):** flags suspect sender domains registered within `DAYS` (default 90) — a strong attacker-infrastructure signal. Results cached on disk; fails closed offline. |
+| `--yara-rules FILE` | Scans suspect attachments with YARA rules (needs `yara-python`; skipped with a warning if absent). |
+| `--scan-qr` | Decodes QR codes in suspect image attachments ("quishing") and analyzes the linked URLs (needs `pyzbar` + `Pillow`). |
+| `--geoip-db FILE` | **Offline:** geolocate originating/Received IPs with a local MaxMind GeoLite2 `.mmdb` (City/Country and/or ASN; repeatable). Surfaces each suspect's origin country, ASN, and hosting org, and flags **high-abuse hosting networks**. Needs the `maxminddb` reader. |
+| `--expected-countries CC,CC` | With `--geoip-db`, flags a message routed through any country outside this set as **suspicious geography**. |
 
 ---
 
@@ -121,14 +148,18 @@ By default it prints a console report; add flags to write files.
 
 | Flag | Output |
 |---|---|
-| `-o, --output` | **Interactive HTML** report — dashboard, attack narrative, timeline, evidence graph, and a searchable tiered candidate table. Trimmed to the top `--html-limit` messages (default 1000). |
-| `--json` | **Full JSON** — every message, every finding with provenance, the audit-log block, IOCs, timeline, and manifest. Never trimmed. |
+| `-o, --output` | **Interactive HTML** report — an **executive summary**, dashboard, attack narrative, timeline, an interactive **relationship graph** (shared senders/domains/hashes/campaigns/ASNs; click a node to pivot), and a searchable, **sortable** candidate table with **MITRE ATT&CK** tags per message and a **defanged, collapsible preview** of each body. Trimmed to the top `--html-limit` messages (default 1000). |
+| `--json` | **Full JSON** — every message, every finding with provenance, the audit-log block, IOCs, an **ATT&CK technique summary**, timeline, and manifest. Never trimmed. |
 | `--csv` | **Per-message CSV** with all timestamps converted to **UTC** (handy when the export is in local time). |
 | `--ioc` | **Pivot-ready IOC CSV** — domains, URLs, IPs, and hashes from the Tier 1/2 suspects. |
 
 ### Review tiers
 
 Suspects are ranked into **Tier 1** (prime suspects), **Tier 2** (secondary), and **Tier 3** (everything else) so an analyst reviews the shortlist first instead of 30,000 messages.
+
+### Top flagged domains
+
+Both the console and HTML report include a **Top Flagged Domains** summary — Tier 1/2 messages grouped by sender domain with message count, highest tier, total score, and senders — so a campaign shows up as one row instead of many. In the HTML report the table is sortable and each domain pivots the view.
 
 ### Evidence provenance
 

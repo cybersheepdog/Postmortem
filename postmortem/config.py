@@ -26,7 +26,24 @@ CONFIG = {
         "reply_to_mismatch": 5, "lookalike": 9, "sending_ip_anomaly": 4,
         "thread_injection": 7, "display_name_spoof": 6, "deleted": 4,
         "moved": 2, "rule_target": 3, "attachment_threat": 6, "anchor": 12,
+        # Header-hygiene signals: weak/corroborating (legit ESP mail can trip
+        # the alignment checks), so kept low to avoid promoting benign senders.
+        "received_anomaly": 2, "message_id_mismatch": 1, "date_anomaly": 2,
+        "dkim_misalignment": 2, "return_path_mismatch": 2,
+        # A random-looking sender local-part (corroboration-gated); a small
+        # NEGATIVE for legit bulk/marketing mail; a strong newly-registered
+        # sender-domain signal (online, opt-in).
+        "random_local_part": 3, "bulk_penalty": -3, "newly_registered": 8,
+        # Geolocation-derived (opt-in, --geoip-db): an unexpected-country hop is
+        # circumstantial; a high-abuse hosting ASN is a stronger corroborator.
+        "suspicious_geo": 2, "high_abuse_host": 4,
     },
+    # ASN organization keywords commonly associated with abuse/bulletproof
+    # hosting. Heuristic and non-exhaustive; overridable via --config.
+    "high_abuse_asn_keywords": [
+        "bulletproof", "bpo", "flokinet", "ded", "stark industries",
+        "railnet", "chang way", "pq hosting", "mivocloud", "aeza",
+    ],
     # Weights for the "is this THE initial email" score (score_initial_email).
     "initial_weights": {
         "self_spoofing": 6, "auth_anomaly_corroborated": 4, "auth_anomaly": 1,

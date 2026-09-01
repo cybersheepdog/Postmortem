@@ -63,12 +63,34 @@ def date_sort_key(record):
     return dt
 
 
+# Public Suffix List support is optional: when `tldextract` is installed it
+# gives correct registrable domains for every multi-part TLD; otherwise we fall
+# back to a small built-in table covering the common cases.
+try:
+    import tldextract as _tldextract
+    _TLD_EXTRACT = _tldextract.TLDExtract(suffix_list_urls=())  # offline, cached PSL
+except Exception:
+    _TLD_EXTRACT = None
+
+_BUILTIN_MULTI_TLDS = (
+    ["co", "uk"], ["com", "au"], ["co", "jp"], ["co", "nz"],
+    ["co", "za"], ["com", "br"], ["co", "in"], ["org", "uk"], ["gov", "uk"],
+)
+
+
 def registered_domain_approx(hostname: str) -> str:
     host = (hostname or "").lower().strip(".")
     if not host:
         return ""
+    if _TLD_EXTRACT is not None:
+        try:
+            ext = _TLD_EXTRACT(host)
+            if ext.domain and ext.suffix:
+                return f"{ext.domain}.{ext.suffix}"
+        except Exception:
+            pass  # fall through to the built-in heuristic
     labels = host.split(".")
-    if len(labels) >= 3 and labels[-2:] in (["co", "uk"], ["com", "au"], ["co", "jp"], ["co", "nz"]):
+    if len(labels) >= 3 and labels[-2:] in _BUILTIN_MULTI_TLDS:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
 

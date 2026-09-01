@@ -6,9 +6,10 @@ baselining, investigator anchoring, initial-email scoring, tiering, the
 evidence graph, timeline and precursor verdict. No I/O or orchestration.
 """
 
+import math
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from postmortem.config import (
@@ -17,7 +18,7 @@ from postmortem.config import (
 from postmortem.models import EmailRecord, AttackTimelineEvent, Anchors
 from postmortem.utils import (
     parse_date, date_sort_key, normalize_email, normalize_subject,
-    domain_of, clean_text,
+    domain_of, clean_text, registered_domain_approx,
 )
 from postmortem.urls import IP_URL_RE
 from pathlib import Path
@@ -410,6 +411,11 @@ def attachment_threat_summary(record):
             notes.append(f"deceptively named attachment {fn}")
         if a.get("forwarded_email"):
             notes.append(f"forwarded message attached ({fn})")
+        if a.get("ext_mismatch"):
+            sniffed = a.get("sniffed_type", "") or "unexpected"
+            notes.append(f"attachment {fn} content is {sniffed}, not what its name claims")
+        if a.get("archive_threat"):
+            notes.append(f"archive {fn} contains executable/script files")
     return notes, credential
 
 
@@ -450,6 +456,137 @@ def message_arrival_dt(record) -> Optional[datetime]:
             if dt is not None:
                 return dt
     return parse_date(record.date)
+
+
+# --------------------------------------------------------------------------
+# Header-hygiene / spoofing-alignment checks
+# --------------------------------------------------------------------------
+# Clock-skew tolerance between adjacent Received hops before their timestamps
+# are treated as genuinely out of order (MTAs are not perfectly synchronized).
+_RECV_SKEW = timedelta(seconds=300)
+
+
+def _received_hop_dt(hop: str) -> Optional[datetime]:
+    """Parse the timestamp that follows the final ';' of a Received header."""
+    parts = str(hop).rsplit(";", 1)
+    if len(parts) == 2:
+        return parse_date(parts[1].strip())
+    return None
+
+
+def analyze_received_chain(received_list, is_external: bool) -> dict:
+    """Inspect the Received chain for tell-tale forgery signs.
+
+    Received headers are prepended, so the list runs newest-first; genuine
+    timestamps therefore never increase as you move to older hops. Missing or
+    single-hop chains are only meaningful for external mail (internal mail and
+    some exports legitimately lack them).
+    """
+    hops = received_list or []
+    result = {"missing": False, "too_short": False,
+              "out_of_order": False, "note": ""}
+    notes = []
+    if not hops:
+        if is_external:
+            result["missing"] = True
+            notes.append("no Received chain on an external message")
+        result["note"] = "; ".join(notes)
+        return result
+    if is_external and len(hops) < 2:
+        result["too_short"] = True
+        notes.append("external message shows only one Received hop")
+
+    last = None  # timestamp of the previous (newer) hop
+    for hop in hops:
+        dt = _received_hop_dt(hop)
+        if dt is None:
+            continue
+        if last is not None and dt > last + _RECV_SKEW:
+            result["out_of_order"] = True
+            notes.append("Received timestamps out of order (possible forged hop)")
+            break
+        last = dt
+    result["note"] = "; ".join(notes)
+    return result
+
+
+def message_id_domain(message_id: str) -> str:
+    """Registrable domain of a Message-ID's domain part, or ''."""
+    m = re.search(r"@([^>@\s]+)", str(message_id or ""))
+    return registered_domain_approx(m.group(1)) if m else ""
+
+
+def dkim_d_domains(dkim_signatures) -> set:
+    """Registrable domains claimed in each DKIM-Signature ``d=`` tag."""
+    out = set()
+    for sig in (dkim_signatures or []):
+        for m in re.finditer(r"(?:^|[;\s])d=([^;\s]+)", str(sig)):
+            d = registered_domain_approx(m.group(1).strip().strip('"'))
+            if d:
+                out.add(d)
+    return out
+
+
+def analyze_date_header(date_str: str, delivery_dt: Optional[datetime]) -> tuple:
+    """Return (anomaly, note) for the Date header. A Date later than the message
+    was actually delivered is impossible; a missing/unparseable Date is a mild
+    hygiene signal."""
+    if not str(date_str or "").strip():
+        return True, "missing Date header"
+    dt = parse_date(date_str)
+    if dt is None:
+        return True, "unparseable Date header"
+    if delivery_dt is not None and dt > delivery_dt + timedelta(days=1):
+        return True, "Date header is later than delivery (impossible ordering)"
+    return False, ""
+
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+# Local-part looking like "name", "name.name", or "name+digits" is a common
+# legitimate convention and is never flagged as random.
+_NAMEY_LOCAL_RE = re.compile(r"[a-z]+([._-][a-z]+)*\d{0,6}$")
+
+
+def looks_random_local_part(email: str) -> bool:
+    """Heuristic: does the address local-part look machine-generated (e.g.
+    ``xk4jf92mliq8h@...``)? Conservative -- long, high-entropy, mixed letters
+    and digits, and not a name-like convention -- to keep false positives low."""
+    local = (email or "").split("@", 1)[0].lower()
+    core = local.split("+", 1)[0]
+    if len(core) < 12:
+        return False
+    if _NAMEY_LOCAL_RE.fullmatch(core):
+        return False
+    letters = sum(c.isalpha() for c in core)
+    digits = sum(c.isdigit() for c in core)
+    if letters == 0 or digits == 0:
+        return False
+    return _shannon_entropy(core) >= 3.5 and (digits / len(core)) >= 0.2
+
+
+_AUTH_FAIL_RESULTS = {"fail", "softfail", "permerror", "temperror", "none"}
+
+
+def _auth_fail_reason(auth: dict) -> str:
+    """Human-readable 'why auth failed' from the detailed Authentication-Results,
+    e.g. "dmarc=fail (p=REJECT); spf=fail smtp.mailfrom=evil.com"."""
+    detail = auth.get("auth_detail") or {}
+    parts = []
+    for mech in ("dmarc", "spf", "dkim", "compauth"):
+        d = detail.get(mech)
+        if d and d.get("result") in _AUTH_FAIL_RESULTS:
+            piece = f"{mech}={d['result']}"
+            if d.get("reason"):
+                piece += f" {d['reason']}"
+            parts.append(piece)
+    return "; ".join(parts)[:200]
 
 
 def build_thread_participants(records):
@@ -577,7 +714,7 @@ def detect_scenario(records, anchors: Anchors):
 def annotate_forensic_signals(
     records, internal_domains, frequent_domains, lookalike_map,
     sender_ip_counts, frequent_senders, anchors, baselines, victim_domains,
-    victim_address, thread_participants, contact_names,
+    victim_address, thread_participants, contact_names, allowlist=None,
 ):
     """Wire the parsed-but-unused signals (auth, Reply-To, look-alike domain,
     sending-IP anomaly) into the record's indicators/score, and record which
@@ -585,15 +722,26 @@ def annotate_forensic_signals(
 
     Authentication is scored by DEVIATION from each sender's baseline, not by
     absolute failure, so chronically-misconfigured legitimate senders do not
-    flood the results."""
+    flood the results.
+
+    ``allowlist`` (registrable domains) suppresses ONLY the weak header-hygiene
+    noise (chronic auth failure, a thin/absent Received chain, a missing Date)
+    for trusted senders -- and only when the message shows no active spoofing
+    signal. Alignment, impersonation, and content checks are never suppressed,
+    so spoofing an allowlisted From address cannot launder an attack."""
     enforce_domains = baselines["enforce_domains"]
     established_domains = baselines["established_domains"]
     first_contact_domains = baselines["first_contact_domains"]
+    allow = {str(d).lower() for d in (allowlist or [])}
 
     for r in records:
         auth = r.authentication_results or {}
-        failed = bool(auth.get("spf_fail") or auth.get("dkim_fail") or auth.get("dmarc_fail"))
+        failed = bool(
+            auth.get("spf_fail") or auth.get("dkim_fail")
+            or auth.get("dmarc_fail") or auth.get("compauth_fail")
+        )
         r.authentication_failed = failed
+        auth_reason = _auth_fail_reason(auth)
         # Deviation: this message failed but the domain normally authenticates.
         r.auth_anomaly = bool(failed and r.sender_domain in enforce_domains)
         # Self-spoofing: fails while claiming the VICTIM's own domain, which is
@@ -649,6 +797,42 @@ def annotate_forensic_signals(
             ):
                 r.display_name_spoof = True
 
+        # Header-hygiene / spoofing-alignment signals. Alignment is compared at
+        # the registrable-domain level, so legitimate subdomain signing
+        # (d=mail.vendor.com, bounce.vendor.com) does NOT trip; only genuine
+        # cross-domain (third-party ESP or spoofed) cases do. External only.
+        is_external = bool(r.sender_domain and r.sender_domain not in internal_domains)
+        sender_reg = registered_domain_approx(r.sender_domain)
+
+        chain = analyze_received_chain(auth.get("received", []), is_external)
+        r.received_chain_anomaly = bool(
+            chain["missing"] or chain["too_short"] or chain["out_of_order"]
+        )
+        r.received_chain_note = chain["note"]
+
+        mid_dom = message_id_domain(r.message_id)
+        r.message_id_mismatch = bool(
+            is_external and mid_dom and sender_reg and mid_dom != sender_reg
+        )
+
+        d_anom, d_note = analyze_date_header(r.date, message_arrival_dt(r))
+        r.date_anomaly = bool(d_anom)
+        r.date_anomaly_note = d_note
+
+        dkim_doms = dkim_d_domains(auth.get("dkim_signatures", []))
+        r.dkim_domain_mismatch = bool(
+            is_external and dkim_doms and sender_reg and sender_reg not in dkim_doms
+        )
+
+        rp = normalize_email(str(auth.get("return_path", "") or "").strip("<> "))
+        rp_dom = registered_domain_approx(domain_of(rp))
+        r.return_path_mismatch = bool(
+            is_external and rp and rp_dom and sender_reg and rp_dom != sender_reg
+        )
+
+        r.random_local_part = bool(is_external and looks_random_local_part(r.sender_email))
+        r.bulk_mail = bool(auth.get("bulk_mail"))
+
         if anchors.compromise_date:
             dt = message_arrival_dt(r)
             r.is_pre_compromise = bool(dt and dt <= anchors.compromise_date)
@@ -698,6 +882,21 @@ def annotate_forensic_signals(
         # failure counts only as a DEVIATION from the sender's norm, so
         # chronically-misconfigured legitimate senders are not promoted.
         pw = CONFIG["priority_weights"]
+        # Allowlist: quiet weak header-hygiene noise (chronic auth failure, thin
+        # Received chain, missing Date) for a trusted sender -- but only when
+        # nothing about the message looks like active spoofing. Any alignment,
+        # impersonation, or anchor signal disables suppression, so a spoof of an
+        # allowlisted From is never laundered.
+        strong_signal = bool(
+            r.self_spoofing or r.auth_anomaly or r.lookalike_of
+            or r.thread_injection or r.display_name_spoof or r.sending_ip_anomaly
+            or r.reply_to_mismatch or r.message_id_mismatch
+            or r.dkim_domain_mismatch or r.return_path_mismatch or matches
+        )
+        suppress_hygiene = bool(allow and sender_reg in allow and not strong_signal)
+        if suppress_hygiene:
+            r.received_chain_anomaly = False
+            r.date_anomaly = False
         bump = 0
         new_indicators = []
         new_prov = []
@@ -712,18 +911,19 @@ def annotate_forensic_signals(
                 matched=matched, weight=points,
             ))
 
+        auth_matched = f"{r.sender_domain} ({auth_reason})" if auth_reason else r.sender_domain
         if r.self_spoofing:
             nf("Authentication fails while claiming an authenticating domain (possible self-spoofing)",
                pw["self_spoofing"], category="auth", source="authentication_results",
-               matched=r.sender_domain)
+               matched=auth_matched)
         elif r.auth_anomaly:
             nf(f"Authentication failure deviates from {r.sender_domain}'s norm (usually authenticates)",
                pw["auth_anomaly"], category="auth", source="authentication_results",
-               matched=r.sender_domain)
-        elif r.authentication_failed:
+               matched=auth_matched)
+        elif r.authentication_failed and not suppress_hygiene:
             nf("Email authentication failed (sender may be misconfigured)",
                pw["auth_fail_chronic"], category="auth", source="authentication_results",
-               matched=r.sender_domain)  # chronic/misconfigured sender: weak alone
+               matched=auth_matched)  # chronic/misconfigured sender: weak alone
         if r.reply_to_mismatch:
             nf(f"Reply-To domain ({reply_to_domain}) differs from sender domain",
                pw["reply_to_mismatch"], category="identity", source="header:Reply-To",
@@ -757,6 +957,38 @@ def annotate_forensic_signals(
             nf(f"Dangerous attachment: {r.attachment_threat_note}",
                pw["attachment_threat"], category="attachment", source="attachment",
                matched=r.attachment_threat_note)
+        # Header-hygiene signals (weak/corroborating; see field comments).
+        if r.received_chain_anomaly:
+            nf(f"Received-chain anomaly: {r.received_chain_note}",
+               pw["received_anomaly"], category="headers", source="header:Received",
+               matched=r.received_chain_note)
+        if r.message_id_mismatch:
+            nf("Message-ID domain does not align with the sender domain",
+               pw["message_id_mismatch"], category="headers", source="header:Message-ID",
+               matched=f"{mid_dom} vs {sender_reg}")
+        if r.date_anomaly:
+            nf(f"Date header issue: {r.date_anomaly_note}",
+               pw["date_anomaly"], category="headers", source="header:Date",
+               matched=r.date_anomaly_note)
+        if r.dkim_domain_mismatch:
+            nf("DKIM d= domain does not align with the sender domain",
+               pw["dkim_misalignment"], category="auth", source="header:DKIM-Signature",
+               matched=f"{', '.join(sorted(dkim_doms))} vs {sender_reg}")
+        if r.return_path_mismatch:
+            nf("Return-Path (envelope-from) domain differs from the sender domain",
+               pw["return_path_mismatch"], category="identity", source="header:Return-Path",
+               matched=f"{rp_dom} vs {sender_reg}")
+        # Random-looking sender local-part: only counts when corroborated by at
+        # least one other signal already found (keeps false positives low).
+        if r.random_local_part and (bump > 0 or strong_signal):
+            nf(f"Sender local-part looks machine-generated ({r.sender_email.split('@')[0][:24]})",
+               pw["random_local_part"], category="identity", source="header:From",
+               matched=r.sender_email)
+        # Bulk/marketing mail: a mild NEGATIVE, only when nothing looks spoofy.
+        if r.bulk_mail and not strong_signal:
+            nf("Bulk/marketing markers (List-Unsubscribe/Precedence) - lower priority",
+               pw["bulk_penalty"], category="reputation", source="header:List-Unsubscribe",
+               matched="List-Unsubscribe/Precedence present")
         if matches:
             bump += pw["anchor"]
             for m in matches:
@@ -767,7 +999,7 @@ def annotate_forensic_signals(
                     matched=m, weight=pw["anchor"],
                 ))
         if bump:
-            r.score += bump
+            r.score = max(0, r.score + bump)  # floor: a negative bulk penalty
             r.indicators = list(dict.fromkeys(list(r.indicators) + new_indicators))
             r.provenance = _dedupe_provenance(list(r.provenance) + new_prov)
 
@@ -1232,7 +1464,7 @@ def reconstruct_attack_narrative(records, scenario, anchors, initial_verdict,
 
 
 def run_scenario_analysis(records, internal_domains, anchors: Anchors,
-                          audit_summary=None):
+                          audit_summary=None, allowlist=None):
     """Full scenario/anchor pipeline. Returns (scenario, reason, verdict)."""
     for r in records:
         r.origin_ip = extract_origin_ip(r.authentication_results or {})
@@ -1273,6 +1505,7 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
         records, internal_domains, frequent_domains, lookalike_map,
         sender_ip_counts, frequent_senders, anchors, baselines, victim_domains,
         victim_address, thread_participants, contact_names,
+        allowlist=allowlist,
     )
     for r in records:
         score_initial_email(r, scenario, anchors)
@@ -1316,6 +1549,12 @@ V8_ATTACHMENT_PATTERNS = (
 )
 
 
+# Screening-time base64 heuristics: a long base64 run, and inline data: images
+# to subtract first (those are legitimate and the main false-positive source).
+_SCREEN_B64_RE = re.compile(r"(?:^|[^A-Za-z0-9+/=])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])")
+_SCREEN_DATA_URI_RE = re.compile(r"data:[^;\s]+;base64,[A-Za-z0-9+/=]+", re.I)
+
+
 def v8_candidate_score(record, screen_chars: int = 16000):
     """
     Conservative first-pass classifier.
@@ -1356,6 +1595,15 @@ def v8_candidate_score(record, screen_chars: int = 16000):
  
     url_count = len(getattr(record, "urls", []) or [])
     attachment_count = len(attachment_names)
+
+    # Cheap obfuscation signal (no decode): a long base64 run in the body that
+    # is NOT an inline data: image. Alone it is not enough to be a candidate,
+    # but combined with a lure it promotes the message so deep analysis can
+    # decode it and run any hidden URL through the URL pipeline.
+    b64_text = _SCREEN_DATA_URI_RE.sub(" ", text)
+    if _SCREEN_B64_RE.search(b64_text):
+        score += 3
+        reasons.append("base64-encoded content in body")
  
     # Strong signals are sufficient on their own.
     if high >= 2:
