@@ -213,10 +213,11 @@ class ProgressTracker:
         else:
             if self.total:
                 eta_text = f", ETA {eta:.1f}s" if eta is not None else ""
+                pct = term.c(f"{payload['percent']:6.2f}%", "bold")
                 print(
-                    f"\r[{payload['percent']:6.2f}%] {self.phase}: "
+                    f"\r[{pct}] {term.c(self.phase, 'cyan')}: "
                     f"{self.completed}/{self.total} "
-                    f"({rate:.1f}/s{eta_text})",
+                    + term.c(f"({rate:.1f}/s{eta_text})", "dim"),
                     end="",
                     flush=True,
                 )
@@ -246,11 +247,12 @@ def v8_cache_progress(phase, completed, total, started, extra=""):
     width = 36
     fraction = completed / total if total else 1.0
     filled = int(width * fraction)
-    bar = "#" * filled + "-" * (width - filled)
+    bar = term.c("#" * filled, "green") + term.c("-" * (width - filled), "grey")
+    pct = term.c(f"{fraction*100:6.2f}%", "bold")
     print(
-        f"\r[{bar}] {fraction*100:6.2f}% "
-        f"{phase}: {completed}/{total} "
-        f"({rate:.1f}/s ETA {eta:.1f}s){extra}",
+        f"\r[{bar}] {pct} "
+        f"{term.c(phase, 'cyan')}: {completed}/{total} "
+        + term.c(f"({rate:.1f}/s ETA {eta:.1f}s)", "dim") + extra,
         end="",
         flush=True,
     )
@@ -562,12 +564,8 @@ def progress_bar(
     )
  
     bar = (
-        "#"
-        * filled
-        + "-"
-        * (
-            width - filled
-        )
+        term.c("#" * filled, "green")
+        + term.c("-" * (width - filled), "grey")
     )
  
     percent = (
@@ -576,8 +574,8 @@ def progress_bar(
  
     print(
         f"\r[{bar}] "
-        f"{percent:6.2f}% "
-        f"{current}/{total}",
+        + term.c(f"{percent:6.2f}%", "bold")
+        + f" {current}/{total}",
         end="",
         file=sys.stderr,
         flush=True,
@@ -1494,7 +1492,8 @@ def main():
     )
     if audit_summary:
         initial_verdict["audit_log"] = audit_summary
-    print(f"Scenario profile:  {scenario} ({scenario_reason})")
+    print("Scenario profile:  " + term.c(scenario, "magenta", "bold")
+          + f" ({scenario_reason})")
 
     # Optional enrichment passes over the Tier 1/2 suspects. Each annotates and
     # can promote a confirmed hit to Tier 1; run before IOC/clustering/reporting.
@@ -1565,9 +1564,9 @@ def main():
     print()
     print(f"Persistent cache hits: {cache_hits}")
     print(f"Content-hash cache reuse: {hash_reuses}")
-    print("=" * 80)
-    print("PERFORMANCE SUMMARY")
-    print("=" * 80)
+    print(term.c("=" * 80, "cyan"))
+    print(term.c("PERFORMANCE SUMMARY", "cyan", "bold"))
+    print(term.c("=" * 80, "cyan"))
     print(f"Messages analyzed: {len(records)}")
     print(f"URLs analyzed:     {sum(len(r.url_analysis) for r in records)}")
     print(f"Attachments seen:  {sum(len(r.attachments) for r in records)}")
@@ -1614,10 +1613,7 @@ def main():
                 limit=args.html_limit,
             )
 
-        print(
-            f"HTML report written to: "
-            f"{args.output}"
-        )
+        print(term.c(f"HTML report written to: {args.output}", "green"))
 
     if args.json:
 
@@ -1632,27 +1628,19 @@ def main():
             manifest,
         )
 
-        print(
-            f"JSON report written to: "
-            f"{args.json}"
-        )
+        print(term.c(f"JSON report written to: {args.json}", "green"))
 
     if args.csv:
 
         write_csv(records, args.csv)
 
-        print(
-            f"CSV (UTC) written to: "
-            f"{args.csv}"
-        )
+        print(term.c(f"CSV (UTC) written to: {args.csv}", "green"))
 
     if args.ioc:
 
         write_iocs_csv(iocs, args.ioc)
 
-        print(
-            f"IOC list ({len(iocs)} indicators) written to: {args.ioc}"
-        )
+        print(term.c(f"IOC list ({len(iocs)} indicators) written to: {args.ioc}", "green"))
 
     # CI gating: exit non-zero (3) when suspects meet the requested tier.
     if args.fail_on_tier:

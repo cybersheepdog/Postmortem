@@ -35,6 +35,13 @@ def _confidence_c(text: str) -> str:
     return term.c(text, *styles)
 
 
+def _hdr(title: str, ch: str = "=") -> None:
+    """Print a consistent, color-coded section header."""
+    print(term.c(ch * 80, "cyan"))
+    print(term.c(title, "cyan", "bold"))
+    print(term.c(ch * 80, "cyan"))
+
+
 # --------------------------------------------------------------------------
 # MITRE ATT&CK technique mapping (heuristic, from finding categories/signals)
 # --------------------------------------------------------------------------
@@ -124,9 +131,7 @@ def print_campaigns(
         return
  
     print()
-    print("=" * 80)
-    print("CAMPAIGN CLUSTERS")
-    print("=" * 80)
+    _hdr("CAMPAIGN CLUSTERS")
  
     for campaign in campaigns[:20]:
  
@@ -199,9 +204,7 @@ def print_campaigns(
  
 def print_initial_compromise(verdict: dict):
     print()
-    print("=" * 80)
-    print("INITIAL COMPROMISE ANALYSIS")
-    print("=" * 80)
+    _hdr("INITIAL COMPROMISE ANALYSIS")
     print(f"Scenario profile: {verdict.get('scenario', '')} "
           f"({verdict.get('scenario_reason', '')})")
     if verdict.get("victim_address"):
@@ -247,9 +250,7 @@ def print_attack_narrative(narrative: dict):
     if not narrative or not narrative.get("phases"):
         return
     print()
-    print("=" * 80)
-    print("ATTACK NARRATIVE (reconstructed)")
-    print("=" * 80)
+    _hdr("ATTACK NARRATIVE (reconstructed)")
     print(narrative.get("summary", ""))
     for i, phase in enumerate(narrative.get("phases", []), 1):
         print()
@@ -277,9 +278,7 @@ def print_audit_summary(audit: dict):
         return
     d = audit.get("derived", {})
     print()
-    print("=" * 80)
-    print("M365 UNIFIED AUDIT LOG (confirmed attacker activity)")
-    print("=" * 80)
+    _hdr("M365 UNIFIED AUDIT LOG (confirmed attacker activity)")
     print(f"  Events parsed:          {audit.get('events_parsed', 0)}")
     if d.get("compromise_date"):
         print(f"  Compromise (earliest):  {d['compromise_date']}")
@@ -504,9 +503,7 @@ def print_summary(
             )
  
     print()
-    print("=" * 80)
-    print("IMPORTANT")
-    print("=" * 80)
+    _hdr("IMPORTANT")
  
     print(
         "Scores are heuristic investigation priorities, "
@@ -988,9 +985,7 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
 
 def print_run_manifest(manifest):
     print()
-    print("=" * 80)
-    print("RUN MANIFEST (reproducibility / chain of custody)")
-    print("=" * 80)
+    _hdr("RUN MANIFEST (reproducibility / chain of custody)")
     c = manifest["corpus"]
     print(f"Tool: postmortem {manifest['tool_version']} (parser {manifest['parser_version']})")
     print(f"Generated (UTC): {manifest['generated_utc']}   Elapsed: {manifest['elapsed_seconds']}s")
