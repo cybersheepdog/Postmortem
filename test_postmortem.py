@@ -548,6 +548,29 @@ def test_geoip_annotation_with_fake_resolver():
     assert any("high-abuse" in i for i in r.indicators)
 
 
+def test_geoip_extract_mmdb_from_tar():
+    import io
+    import tarfile
+    from postmortem.geoip import _extract_mmdb
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        payload = b"\x00fake-mmdb-bytes"
+        info = tarfile.TarInfo("GeoLite2-ASN_20260101/GeoLite2-ASN.mmdb")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    assert _extract_mmdb(buf.getvalue(), "GeoLite2-ASN") == b"\x00fake-mmdb-bytes"
+
+
+def test_geoip_ensure_reuses_fresh_cache_no_network(tmp_path):
+    # A fresh cached copy must be reused WITHOUT any download attempt, so this
+    # runs fine offline even with a dummy key.
+    from postmortem.geoip import ensure_databases
+    (tmp_path / "GeoLite2-City.mmdb").write_bytes(b"city")
+    (tmp_path / "GeoLite2-ASN.mmdb").write_bytes(b"asn")
+    paths = ensure_databases("DUMMYKEY", tmp_path, max_age_days=999, verbose=False)
+    assert {p.name for p in paths} == {"GeoLite2-City.mmdb", "GeoLite2-ASN.mmdb"}
+
+
 def test_entity_graph_builder():
     from postmortem.reporting import build_entity_graph
     a = make_record(sender_email="x@evil.example", sender_domain="evil.example",

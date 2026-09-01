@@ -879,6 +879,26 @@ def main():
              "US,GB). With --geoip-db, a hop outside this set is flagged as "
              "suspicious geography.",
     )
+    enrich.add_argument(
+        "--maxmind-key",
+        metavar="KEY", default=os.environ.get("MAXMIND_LICENSE_KEY"),
+        help="MaxMind license key: download/refresh GeoLite2 City+ASN databases "
+             "automatically (into --geoip-dir) instead of supplying --geoip-db. "
+             "Defaults to the MAXMIND_LICENSE_KEY environment variable.",
+    )
+    enrich.add_argument(
+        "--geoip-dir",
+        type=Path, default=Path.home() / ".postmortem" / "geoip",
+        metavar="DIR",
+        help="Where downloaded GeoLite2 databases are cached "
+             "(default: ~/.postmortem/geoip).",
+    )
+    enrich.add_argument(
+        "--geoip-max-age",
+        type=int, default=7, metavar="DAYS",
+        help="Re-download GeoLite2 databases when the cached copy is older than "
+             "this many days (default 7; GeoLite2 rebuilds twice a week).",
+    )
 
     args = parser.parse_args()
 
@@ -1500,11 +1520,18 @@ def main():
             n = qr_scan(records)
         print(f"QR scan: {n} QR-code URL(s) in image attachments")
         enriched = enriched or bool(n)
-    if getattr(args, "geoip_db", None):
-        from postmortem.geoip import GeoResolver, annotate_records as geo_annotate
+    if getattr(args, "geoip_db", None) or getattr(args, "maxmind_key", None):
+        from postmortem.geoip import (
+            GeoResolver, ensure_databases, annotate_records as geo_annotate)
         from postmortem.config import CONFIG as _CFG
+        db_paths = list(args.geoip_db or [])
+        if args.maxmind_key:
+            with phase("GeoLite2 database download/refresh"):
+                db_paths += ensure_databases(
+                    args.maxmind_key, args.geoip_dir,
+                    max_age_days=args.geoip_max_age)
         with phase("GeoIP / ASN lookups"):
-            resolver = GeoResolver(args.geoip_db)
+            resolver = GeoResolver(db_paths)
             geo_n = host_n = 0
             if resolver.available():
                 expected = [c for c in (args.expected_countries or "").split(",") if c.strip()]
