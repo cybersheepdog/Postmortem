@@ -851,10 +851,11 @@ def main():
     )
     enrich.add_argument(
         "--yara-rules",
-        type=Path, metavar="FILE",
-        help="Scan suspect attachments with these compiled/uncompiled YARA "
-             "rules (needs the yara-python package; skipped with a warning if "
-             "absent).",
+        type=Path, metavar="PATH",
+        help="Scan suspect attachments with YARA rules: a single .yar/.yara "
+             "file OR a directory of them (compiled per-file, bad files "
+             "skipped). Needs the yara-python package; skipped with a warning "
+             "if absent.",
     )
     enrich.add_argument(
         "--scan-qr",
@@ -1510,9 +1511,17 @@ def main():
     if getattr(args, "yara_rules", None):
         from postmortem.yara_scan import scan_records as yara_scan
         with phase("YARA scan of suspect attachments"):
-            n = yara_scan(records, args.yara_rules)
-        print(f"YARA: {n} attachment match(es)")
-        enriched = enriched or bool(n)
+            res = yara_scan(records, args.yara_rules)
+        if res["available"]:
+            msg = (f"YARA: {res['matches']} match(es) across "
+                   f"{res['attachments']} attachment(s) in {res['messages']} "
+                   f"Tier 1/2 message(s) using {res['rules_loaded']} rule file(s)")
+            if res["rules_failed"]:
+                msg += f" ({res['rules_failed']} rule file(s) skipped)"
+            if res["rules_loaded"] and res["attachments"] == 0:
+                msg += "  (no attachments on the suspects to scan)"
+            print(term.c(msg, "green" if res["matches"] else "dim"))
+        enriched = enriched or bool(res["matches"])
     if getattr(args, "scan_qr", False):
         from postmortem.qr_scan import scan_records as qr_scan
         with phase("QR-code decode of suspect images"):

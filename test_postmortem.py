@@ -453,7 +453,11 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
     r.tier = 1
     r.path = str(tmp_path / "nonexistent.eml")
     if importlib.util.find_spec("yara") is None:
-        assert yara_scan.scan_records([r], tmp_path / "rules.yar") == 0
+        # a directory of rules is accepted; missing lib -> available False, no crash
+        (tmp_path / "rules").mkdir()
+        (tmp_path / "rules" / "a.yar").write_text("rule x { condition: true }")
+        res = yara_scan.scan_records([r], tmp_path / "rules")
+        assert res["matches"] == 0 and res["available"] is False
     if importlib.util.find_spec("pyzbar") is None:
         assert qr_scan.scan_records([r]) == 0
 

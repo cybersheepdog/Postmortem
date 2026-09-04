@@ -1,0 +1,23 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# postmortem runtime artifacts
+.postmortem_cache.sqlite3
+.postmortem_extracted/
+.postmortem_domain_cache.json
+
+# Generated reports
+*.html
+report.json
+iocs.csv
+
+# Environments / editors
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.DS_Store
