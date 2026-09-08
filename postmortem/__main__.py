@@ -344,8 +344,20 @@ def parallel_map(worker, items, workers, chunksize):
 
 
 def _parse_uncached_worker(path):
-    """Top-level (picklable) parse worker for the process pool."""
-    return path, parse_eml(path, deep=False)
+    """Top-level (picklable) parse worker for the process pool.
+
+    Never propagates an exception: a single unparseable message (malformed
+    headers, a MIME structure the stdlib chokes on) must degrade to one skipped
+    file, not abort a run of tens of thousands of messages partway through.
+    """
+    try:
+        return path, parse_eml(path, deep=False)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(
+            f"\n[!] Skipping {path}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return path, None
 
 
 def _deep_url_set(deep_record) -> list[str]:
@@ -378,7 +390,15 @@ def _deep_analyze_worker(job):
     copy) so results are identical regardless of pool type.
     """
     index, path = job
-    deep_record = parse_eml(Path(path), deep=True)
+    try:
+        deep_record = parse_eml(Path(path), deep=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(
+            f"\n[!] Skipping deep analysis of {path}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return index, None
     if deep_record is None:
         return index, None
 
@@ -448,7 +468,15 @@ def v6_parallel_deep_analysis(records, candidate_indexes, max_workers, url_cache
     if workers == 1 or len(pending) < _PROCESS_POOL_MIN_JOBS:
         for index in pending:
             record = records[index]
-            deep_record = parse_eml(Path(record.path), deep=True)
+            try:
+                deep_record = parse_eml(Path(record.path), deep=True)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"\n[!] Skipping deep analysis of {record.path}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
             if deep_record is None:
                 continue
             all_urls = _deep_url_set(deep_record)

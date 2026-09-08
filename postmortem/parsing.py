@@ -33,6 +33,62 @@ EMAIL_RE = re.compile(
     re.I,
 )
 
+# ---------------------------------------------------------------------------
+# Tolerant header access
+#
+# ``email.policy.default`` parses header values lazily, on fetch, and raises on
+# malformed headers that real-world (and attacker-generated) mail carries all
+# the time -- e.g. a Message-ID with an empty local part, ``<@example.com>``,
+# which makes CPython's header parser raise IndexError. A single such message
+# must never abort a whole mailbox run, so every header fetch goes through
+# these helpers: on a parse failure they fall back to the raw, undecoded header
+# text taken straight from the message source. Keeping the value (rather than
+# dropping the header) preserves threading, and a malformed header is itself a
+# useful signal.
+# ---------------------------------------------------------------------------
+
+
+def _raw_header_values(message, name: str) -> list:
+    """Unparsed values for ``name``, bypassing policy header parsing."""
+    lowered = name.lower()
+    try:
+        return [
+            str(value)
+            for key, value in message.raw_items()
+            if str(key).lower() == lowered
+        ]
+    except Exception:
+        return []
+
+
+def header_str(message, name: str, default: str = "") -> str:
+    """``message[name]`` as text; falls back to the raw header on parse errors."""
+    try:
+        value = message.get(name, None)
+        if value is None:
+            return default
+        return str(value)
+    except Exception:
+        raw = _raw_header_values(message, name)
+        return raw[0] if raw else default
+
+
+def header_list(message, name: str) -> list:
+    """All values of ``name`` as text; falls back to raw headers on errors."""
+    try:
+        values = message.get_all(name, [])
+    except Exception:
+        return _raw_header_values(message, name)
+    out = []
+    for value in values or []:
+        try:
+            out.append(str(value))
+        except Exception:
+            out.extend(_raw_header_values(message, name))
+            break
+    return out
+
+
 # BeautifulSoup gives more robust HTML handling (malformed markup, entities,
 # attribute quirks) than regex. Optional: fall back to regex when it is absent.
 try:
@@ -306,7 +362,7 @@ def iter_decoded_attachment(part, chunk_size: int = 1024 * 1024):
             yield payload[offset:offset + chunk_size]
         return
  
-    encoding = (part.get("Content-Transfer-Encoding", "") or "").lower().strip()
+    encoding = header_str(part, "Content-Transfer-Encoding").lower().strip()
  
     if encoding == "base64":
         text = re.sub(r"\s+", "", str(payload))
@@ -497,7 +553,7 @@ def inspect_attachment(part, filename):
                 sub = nested[0]
                 body = extract_body(sub)
                 info["embedded_urls"] = extract_urls(
-                    f"{sub.get('Subject', '')}\n{body}"
+                    f"{header_str(sub, 'Subject')}\n{body}"
                 )[:20]
         except Exception:
             pass
@@ -622,7 +678,7 @@ def attachment_fingerprint(part) -> dict[str, object]:
         "content_type": part.get_content_type(),
         "size": len(payload),
         "sha256": sha256_bytes(payload),
-        "content_id": str(part.get("Content-ID", "")).strip("<>"),
+        "content_id": header_str(part, "Content-ID").strip("<>"),
         "disposition": part.get_content_disposition() or "",
     }
  
@@ -661,18 +717,16 @@ def parse_authentication_results(values) -> dict:
 
 def parse_authentication_headers(message) -> dict[str, object]:
     auth = {
-        "authentication_results": message.get_all("Authentication-Results", []),
-        "arc_authentication_results": message.get_all(
-            "ARC-Authentication-Results", []
-        ),
-        "received_spf": message.get_all("Received-SPF", []),
-        "dkim_signatures": message.get_all("DKIM-Signature", []),
-        "return_path": message.get("Return-Path", ""),
-        "reply_to": message.get("Reply-To", ""),
-        "received": message.get_all("Received", []),
-        "x_originating_ip": message.get_all("X-Originating-IP", []),
-        "list_unsubscribe": message.get_all("List-Unsubscribe", []),
-        "precedence": message.get("Precedence", ""),
+        "authentication_results": header_list(message, "Authentication-Results"),
+        "arc_authentication_results": header_list(message, "ARC-Authentication-Results"),
+        "received_spf": header_list(message, "Received-SPF"),
+        "dkim_signatures": header_list(message, "DKIM-Signature"),
+        "return_path": header_str(message, "Return-Path"),
+        "reply_to": header_str(message, "Reply-To"),
+        "received": header_list(message, "Received"),
+        "x_originating_ip": header_list(message, "X-Originating-IP"),
+        "list_unsubscribe": header_list(message, "List-Unsubscribe"),
+        "precedence": header_str(message, "Precedence"),
     }
     # Bulk/marketing markers: a mild NEGATIVE signal for FP reduction.
     auth["bulk_mail"] = bool(auth["list_unsubscribe"]) or (
@@ -726,10 +780,7 @@ def parse_eml(path: Path, deep: bool = False) -> Optional[EmailRecord]:
  
         return None
  
-    sender_header = message.get(
-        "From",
-        "",
-    )
+    sender_header = header_str(message, "From")
  
     sender_name, sender_address = parseaddr(
         sender_header
@@ -740,27 +791,24 @@ def parse_eml(path: Path, deep: bool = False) -> Optional[EmailRecord]:
     )
  
     recipients = extract_addresses(
-        message.get("To", "")
+        header_str(message, "To")
     )
  
     cc = extract_addresses(
-        message.get("Cc", "")
+        header_str(message, "Cc")
     )
  
     message_id = normalize_message_id(
-        message.get("Message-ID", "")
+        header_str(message, "Message-ID")
     )
  
     in_reply_to = normalize_message_id(
-        message.get("In-Reply-To", "")
+        header_str(message, "In-Reply-To")
     )
  
     references = []
  
-    for value in message.get_all(
-        "References",
-        [],
-    ):
+    for value in header_list(message, "References"):
  
         for ref in re.findall(
             r"<[^>]+>",
@@ -779,13 +827,7 @@ def parse_eml(path: Path, deep: bool = False) -> Optional[EmailRecord]:
  
     body = extract_body(message)
  
-    subject = str(
-        message.get(
-            "Subject",
-            "",
-        )
-        or ""
-    )
+    subject = header_str(message, "Subject")
  
     # First pass: URL extraction is cheap; URL risk analysis and attachment
     # hashing are deliberately deferred until the message is a candidate.
@@ -824,13 +866,7 @@ def parse_eml(path: Path, deep: bool = False) -> Optional[EmailRecord]:
         ),
         recipients=recipients,
         cc=cc,
-        date=str(
-            message.get(
-                "Date",
-                "",
-            )
-            or ""
-        ),
+        date=header_str(message, "Date"),
         subject=subject,
         body=body,
         urls=urls,

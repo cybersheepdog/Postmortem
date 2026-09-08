@@ -203,7 +203,7 @@ def _pst_reconstruct_eml(message) -> bytes:
     # Attachments present: build a fresh MIME message carrying the original
     # headers plus the body and re-attached files.
     out = EmailMessage()
-    for key, value in base.items():
+    for key, value in _safe_items(base):
         kl = key.lower()
         if kl in ("content-type", "content-transfer-encoding", "mime-version"):
             continue
@@ -222,8 +222,24 @@ def _pst_reconstruct_eml(message) -> bytes:
     return out.as_bytes()
 
 
+def _safe_items(msg) -> list:
+    """Header name/value pairs, tolerant of headers the stdlib cannot parse.
+
+    ``policy.default`` parses header values on access and raises on malformed
+    ones (e.g. a Message-ID with an empty local part), which would otherwise
+    abort an entire mailbox extraction. Fall back to the raw source values.
+    """
+    try:
+        return list(msg.items())
+    except Exception:
+        try:
+            return [(k, str(v)) for k, v in msg.raw_items()]
+        except Exception:
+            return []
+
+
 def _headers_to_str(msg) -> str:
-    return "".join(f"{k}: {v}\r\n" for k, v in msg.items())
+    return "".join(f"{k}: {v}\r\n" for k, v in _safe_items(msg))
 
 
 def _pst_walk(folder, path_parts, out_dir, counter) -> set:
