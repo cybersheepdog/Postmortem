@@ -463,6 +463,41 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# provenance: every point is accounted for
+# --------------------------------------------------------------------------
+def test_score_reconciles_with_provenance():
+    # The tool's headline claim is that every finding carries its provenance.
+    # A score that cannot be decomposed into named findings is not evidence.
+    # Regression: url_domains used to add points by mutating the score
+    # directly, bypassing add() and leaving no indicator or provenance entry.
+    cases = [
+        dict(subject="Newsletter",
+             body="Links: http://a.example/1 http://b.example/2 http://c.example/3",
+             urls=["http://a.example/1", "http://b.example/2", "http://c.example/3"],
+             url_domains=["a.example", "b.example", "c.example"]),
+        dict(subject="URGENT wire transfer",
+             body="Change bank details immediately and keep this confidential.",
+             attachments=["invoice.docm"]),
+        dict(subject="Re: lunch", body="See you at one."),
+        dict(subject="Account statement",
+             body="Payment received today. http://203.0.113.9/pay",
+             urls=["http://203.0.113.9/pay"], url_domains=["203.0.113.9"]),
+    ]
+    for kw in cases:
+        r = make_record(sender_email="s@ext.example", sender_domain="ext.example")
+        for key, value in kw.items():
+            setattr(r, key, value)
+        calculate_score(r, {"acme.com"}, set())
+        accounted = sum(f.get("weight", 0) for f in r.provenance)
+        assert accounted == r.score, (
+            f"{r.score - accounted} unattributed point(s) for {kw['subject']!r}")
+        # Anything that scored must also be visible to the analyst.
+        for finding in r.provenance:
+            if finding.get("weight", 0):
+                assert finding.get("signal"), "scored finding with no signal name"
+
+
+# --------------------------------------------------------------------------
 # candidate screening: sender, URL traits, standalone signals
 # --------------------------------------------------------------------------
 def _screen_record(**kw):

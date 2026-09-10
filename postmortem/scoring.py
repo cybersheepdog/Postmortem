@@ -1891,10 +1891,14 @@ def calculate_score(
             matched=", ".join(record.urls[:3]))
 
     if record.url_domains:
-        # Per-domain volume bump; reflected in the total, not a named finding.
-        score += len(
-            record.url_domains
-        )
+        # Routed through add() like every other signal. This used to mutate the
+        # score directly, producing points with no indicator and no provenance
+        # entry -- a score the analyst could not decompose, in a tool whose
+        # output is evidence.
+        count = len(record.url_domains)
+        add(f"Links to {count} distinct URL domain(s)", count,
+            category="url", source="body",
+            matched=", ".join(sorted(record.url_domains)[:5]))
 
     if IP_URL_RE.search(text):
         add("URL uses an IP address instead of a domain name", 6,
