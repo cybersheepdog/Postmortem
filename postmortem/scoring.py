@@ -1586,12 +1586,20 @@ def v8_candidate_score(record, screen_chars: int = 16000):
         for p in V8_ATTACHMENT_PATTERNS
     )
  
-    auth = getattr(record, "authentication", {}) or {}
-    auth_failures = 0
-    for key in ("spf", "dkim", "dmarc"):
-        value = str(auth.get(key, "") or "").lower().strip()
-        if value in {"fail", "softfail", "neutral", "temperror", "permerror"}:
-            auth_failures += 1
+    # EmailRecord stores these under `authentication_results`, and stores them
+    # as booleans that parse_authentication_headers() has already derived --
+    # not as raw "spf"/"dkim"/"dmarc" strings. Reading the wrong attribute name
+    # made this block a no-op: a message failing SPF, DKIM and DMARC counted
+    # zero failures and was never promoted, despite this function's contract of
+    # preserving authentication failures.
+    auth = getattr(record, "authentication_results", {}) or {}
+    auth_failures = sum(
+        1 for key in ("spf_fail", "dkim_fail", "dmarc_fail") if auth.get(key)
+    )
+    # M365's composite verdict is a separate judgement from the three
+    # mechanisms and fails on messages where each individual check passes.
+    if auth.get("compauth_fail"):
+        auth_failures += 1
  
     url_count = len(getattr(record, "urls", []) or [])
     attachment_count = len(attachment_names)
