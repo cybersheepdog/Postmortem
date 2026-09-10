@@ -240,6 +240,7 @@ class ProgressTracker:
 # The SQLite cache and whole-file hashing live in postmortem.cache.
 from postmortem.cache import SQLiteRecordCache, sha256_file
 from postmortem import resources  # noqa: E402
+from postmortem.bodytext import prepare_bodies  # noqa: E402
 
 
 def _persist_records(cache, records, args, label, batch_size=1000):
@@ -1468,6 +1469,26 @@ def main():
     )
  
     # ------------------------------------------------------------------
+    # Body regions: the sender's own words vs quoted history and boilerplate
+    # ------------------------------------------------------------------
+    # Runs before any language scoring, and needs the whole corpus: whether a
+    # repeated block is an organization's footer or an attacker's mass-mailed
+    # lure cannot be decided from one message.
+    _compromise_dt = parse_anchor_datetime(
+        getattr(args, "compromise_date", "") or "")
+    with phase("Separating message text from quoted history and boilerplate"):
+        body_summary, _bp_index = prepare_bodies(
+            records, compromise_date=_compromise_dt)
+    print(f"Body blocks: {body_summary['blocks_seen']} distinct; "
+          f"{body_summary['boilerplate_blocks']} identified as boilerplate "
+          f"across senders; {body_summary['messages_reduced']} message(s) reduced")
+    if body_summary["burst_blocks"]:
+        print(term.c(
+            f"Mass-mail bursts: {body_summary['burst_blocks']} body block(s) "
+            "sent repeatedly from a single account in a short window",
+            "yellow"))
+
+    # ------------------------------------------------------------------
     # Initial scoring
     # ------------------------------------------------------------------
  
@@ -1791,7 +1812,9 @@ def main():
         print("Indicators of compromise (Tier 1/2): "
               + ", ".join(f"{t}={by_type[t]}" for t in sorted(by_type)))
 
-    timeline = build_attack_timeline(records)
+    # The audit log is merged in here, so the report carries one
+    # chronology rather than a message timeline and a separate UAL summary.
+    timeline = build_attack_timeline(records, audit_summary)
     precursor_verdict = earliest_malicious_precursor_verdict(records)
 
     manifest = build_run_manifest(

@@ -46,13 +46,20 @@ def parse_date(value: str) -> Optional[datetime]:
         return None
     try:
         dt = parsedate_to_datetime(value)
-        if dt is None:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
     except Exception:
-        return None
+        dt = None
+    if dt is None:
+        # Audit-log timestamps are ISO 8601, not RFC 2822. Without this they
+        # failed to parse and every audit event sorted to the end of the
+        # timeline instead of into its place among the messages.
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def date_sort_key(record):

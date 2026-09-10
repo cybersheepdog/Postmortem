@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
+from postmortem.bodytext import scoring_text
 from postmortem.config import CONFIG, PHISHING_TERMS, BUSINESS_TERMS
 from postmortem.models import EmailRecord, CampaignInfo
 from postmortem.utils import (
@@ -20,10 +21,12 @@ def campaign_features(
     record: EmailRecord,
 ) -> dict:
  
+    # The sender's own words: shared quoted history would otherwise read as
+    # shared authorship and cluster every long thread into one campaign.
     text = (
         record.subject
         + "\n"
-        + record.body
+        + scoring_text(record)
     ).lower()
  
     return {

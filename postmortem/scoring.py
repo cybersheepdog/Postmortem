@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from postmortem.bodytext import scoring_text
 from postmortem.config import (
     CONFIG, PHISHING_TERMS, COMMON_FREE_EMAIL, RISKY_EXTENSIONS,
 )
@@ -72,7 +73,7 @@ def _dedupe_provenance(entries):
 
 
 def classify_attack_stage(record: EmailRecord) -> str:
-    text = clean_text(f"{record.subject}\n{record.body}").lower()
+    text = clean_text(f"{record.subject}\n{scoring_text(record)}").lower()
     payment = (
         "wire", "payment", "invoice", "bank account", "bank details",
         "routing number", "beneficiary", "gift card", "transfer funds",
@@ -1014,7 +1015,7 @@ def score_initial_email(record, scenario, anchors: Anchors):
         record.scenario_reasons = []
         return 0
 
-    text = f"{record.subject}\n{record.body}".lower()
+    text = f"{record.subject}\n{scoring_text(record)}".lower()
     has_url = bool(record.urls)
     cred_lure = any(t in text for t in _CREDENTIAL_LURES)
     pay_lure = any(t in text for t in _PAYMENT_TERMS)
@@ -1423,7 +1424,7 @@ def reconstruct_attack_narrative(records, scenario, anchors, initial_verdict,
 
     # -- 4. Fraudulent objective --------------------------------------------
     def is_fraud(r):
-        text = f"{r.subject}\n{r.body}".lower()
+        text = f"{r.subject}\n{scoring_text(r)}".lower()
         pay = any(t in text for t in _PAYMENT_TERMS) or any(t in text for t in _BANK_CHANGE_TERMS)
         anchored = any("fraud account" in m for m in r.anchor_matches)
         post = bool(anchors.compromise_date) and not r.is_pre_compromise
@@ -1839,9 +1840,13 @@ def calculate_score(
             matched=matched, weight=points,
         ))
 
+    # The sender's own words only. Scoring the whole body meant a standard
+    # confidentiality footer satisfied the secrecy half of the payment+secrecy
+    # combination, and a thread's quoted history re-scored the original lure on
+    # every reply.
     text = (
         f"{record.subject}\n"
-        f"{record.body}"
+        f"{scoring_text(record)}"
     ).lower()
 
     sender = record.sender_email
@@ -2009,6 +2014,28 @@ def calculate_score(
             category="language", source="subject",
             matched=subject_hit.group(0))
 
+    # ------------------------------------------------------------------
+    # Body-region findings
+    # ------------------------------------------------------------------
+    # Quoted history is excluded from scoring, so anything notable that lives
+    # only down there is surfaced without score rather than silently dropped.
+    # The message that originated it is the one that should carry the weight.
+    if record.quoted_signals:
+        add(f"Quoted history mentions: {', '.join(record.quoted_signals[:4])} "
+            "(not scored - attributed to the original message)", 0,
+            category="language", source="body:quoted",
+            matched=", ".join(record.quoted_signals[:4]))
+
+    # The same body text sent many times from one account in a short window is
+    # what an attacker does with a mailbox they have taken over. Detected from
+    # corpus repetition, which is also how boilerplate is found -- the guards
+    # that separate the two live in postmortem.bodytext.
+    if record.burst_copies:
+        add(f"Body text mass-sent: {record.burst_copies} near-identical "
+            f"message(s) from this sender within {record.burst_hours:.0f}h",
+            6, category="reputation", source="corpus:block_repetition",
+            matched=f"{record.burst_copies} copies / {record.burst_hours:.0f}h")
+
     record.score = score
 
     record.indicators = list(
@@ -2147,7 +2174,7 @@ def analyze_temporal_signals(
             record_text = (
                 record.subject
                 + "\n"
-                + record.body
+                + scoring_text(record)
             ).lower()
  
             if (
@@ -2169,7 +2196,7 @@ def analyze_temporal_signals(
                     later_text = (
                         later_record.subject
                         + "\n"
-                        + later_record.body
+                        + scoring_text(later_record)
                     ).lower()
  
                     if any(
@@ -2253,13 +2280,83 @@ def detect_possible_impersonation(
                     ))
 
 
-def build_attack_timeline(records: list[EmailRecord]) -> list[AttackTimelineEvent]:
+def audit_timeline_events(audit_summary: dict) -> list[AttackTimelineEvent]:
+    """Turn UAL findings into timeline entries.
+
+    The audit log records what the attacker did; message signals only infer it.
+    Keeping the two in separate reports leaves the investigator to interleave
+    them by hand, which is the one thing a BEC write-up always needs done.
+    """
+    if not audit_summary:
+        return []
+
+    events = []
+
+    def add(when, stage, summary, evidence, actor="", ip=""):
+        events.append(AttackTimelineEvent(
+            timestamp=when or "", path="", message_id="", sender=actor or "",
+            subject=summary, stage=stage, score=0, campaign_id="",
+            precursor=False, evidence=[e for e in evidence if e],
+            source="audit", actor=actor or "", client_ip=ip or "",
+        ))
+
+    for entry in audit_summary.get("attacker_logins", []) or []:
+        add(entry.get("time"), "attacker_signin",
+            f"Sign-in from {entry.get('ip', 'unknown IP')}",
+            [f"Account: {entry.get('user', '')}"],
+            entry.get("user", ""), entry.get("ip", ""))
+
+    for entry in audit_summary.get("malicious_rules", []) or []:
+        detail = []
+        if entry.get("keywords"):
+            detail.append("Matches on: " + ", ".join(entry["keywords"][:8]))
+        if entry.get("move_to"):
+            detail.append("Moves matching mail to: " + entry["move_to"])
+        if entry.get("delete"):
+            detail.append("Deletes matching mail")
+        if entry.get("forwards"):
+            detail.append("Forwards to: " + ", ".join(entry["forwards"]))
+        add(entry.get("time"), "persistence_rule",
+            f"{entry.get('operation', 'Rule')} created a concealment rule",
+            detail, entry.get("user", ""), entry.get("client_ip", ""))
+
+    for entry in audit_summary.get("forwarding_rules", []) or []:
+        detail = ["Forwards to: " + ", ".join(entry.get("forwards", []))]
+        if entry.get("mailbox_level"):
+            detail.append("Mailbox-level SMTP forwarding, not an inbox rule")
+        if entry.get("keeps_copy"):
+            detail.append("Delivers to the mailbox as well, so the user sees no gap")
+        add(entry.get("time"), "mail_forwarding",
+            f"{entry.get('operation', 'Forwarding')} configured exfiltration",
+            detail, entry.get("user", ""), entry.get("client_ip", ""))
+
+    derived = audit_summary.get("derived", {}) or {}
+    if audit_summary.get("deletions") and derived.get("compromise_date"):
+        add(derived["compromise_date"], "mail_deletion",
+            f"{audit_summary['deletions']} mail deletion event(s) recorded",
+            ["Deleted messages may be absent from the exported corpus"])
+
+    return events
+
+
+def build_attack_timeline(records: list[EmailRecord],
+                          audit_summary: dict = None) -> list[AttackTimelineEvent]:
     events = []
     for r in sorted(records, key=date_sort_key):
         evidence = []
         if r.likely_precursor: evidence.append("Heuristic precursor relationship to later activity")
         evidence.extend(r.indicators[:5])
         events.append(AttackTimelineEvent(r.date, r.path, r.message_id, r.sender_email, r.subject, classify_attack_stage(r), r.score, r.campaign_id, r.likely_precursor, list(dict.fromkeys(evidence))))
+
+    # One chronology, both sources, sorted together. AttackTimelineEvent keeps
+    # its time in `timestamp`, not `date`, so date_sort_key does not apply.
+    events.extend(audit_timeline_events(audit_summary))
+
+    def when(event):
+        dt = parse_date(event.timestamp or "")
+        return dt or datetime.max.replace(tzinfo=timezone.utc)
+
+    events.sort(key=when)
     return events
  
  

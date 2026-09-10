@@ -463,6 +463,201 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# audit log: mailbox forwarding, merged timeline
+# --------------------------------------------------------------------------
+def _write_ual(tmp_path, events):
+    import json
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps(events))
+    return p
+
+
+def test_set_mailbox_smtp_forwarding_is_detected(tmp_path):
+    # Regression: Exchange records Set-Mailbox forwarding inside Parameters,
+    # but the code only looked for it as a top-level field, so one of the most
+    # common BEC persistence mechanisms was never detected -- and its exfil
+    # address never became an anchor.
+    from postmortem.auditlog import analyze_audit_log
+    ual = _write_ual(tmp_path, [{
+        "CreationTime": "2025-09-01T14:32:11", "Operation": "Set-Mailbox",
+        "UserId": "jane@corp.example", "ClientIP": "203.0.113.9",
+        "Parameters": [
+            {"Name": "ForwardingSmtpAddress", "Value": "smtp:exfil@evil.example"},
+            {"Name": "DeliverToMailboxAndForward", "Value": "True"}]}])
+    summary = analyze_audit_log(str(ual))
+    assert "exfil@evil.example" in summary["derived"]["attacker_addresses"]
+    assert "evil.example" in summary["derived"]["attacker_domains"]
+    entry = summary["forwarding_rules"][0]
+    assert entry["mailbox_level"] is True
+    # Forwarding that also delivers to the mailbox hides the exfiltration from
+    # the user, and is worth stating separately.
+    assert entry["keeps_copy"] is True
+
+
+def test_audit_events_merge_into_the_timeline(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import build_attack_timeline
+    from postmortem.utils import parse_date
+
+    ual = _write_ual(tmp_path, [
+        {"CreationTime": "2025-01-15T09:14:00", "Operation": "UserLoggedIn",
+         "UserId": "jane@corp.example", "ClientIP": "203.0.113.9"},
+        {"CreationTime": "2025-01-15T09:26:00", "Operation": "New-InboxRule",
+         "UserId": "jane@corp.example", "ClientIP": "203.0.113.9",
+         "Parameters": [{"Name": "SubjectContainsWords", "Value": "invoice;wire"},
+                        {"Name": "MoveToFolder", "Value": "RSS Feeds"}]}])
+    summary = analyze_audit_log(str(ual))
+
+    before = make_record(mid="before", date="Mon, 13 Jan 2025 09:00:00 +0000")
+    after = make_record(mid="after", date="Fri, 17 Jan 2025 09:00:00 +0000")
+    timeline = build_attack_timeline([before, after], summary)
+
+    sources = [getattr(e, "source", "message") for e in timeline]
+    assert sources.count("audit") == 2
+    assert len(timeline) == 4
+
+    # Fully chronological: audit timestamps are ISO 8601 rather than RFC 2822,
+    # and used to fail to parse, which sorted every audit event to the end.
+    stamps = [parse_date(e.timestamp) for e in timeline]
+    assert all(stamps[i] >= stamps[i - 1] for i in range(1, len(stamps)))
+    assert sources == ["message", "audit", "audit", "message"]
+
+    audit_events = [e for e in timeline if e.source == "audit"]
+    assert {e.stage for e in audit_events} == {"attacker_signin", "persistence_rule"}
+    rule = next(e for e in audit_events if e.stage == "persistence_rule")
+    assert rule.client_ip == "203.0.113.9"
+    assert any("invoice" in d for d in rule.evidence)
+    # An audit event is a recorded fact, not a scored inference.
+    assert rule.score == 0
+
+
+def test_timeline_without_an_audit_log_is_unchanged():
+    from postmortem.scoring import build_attack_timeline
+    records = [make_record(mid="a", date="Mon, 13 Jan 2025 09:00:00 +0000")]
+    assert len(build_attack_timeline(records)) == 1
+    assert len(build_attack_timeline(records, None)) == 1
+    assert build_attack_timeline(records)[0].source == "message"
+
+
+# --------------------------------------------------------------------------
+# body regions: quoted history, signatures, boilerplate, mass-mail bursts
+# --------------------------------------------------------------------------
+def test_split_quoted_and_signature():
+    from postmortem.bodytext import split_quoted, strip_signature
+    body = ("Hi Tom,\n\nThe payment went out today.\n\n"
+            "--\nJane Smith | Accounts Payable\nThis email is confidential.\n\n"
+            "On Mon, 1 Sep 2025 at 09:12, Tom <tom@corp.example> wrote:\n"
+            "> Did the wire transfer go out? Keep this confidential.\n")
+    own, quoted = split_quoted(body)
+    assert "wire transfer" not in own.lower()
+    assert "wire transfer" in quoted.lower()
+    body_only, signature = strip_signature(own)
+    assert "payment went out" in body_only
+    assert "Accounts Payable" in signature
+
+    # Interleaved quoting is history wherever it sits.
+    own, quoted = split_quoted("New text.\n> old quoted line\nMore new text.")
+    assert "old quoted line" not in own
+    assert "old quoted line" in quoted
+
+
+def test_boilerplate_index_separates_footers_from_mass_mail():
+    # The case that makes naive repetition-detection dangerous: an attacker who
+    # mass-mails a lure from a compromised account produces a repeated block
+    # too. Suppressing it would hide the attack.
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    from postmortem.bodytext import BoilerplateIndex, block_hash
+
+    footer = ("This email and any attachments are confidential and intended solely "
+              "for the addressee. If received in error please notify the sender.")
+    lure = ("I have shared a secure document with you through our finance portal. "
+            "Please sign in with your work credentials to review the details.")
+    base = datetime(2025, 6, 1, tzinfo=timezone.utc)
+
+    index = BoilerplateIndex()
+    # Institutional: many senders, wide span, trailing, pre-compromise.
+    for i in range(40):
+        r = make_record(sender_email="user%02d@corp.example" % (i % 10))
+        r.date = format_datetime(base + timedelta(days=i * 1.5))
+        r.is_pre_compromise = True
+        index.observe(r, "Notes attached.\n\n" + footer)
+    # The blast: one sender, four hours, post-compromise, carrying that footer.
+    blast = base + timedelta(days=95)
+    for i in range(25):
+        r = make_record(sender_email="jane@corp.example")
+        r.date = format_datetime(blast + timedelta(minutes=i * 10))
+        r.is_pre_compromise = False
+        index.observe(r, lure + "\n\n" + footer)
+
+    index.finalize(compromise_known=True)
+    assert index.is_boilerplate(block_hash(footer)) is True
+    assert index.is_boilerplate(block_hash(lure)) is False, (
+        "an attacker's mass-mailed lure must never be treated as boilerplate")
+
+    burst = index.burst_for(block_hash(lure))
+    assert burst and burst["count"] == 25 and burst["sender"] == "jane@corp.example"
+    assert index.burst_for(block_hash(footer)) is None
+
+
+def test_footer_no_longer_scores():
+    # Measured before this change: the footer alone was worth +7, because
+    # "confidential" scored and unlocked the payment+secrecy combination.
+    from postmortem.bodytext import prepare_bodies
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    footer = ("This email and any attachments are confidential and intended solely "
+              "for the addressee. If received in error please notify the sender.")
+    message = "Hi Tom, the payment went out today. Thanks."
+    base = datetime(2025, 6, 1, tzinfo=timezone.utc)
+
+    corpus = []
+    for i in range(40):
+        r = make_record(sender_email="user%02d@vendor.example" % (i % 10))
+        r.date = format_datetime(base + timedelta(days=i * 1.5))
+        r.body = "Notes attached.\n\n" + footer
+        corpus.append(r)
+
+    with_footer = make_record(sender_email="jane@vendor.example")
+    with_footer.date = format_datetime(base + timedelta(days=61))
+    with_footer.body = message + "\n\n" + footer
+    without = make_record(sender_email="jane@vendor.example")
+    without.date = format_datetime(base + timedelta(days=61))
+    without.body = message
+    corpus += [with_footer, without]
+
+    prepare_bodies(corpus)
+    for r in (with_footer, without):
+        calculate_score(r, {"acme.com"}, set())
+    assert with_footer.score == without.score, (
+        "the confidentiality footer still contributes "
+        f"{with_footer.score - without.score} point(s)")
+
+
+def test_quoted_signals_are_reported_without_score():
+    # Excluding quoted history from scoring must not become a blind spot.
+    from postmortem.bodytext import prepare_bodies
+    r = make_record(sender_email="bob@corp.example")
+    r.body = ("Looping in finance.\n\n"
+              "On Mon, 1 Sep 2025 at 09:12, a <a@evil.example> wrote:\n"
+              "> Please change the bank details and keep this confidential.\n")
+    plain = make_record(sender_email="bob@corp.example")
+    plain.body = "Looping in finance."
+
+    prepare_bodies([r, plain])
+    assert "bank details" in r.quoted_signals
+    calculate_score(r, {"acme.com"}, set())
+    calculate_score(plain, {"acme.com"}, set())
+    # Reported, but worth nothing: the original message carries the weight.
+    assert r.score == plain.score
+    assert any("Quoted history mentions" in i for i in r.indicators)
+    for finding in r.provenance:
+        if "Quoted history" in finding.get("signal", ""):
+            assert finding.get("weight", 0) == 0
+
+
+# --------------------------------------------------------------------------
 # provenance: every point is accounted for
 # --------------------------------------------------------------------------
 def test_score_reconciles_with_provenance():

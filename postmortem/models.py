@@ -24,6 +24,15 @@ class AttackTimelineEvent:
     precursor: bool = False
     evidence: list[str] = field(default_factory=list)
 
+    # "message" for a mail item, "audit" for an M365 Unified Audit Log event.
+    # Message signals infer what happened; the audit log records it, so the two
+    # belong in one chronology rather than in separate reports -- but the
+    # reader must be able to tell which is which.
+    source: str = "message"
+    # For an audit event: the account and client IP the action came from.
+    actor: str = ""
+    client_ip: str = ""
+
 
 @dataclass
 class CampaignInfo:
@@ -110,6 +119,24 @@ class EmailRecord:
     # already scanned, and what forces a re-scan when the rules change --
     # findings are additive, so re-running the same pass over a record that
     # already carries its results would double-count the score.
+    # The sender's own words: quoted reply history, signature and corpus
+    # boilerplate removed. Language scoring reads this; `body` keeps the full
+    # text for display and export, because a forensic record must not lose
+    # anything. Left empty when nothing was removed, so the common case of a
+    # message with no reply chain costs no extra memory.
+    body_own: str = ""
+
+    # High-signal terms present in the quoted history but absent from the
+    # sender's own text. Reported without score, so excluding quoted text from
+    # scoring never becomes a blind spot for the analyst.
+    quoted_signals: list[str] = field(default_factory=list)
+
+    # Set when this message's body block was mass-sent: the same text from one
+    # sender across many messages in a short window, which is what an attacker
+    # does with a mailbox they have taken over.
+    burst_copies: int = 0
+    burst_hours: float = 0.0
+
     enrichment_fingerprint: str = ""
 
     # The raw attachment-scan hits behind those findings, kept as data rather

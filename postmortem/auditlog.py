@@ -34,7 +34,17 @@ _KEYWORD_PARAMS = {
     "subjectcontainswords", "bodycontainswords", "subjectorbodycontainswords",
     "fromaddresscontainswords", "hassenderoverride",
 }
-_FORWARD_PARAMS = {"forwardto", "redirectto", "forwardasattachmentto"}
+# Inbox-rule forwarding, plus the mailbox-level equivalents. Set-Mailbox
+# records the change inside Parameters, not as a top-level field, so omitting
+# these names here meant SMTP forwarding -- one of the most common BEC
+# persistence mechanisms -- was never detected at all.
+_FORWARD_PARAMS = {
+    "forwardto", "redirectto", "forwardasattachmentto",
+    "forwardingsmtpaddress", "forwardingaddress",
+}
+# Not a forwarding target itself: it says mail is forwarded *and* kept, which
+# is how an attacker avoids the user noticing their mail disappearing.
+_FORWARD_CORROBORATION = {"delivertomailboxandforward"}
 _MOVE_PARAMS = {"movetofolder"}
 # Low-visibility destinations a concealment rule typically uses.
 _HIDDEN_FOLDERS = ("rss feeds", "rss subscriptions", "archive", "junk",
@@ -159,9 +169,13 @@ def _rule_findings(event):
     # Set-Mailbox forwarding lives in top-level fields too.
     forwards, keywords, move_to = [], [], ""
     delete = False
+    keeps_copy = False
     for name, value in params.items():
         if name in _FORWARD_PARAMS and value:
+            # "smtp:exfil@evil.example" is the usual Set-Mailbox form.
             forwards.extend(_EMAIL_RE.findall(str(value)))
+        elif name in _FORWARD_CORROBORATION and str(value).lower() in ("true", "1"):
+            keeps_copy = True
         elif name in _MOVE_PARAMS and value:
             move_to = str(value)
         elif name in _KEYWORD_PARAMS and value:
@@ -177,7 +191,8 @@ def _rule_findings(event):
     suspicious = bool(forwards or hides or keywords)
     return {
         "forwards": forwards, "keywords": keywords, "move_to": move_to,
-        "delete": delete, "suspicious": suspicious,
+        "delete": delete, "suspicious": suspicious, "keeps_copy": keeps_copy,
+        "mailbox_level": bool(forwards) and event["op_lower"] == "set-mailbox",
     }
 
 
@@ -208,6 +223,8 @@ def analyze_audit_log(path):
                 "operation": e["operation"], "user": e["user"], "client_ip": e["client_ip"],
                 "forwards": f["forwards"], "move_to": f["move_to"],
                 "delete": f["delete"], "keywords": f["keywords"],
+                "keeps_copy": f["keeps_copy"],
+                "mailbox_level": f["mailbox_level"],
             }
             (forwarding if (f["forwards"] and not f["keywords"] and not f["delete"] and not f["move_to"])
              else malicious_rules).append(entry)

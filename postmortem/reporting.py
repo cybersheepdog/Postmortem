@@ -400,8 +400,33 @@ def print_summary(
     print()
     print("ATTACK TIMELINE")
     print("-" * 80)
-    for event in timeline[:50]:
-        print(f"{event.timestamp or '(unknown)':25} | {event.stage:28} | score={event.score:3} | {event.path}")
+    # Audit events are always shown. They are the recorded facts of the case,
+    # and on a large corpus a plain head-50 cut would drop every one of them
+    # behind the message volume.
+    shown = [e for e in timeline if getattr(e, "source", "message") == "audit"]
+    for event in timeline:
+        if len(shown) >= 50:
+            break
+        if getattr(event, "source", "message") != "audit":
+            shown.append(event)
+    shown.sort(key=lambda e: timeline.index(e))
+    omitted = len(timeline) - len(shown)
+    for event in shown:
+        if getattr(event, "source", "message") == "audit":
+            who = event.actor or "unknown account"
+            where = f" from {event.client_ip}" if event.client_ip else ""
+            line = (f"{event.timestamp or '(unknown)':25} | {event.stage:28} | "
+                    f"{term.c('AUDIT', 'magenta', 'bold')}    | {event.subject}"
+                    f"  [{who}{where}]")
+            print(line)
+            for detail in event.evidence[:3]:
+                print(f"{'':25} | {'':28} |          - {detail}")
+        else:
+            print(f"{event.timestamp or '(unknown)':25} | {event.stage:28} | "
+                  f"score={event.score:3} | {event.path}")
+    if omitted > 0:
+        print(f"{'':25} | ... {omitted} further message event(s) omitted; "
+              "the JSON report carries the full timeline")
  
     print()
     print("TOP CANDIDATE EMAILS")
@@ -1266,7 +1291,10 @@ def generate_html_interactive(records, campaigns, output, timeline, precursor_ve
         return dt or datetime.max.replace(tzinfo=timezone.utc)
 
     sub_events = sorted(
-        (e for e in timeline if e.path in keep_paths),
+        # Audit events carry no message path, so the record filter would drop
+        # all of them; they are always kept.
+        (e for e in timeline
+         if getattr(e, "source", "message") == "audit" or e.path in keep_paths),
         key=event_sort_key,
     )
 
