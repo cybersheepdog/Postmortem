@@ -1,12 +1,16 @@
 # postmortem - dependencies
 # ============================================================================
-# The core analyzer runs on the Python standard library alone (Python 3.10+).
-# Scanning .eml files, ingesting MBOX, exporting HTML/JSON/CSV/IOC reports, and
-# parsing a Microsoft 365 Unified Audit Log all work with NO third-party
-# packages installed.
+# Python 3.10+ and one required package (below). Beyond psutil, the analyzer
+# runs on the standard library alone: scanning .eml files, ingesting MBOX,
+# exporting HTML/JSON/CSV/IOC reports, and parsing a Microsoft 365 Unified
+# Audit Log all work with nothing else installed.
 #
-# Everything below is optional and each degrades gracefully when absent.
+# Everything under "Optional" degrades gracefully when absent.
 # Uncomment what you need.
+
+# --- Required ---------------------------------------------------------------
+psutil                  # runtime CPU/RAM detection; sizes every parallel phase
+                        # to the host instead of a hard-coded worker count
 
 # --- Optional: parsing correctness / robustness -----------------------------
 # beautifulsoup4        # more robust HTML body/link/form parsing than regex

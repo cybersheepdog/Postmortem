@@ -104,6 +104,21 @@ class EmailRecord:
 
     deep_analyzed: bool = False
 
+    # Fingerprint of the attachment-scan configuration (YARA ruleset contents
+    # plus which passes were enabled) that last enriched this record. It is
+    # what lets an interrupted run resume without re-scanning attachments it
+    # already scanned, and what forces a re-scan when the rules change --
+    # findings are additive, so re-running the same pass over a record that
+    # already carries its results would double-count the score.
+    enrichment_fingerprint: str = ""
+
+    # The raw attachment-scan hits behind those findings, kept as data rather
+    # than as already-applied indicators. Scoring is recomputed from scratch on
+    # every run, so a cached record's indicator list is rebuilt and would lose
+    # them; storing the hits lets a resumed run replay them at the same point
+    # in the pipeline the scan would have produced them.
+    enrichment_hits: list[dict] = field(default_factory=list)
+
     authentication_results: dict = field(default_factory=dict)
 
     # Forensic signals populated by the scenario/anchor analysis pass. These are

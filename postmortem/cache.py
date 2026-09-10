@@ -68,6 +68,53 @@ class SQLiteRecordCache:
             return None
         return row[0], EmailRecord(**json.loads(row[1]))
 
+    def load_path_index(self) -> dict:
+        """Return ``{path: (size, mtime_ns)}`` for every row of this parser version.
+
+        The per-file :meth:`fast_get` costs one SQLite round trip per message,
+        which is invisible on a 30k mailbox and ruinous on a corpus of
+        millions. This pulls the whole identity index in a single scan so the
+        cache check becomes a dict lookup. Only the identity columns are read;
+        the record payloads stay on disk until a hit is confirmed, so the index
+        costs a few tens of bytes per cached message rather than the full
+        serialized record.
+        """
+        index = {}
+        cursor = self.conn.execute(
+            "SELECT path, size, mtime_ns FROM records WHERE parser_version=?",
+            (V7_PARSER_VERSION,),
+        )
+        while True:
+            rows = cursor.fetchmany(10000)
+            if not rows:
+                break
+            for path, size, mtime_ns in rows:
+                index[path] = (size, mtime_ns)
+        return index
+
+    def iter_records_by_paths(self, paths, chunk_size: int = 500):
+        """Yield ``(path, EmailRecord)`` for each cached path, in chunks.
+
+        Used after :meth:`load_path_index` has established which paths are
+        genuine hits, so only records that will actually be reused are
+        deserialized.
+        """
+        paths = list(paths)
+        for offset in range(0, len(paths), chunk_size):
+            chunk = paths[offset:offset + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"""
+                SELECT path, record_json
+                FROM records
+                WHERE parser_version=?
+                  AND path IN ({placeholders})
+                """,
+                [V7_PARSER_VERSION, *chunk],
+            ).fetchall()
+            for path, record_json in rows:
+                yield path, EmailRecord(**json.loads(record_json))
+
     def get_by_hash(self, file_sha256: str):
         row = self.conn.execute(
             """

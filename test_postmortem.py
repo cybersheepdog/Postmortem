@@ -463,6 +463,246 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# scale: adaptive worker sizing, resumable extraction, shared attachment scan
+# --------------------------------------------------------------------------
+def _mk_eml(path, subject="Urgent wire transfer request", attachment=None):
+    m = EmailMessage()
+    m["From"] = "attacker@evil-example.com"
+    m["To"] = "victim@corp-example.com"
+    m["Subject"] = subject
+    m["Date"] = "Mon, 1 Sep 2025 10:00:00 +0000"
+    m["Message-ID"] = "<%s@evil-example.com>" % path.stem
+    m.set_content("Update the bank details now: http://evil-example.com/login")
+    if attachment:
+        name, data, maintype, subtype = attachment
+        m.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(m.as_bytes())
+    return path
+
+
+def test_worker_plan_respects_cpu_memory_and_overrides(monkeypatch):
+    # Worker counts must come from the host at run time, never a fixed cap,
+    # and every bound must stay overridable for odd machines.
+    from postmortem import resources
+
+    monkeypatch.setattr(resources, "cpu_count", lambda logical=None: 8)
+    monkeypatch.setattr(resources, "available_memory", lambda: 32 * 1024**3)
+    monkeypatch.setenv("POSTMORTEM_CPU_RESERVE", "0")
+    n, why = resources.plan_workers("parse")
+    assert n == 8 and "cpu-bound" in why
+
+    # A reservation leaves cores free for the parent and the OS.
+    monkeypatch.setenv("POSTMORTEM_CPU_RESERVE", "2")
+    assert resources.plan_workers("parse")[0] == 6
+
+    # Scarce memory must narrow the pool rather than let it OOM mid-run.
+    monkeypatch.setattr(resources, "available_memory", lambda: 1024**3)
+    n, why = resources.plan_workers("parse")
+    assert n < 6 and "memory-bound" in why
+
+    # An explicit request is a ceiling, not a floor.
+    monkeypatch.setattr(resources, "available_memory", lambda: 32 * 1024**3)
+    assert resources.plan_workers("parse", requested=3)[0] == 3
+    monkeypatch.setenv("POSTMORTEM_WORKERS", "5")
+    assert resources.plan_workers("parse", requested=3)[0] == 5
+
+
+def test_interrupted_extraction_is_not_reused_as_complete(tmp_path):
+    # The bug this guards: reuse used to be decided by "does the output
+    # directory contain any .eml", so a crash part way through a container
+    # left a truncated mailbox that every later run silently accepted.
+    import mailbox
+    from postmortem import mailbox_ingest as mi
+
+    src = tmp_path / "corp.mbox"
+    box = mailbox.mbox(str(src))
+    for i in range(40):
+        m = EmailMessage()
+        m["From"] = "a%d@evil-example.com" % i
+        m["To"] = "v@corp-example.com"
+        m["Subject"] = "Invoice %d" % i
+        m["Date"] = "Mon, 1 Sep 2025 10:00:00 +0000"
+        m["Message-ID"] = "<m%d@evil-example.com>" % i
+        m.set_content("body")
+        box.add(m)
+    box.flush()
+    box.close()
+
+    out = tmp_path / "extracted"
+    real_write = mi._write_eml
+    state = {"n": 0}
+
+    class Boom(Exception):
+        pass
+
+    def flaky(out_dir, parts, seq, raw):
+        state["n"] += 1
+        if state["n"] > 15:
+            raise Boom("simulated power loss")
+        return real_write(out_dir, parts, seq, raw)
+
+    mi._write_eml = flaky
+    try:
+        try:
+            mi.ingest_container(src, out)
+        except Boom:
+            pass
+    finally:
+        mi._write_eml = real_write
+
+    target = out / "corp"
+    assert list(target.rglob("*.eml")), "expected a partial extraction"
+    manifest = mi.read_manifest(target)
+    # Partial output must never pass for a finished extraction.
+    assert not mi._manifest_usable(manifest, src)
+
+    result = mi.ingest_container(src, out)
+    assert not result.get("reused")
+    assert len(list(target.rglob("*.eml"))) == 40
+    assert result["messages_written"] == 40
+
+    # A finished extraction is reused, and only then.
+    again = mi.ingest_container(src, out)
+    assert again.get("reused") is True
+
+
+def test_mbox_resume_skips_already_extracted(tmp_path):
+    import mailbox
+    from postmortem import mailbox_ingest as mi
+
+    src = tmp_path / "corp.mbox"
+    box = mailbox.mbox(str(src))
+    for i in range(30):
+        m = EmailMessage()
+        m["From"] = "a@evil-example.com"
+        m["To"] = "v@corp-example.com"
+        m["Subject"] = "Invoice %d" % i
+        m["Date"] = "Mon, 1 Sep 2025 10:00:00 +0000"
+        m["Message-ID"] = "<m%d@evil-example.com>" % i
+        m.set_content("body")
+        box.add(m)
+    box.flush()
+    box.close()
+
+    target = tmp_path / "out"
+    partial = mi.extract_mbox(src, target, manifest={"mbox_position": 20,
+                                                     "messages_written": 20})
+    # Only the tail is written when the manifest says the head is already done.
+    assert partial["resumed_from"] == 20
+    assert len(list(target.rglob("*.eml"))) == 10
+    # Sequence numbers follow the message's position in the file, so a resumed
+    # run lands on the same filenames an uninterrupted one would.
+    names = sorted(p.name for p in target.rglob("*.eml"))
+    assert names[0] == "000021.eml" and names[-1] == "000030.eml"
+
+
+def test_attachment_scan_decodes_once_for_both_passes(tmp_path):
+    # YARA and QR each used to re-open and re-parse every suspect message.
+    from postmortem import attachment_scan
+
+    records = []
+    for i in range(4):
+        p = _mk_eml(tmp_path / ("m%d.eml" % i),
+                    attachment=("a.png", b"MARKER", "image", "png"))
+        r = parse_eml(p)
+        r.tier = 1
+        records.append(r)
+
+    real = attachment_scan.iter_attachment_payloads
+    calls = {"n": 0}
+
+    def counting(path):
+        calls["n"] += 1
+        return real(path)
+
+    attachment_scan.iter_attachment_payloads = counting
+    attachment_scan._build_decoder = lambda: (
+        lambda payload: ["http://evil-qr-example.com/pay"])
+    try:
+        _, hits = attachment_scan.run_passes(records, want_qr=True)
+    finally:
+        attachment_scan.iter_attachment_payloads = real
+
+    assert hits == 4
+    assert calls["n"] == 4, "each message must be decoded exactly once"
+
+
+def test_enrichment_replay_does_not_double_count(tmp_path):
+    # Findings are additive, and scoring is recomputed from scratch each run.
+    # A record already scanned must have its stored hits replayed exactly once
+    # -- not rescanned, and not applied on top of themselves.
+    from postmortem import attachment_scan
+
+    p = _mk_eml(tmp_path / "m.eml",
+                attachment=("a.png", b"MARKER", "image", "png"))
+    record = parse_eml(p)
+    record.tier = 1
+    attachment_scan._build_decoder = lambda: (
+        lambda payload: ["http://evil-qr-example.com/pay"])
+
+    _, first = attachment_scan.run_passes([record], want_qr=True)
+    score_after_first = record.score
+    stamp = record.enrichment_fingerprint
+    assert first == 1 and stamp and record.enrichment_hits
+
+    # Second run: scoring has rebuilt the record, as the real pipeline does.
+    record.score = 0
+    record.indicators = []
+    record.provenance = []
+    real = attachment_scan.iter_attachment_payloads
+    calls = {"n": 0}
+
+    def counting(path):
+        calls["n"] += 1
+        return real(path)
+
+    attachment_scan.iter_attachment_payloads = counting
+    try:
+        _, second = attachment_scan.run_passes([record], want_qr=True)
+    finally:
+        attachment_scan.iter_attachment_payloads = real
+
+    assert calls["n"] == 0, "an already-scanned record must not be re-read"
+    assert second == 1
+    assert record.score == score_after_first
+    assert len([i for i in record.indicators if "QR" in i]) == 1
+
+    # Changing the configuration must invalidate the stored result.
+    rules = tmp_path / "r.yar"
+    rules.write_text('rule R { condition: false }')
+    assert attachment_scan.fingerprint(rules, True) != stamp
+
+
+def test_prune_keeps_flagged_and_never_leaves_the_extract_dir(tmp_path):
+    from postmortem import mailbox_ingest as mi
+
+    extract_dir = tmp_path / "extracted"
+    outside = tmp_path / "analyst_own_eml"
+    keep = _mk_eml(extract_dir / "corp" / "Inbox" / "000001.eml")
+    drop = _mk_eml(extract_dir / "corp" / "Inbox" / "000002.eml")
+    untouched = _mk_eml(outside / "mine.eml")
+
+    r_keep = parse_eml(keep)
+    r_keep.tier = 1
+    r_drop = parse_eml(drop)
+    r_drop.tier = 3
+    r_outside = parse_eml(untouched)
+    r_outside.tier = 3
+
+    report = mi.prune_to_hits(extract_dir, [r_keep, r_drop, r_outside],
+                              dry_run=True)
+    assert report["removed"] == 1 and keep.exists() and drop.exists()
+
+    report = mi.prune_to_hits(extract_dir, [r_keep, r_drop, r_outside])
+    assert report["removed"] == 1 and report["kept"] == 1
+    assert keep.exists() and not drop.exists()
+    # A file the investigator supplied is outside the staging directory and
+    # must be untouchable, whatever its tier.
+    assert untouched.exists()
+
+
+# --------------------------------------------------------------------------
 # parsing correctness (HTML + PSL), top-domains summary, terminal color
 # --------------------------------------------------------------------------
 def test_html_to_text_and_links():

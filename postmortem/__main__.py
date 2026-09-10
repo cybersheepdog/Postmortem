@@ -239,6 +239,43 @@ class ProgressTracker:
  
 # The SQLite cache and whole-file hashing live in postmortem.cache.
 from postmortem.cache import SQLiteRecordCache, sha256_file
+from postmortem import resources  # noqa: E402
+
+
+def _persist_records(cache, records, args, label, batch_size=1000):
+    """Write records back to the analysis cache in batched transactions.
+
+    Used by any phase that enriches records after the initial cache write, so
+    its work survives an interrupted run instead of being recomputed.
+    """
+    if not records:
+        return 0
+    rows = []
+    stored = 0
+    for record in records:
+        try:
+            path = Path(record.path)
+            st = path.stat()
+            file_hash = getattr(record, "_cache_file_sha256", None)
+            if not file_hash:
+                file_hash = sha256_file(path) if args.content_hash else ""
+            rows.append((
+                str(path), st.st_size, st.st_mtime_ns, file_hash,
+                V7_PARSER_VERSION,
+                json.dumps(asdict(record), ensure_ascii=False),
+            ))
+            if len(rows) >= batch_size:
+                cache.put_batch(rows)
+                stored += len(rows)
+                rows.clear()
+        except Exception as exc:  # noqa: BLE001 - caching is best-effort
+            print(f"\n[!] Could not persist {label} for {record.path}: {exc}",
+                  file=sys.stderr)
+    if rows:
+        cache.put_batch(rows)
+        stored += len(rows)
+    print(f"Persisted {stored} {label} to the cache")
+    return stored
 def v8_cache_progress(phase, completed, total, started, extra=""):
     elapsed = max(time.monotonic() - started, 0.001)
     rate = completed / elapsed
@@ -463,7 +500,7 @@ def v6_parallel_deep_analysis(records, candidate_indexes, max_workers, url_cache
     if not pending:
         return []
 
-    workers = max(1, min(int(max_workers or 1), 16))
+    workers = max(1, int(max_workers or 1))
 
     if workers == 1 or len(pending) < _PROCESS_POOL_MIN_JOBS:
         for index in pending:
@@ -655,6 +692,37 @@ def main():
     )
 
     parser.add_argument(
+        "--prune-extracted",
+        action="store_true",
+        help=(
+            "After reporting, delete extracted .eml files that no signal "
+            "flagged, keeping Tier 1/2 and anything with an attachment-scan "
+            "hit. Only ever touches the extraction staging directory, never a "
+            "directory of .eml you supplied. Note that later runs over that "
+            "directory then see only the retained messages, so totals will "
+            "differ: this is a close-out step to reclaim disk, not a routine "
+            "optimization. --reingest restores the full extraction. Off by "
+            "default; use --prune-dry-run first."
+        ),
+    )
+
+    parser.add_argument(
+        "--prune-dry-run",
+        action="store_true",
+        help="Report what --prune-extracted would delete, and delete nothing.",
+    )
+
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help=(
+            "Do not resume an extraction that was interrupted; discard the "
+            "partial output and start that container again. By default an "
+            "unfinished extraction is continued from its last checkpoint."
+        ),
+    )
+
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -709,17 +777,13 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(
-            8,
-            max(
-                1,
-                os.cpu_count()
-                or 4,
-            ),
-        ),
+        default=None,
         help=(
-            "Number of parallel parsing workers "
-            "(default: %(default)s)"
+            "Upper bound on parallel workers. Default: auto-detected per "
+            "phase from the core count and currently available RAM, so the "
+            "same command adapts to the machine it runs on. This value is a "
+            "ceiling request, not a floor -- a phase still runs narrower if "
+            "memory demands it. See POSTMORTEM_* environment overrides."
         ),
     )
  
@@ -951,7 +1015,7 @@ def main():
 
         return 1
 
-    if args.workers < 1:
+    if args.workers is not None and args.workers < 1:
 
         print(
             "Error: --workers must be >= 1",
@@ -968,6 +1032,7 @@ def main():
     # Container ingestion (PST/OST/MBOX -> .eml, folders preserved)
     # ------------------------------------------------------------------
     containers = find_containers(args.directory)
+    pruneable_dir = None
     if containers:
         base = args.directory if args.directory.is_dir() else args.directory.parent
         extract_dir = args.extract_dir or (base / ".postmortem_extracted")
@@ -976,7 +1041,10 @@ def main():
             f"({', '.join(sorted({c.suffix.lower().lstrip('.') for c in containers}))}); "
             f"extracting to {extract_dir}"
         )
-        ingest = ingest_all(args.directory, extract_dir, reingest=args.reingest)
+        ingest = ingest_all(args.directory, extract_dir,
+                            reingest=args.reingest,
+                            workers=args.workers,
+                            resume=not args.no_resume)
         print(
             f"Extracted {ingest['messages_written']} message(s) "
             f"from {ingest['containers_found']} container(s)"
@@ -987,6 +1055,7 @@ def main():
         # A bare container file: analyze only what we extracted from it, not
         # whatever else happens to sit in its parent directory.
         scan_root = extract_dir if input_is_container_file else args.directory
+        pruneable_dir = extract_dir
     elif input_is_container_file:
         print(f"Error: not an ingestable container: {args.directory}",
               file=sys.stderr)
@@ -998,15 +1067,17 @@ def main():
         f"Scanning: {scan_root}"
     )
 
-    eml_files = sorted(
-        p
-        for p in scan_root.rglob("*")
-        if (
-            p.is_file()
-            and p.suffix.lower()
-            == ".eml"
-        )
-    )
+    # os.walk is backed by scandir, which reports file-vs-directory straight
+    # from the directory entry. Path.rglob("*") + p.is_file() instead pays a
+    # stat syscall per entry, which on a corpus of millions of extracted
+    # messages costs more than the parsing does.
+    eml_files = []
+    for dirpath, dirnames, filenames in os.walk(scan_root):
+        dirnames.sort()
+        for name in filenames:
+            if name.lower().endswith(".eml"):
+                eml_files.append(Path(dirpath) / name)
+    eml_files.sort(key=str)
 
     print(
         f"Found {len(eml_files)} .eml files"
@@ -1033,24 +1104,56 @@ def main():
  
     if args.no_cache:
         print("Cache disabled (--no-cache): parsing every message fresh...")
+        parse_jobs = list(eml_files)
     else:
         print("Checking persistent analysis cache (metadata fast-path; no full-file hashing yet)...")
-    for index, path in enumerate(eml_files, 1):
-        cached = None
-        if not args.no_cache:
-            try:
-                cached = cache.fast_get(path)
-            except OSError:
-                cached = None
+        # Pull the whole (path, size, mtime) identity index in one scan, then
+        # decide every file against a dict. The previous per-file fast_get()
+        # issued one SQLite round trip per message.
+        try:
+            path_index = cache.load_path_index()
+        except Exception as exc:  # noqa: BLE001 - cache is an optimization
+            print(f"[!] Could not load cache index ({exc}); parsing fresh.",
+                  file=sys.stderr)
+            path_index = {}
  
-        if cached:
-            _, record = cached
-            records.append(record)
-            cache_hits += 1
-        else:
-            parse_jobs.append(path)
+        hit_paths = []
+        for index, path in enumerate(eml_files, 1):
+            entry = path_index.get(str(path))
+            if entry is not None:
+                try:
+                    st = path.stat()
+                except OSError:
+                    st = None
+                if st is not None and (st.st_size, st.st_mtime_ns) == entry:
+                    hit_paths.append(path)
+                else:
+                    parse_jobs.append(path)
+            else:
+                parse_jobs.append(path)
+            progress_bar(index, len(eml_files))
+        print()
  
-        progress_bar(index, len(eml_files))
+        # Deserialize only the records that are genuine hits.
+        if hit_paths:
+            print(f"Loading {len(hit_paths)} cached record(s)...")
+            by_path = {}
+            for loaded, (path_str, record) in enumerate(
+                cache.iter_records_by_paths([str(p) for p in hit_paths]), 1
+            ):
+                by_path[path_str] = record
+                progress_bar(loaded, len(hit_paths))
+            print()
+            for path in hit_paths:
+                record = by_path.get(str(path))
+                if record is None:
+                    # Index said hit but the payload is gone (concurrent
+                    # vacuum, partial write): fall back to parsing it.
+                    parse_jobs.append(path)
+                    continue
+                records.append(record)
+                cache_hits += 1
+            parse_jobs.sort(key=str)
  
     print()
     print(
@@ -1067,8 +1170,10 @@ def main():
             chunksize = 1
         else:
             # Process pool (auto-falls back to serial if unavailable): real
-            # parallelism for CPU-bound MIME parsing.
-            workers = max(1, min(args.workers, 16))
+            # parallelism for CPU-bound MIME parsing. Width is derived from the
+            # host rather than a fixed cap, so this scales with the machine.
+            workers, why = resources.plan_workers("parse", requested=args.workers)
+            print(f"  parse workers: {workers} ({why})")
             chunksize = max(1, len(parse_jobs) // (workers * 4))
         for completed, result in enumerate(
             parallel_map(_parse_uncached_worker, parse_jobs, workers, chunksize), 1
@@ -1115,7 +1220,12 @@ def main():
                 return path, record, sha256_file(path)
 
             hashed = []
-            hash_workers = max(1, min(args.workers, 16))
+            # I/O-bound thread pool: it may run wider than the CPU-bound
+            # phases, since threads waiting on disk cost almost no memory.
+            hash_workers, hash_why = resources.plan_workers(
+                "hash", requested=args.workers, footprint=16 * 1024 * 1024
+            )
+            print(f"  hash workers: {hash_workers} ({hash_why})")
  
             if hash_workers == 1:
                 for completed, item in enumerate(hash_jobs, 1):
@@ -1375,15 +1485,18 @@ def main():
  
     # Configurable bounded concurrency. Keep this modest by default so large
     # investigations do not overwhelm disk/CPU.
-    max_workers = max(
-        1,
-        min(
-            int(os.environ.get("BEC_HUNT_WORKERS", "4")),
-            16,
-        ),
-    )
+    # BEC_HUNT_WORKERS remains honored so existing scripts keep working; with
+    # it unset the width is derived from the host instead of a fixed 4.
+    _legacy_workers = os.environ.get("BEC_HUNT_WORKERS")
+    if _legacy_workers and _legacy_workers.strip().isdigit():
+        max_workers = max(1, int(_legacy_workers.strip()))
+        workers_why = "BEC_HUNT_WORKERS=" + _legacy_workers.strip()
+    else:
+        max_workers, workers_why = resources.plan_workers(
+            "deep", requested=args.workers
+        )
  
-    print(f"Pass 2/2: deep enrichment ({max_workers} workers)")
+    print(f"Pass 2/2: deep enrichment ({max_workers} workers, {workers_why})")
     analyzed_indexes = v6_parallel_deep_analysis(
         records,
         candidate_indexes,
@@ -1536,26 +1649,48 @@ def main():
         print(f"Domain-age (RDAP): {n} newly-registered sender domain(s) "
               f"(< {args.check_domain_age}d)")
         enriched = enriched or bool(n)
-    if getattr(args, "yara_rules", None):
-        from postmortem.yara_scan import scan_records as yara_scan
-        with phase("YARA scan of suspect attachments"):
-            res = yara_scan(records, args.yara_rules)
-        if res["available"]:
+    # YARA and QR share one decode of each suspect's attachments, so running
+    # both costs one sweep rather than two. Either can be enabled alone.
+    want_yara = bool(getattr(args, "yara_rules", None))
+    want_qr = bool(getattr(args, "scan_qr", False))
+    if want_yara or want_qr:
+        from postmortem.attachment_scan import run_passes
+        labels = [x for x, on in (("YARA", want_yara), ("QR", want_qr)) if on]
+        with phase(f"{' + '.join(labels)} scan of suspect attachments"):
+            res, qr_n = run_passes(
+                records,
+                rules_path=args.yara_rules if want_yara else None,
+                want_qr=want_qr,
+                requested_workers=args.workers,
+            )
+        if want_yara and res["available"]:
             msg = (f"YARA: {res['matches']} match(es) across "
                    f"{res['attachments']} attachment(s) in {res['messages']} "
                    f"Tier 1/2 message(s) using {res['rules_loaded']} rule file(s)")
             if res["rules_failed"]:
                 msg += f" ({res['rules_failed']} rule file(s) skipped)"
-            if res["rules_loaded"] and res["attachments"] == 0:
+            if res.get("replayed"):
+                msg += (f"  ({res['replayed']} message(s) reused from a prior "
+                        f"scan with these rules, {res.get('scanned', 0)} rescanned)")
+            elif res["rules_loaded"] and res["attachments"] == 0:
                 msg += "  (no attachments on the suspects to scan)"
             print(term.c(msg, "green" if res["matches"] else "dim"))
-        enriched = enriched or bool(res["matches"])
-    if getattr(args, "scan_qr", False):
-        from postmortem.qr_scan import scan_records as qr_scan
-        with phase("QR-code decode of suspect images"):
-            n = qr_scan(records)
-        print(f"QR scan: {n} QR-code URL(s) in image attachments")
-        enriched = enriched or bool(n)
+        if want_qr:
+            print(f"QR scan: {qr_n} QR-code URL(s) in image attachments")
+        enriched = enriched or bool(res["matches"]) or bool(qr_n)
+        # Persist the scanned records immediately. These passes mutate records
+        # in memory after the cache has already been written, so before this
+        # every YARA/QR result was thrown away by a crash -- and redone in full
+        # on the next run. Records carry the configuration fingerprint that
+        # produced them, so a resumed run skips what it already scanned and a
+        # changed ruleset invalidates it.
+        _persist_records(
+            cache,
+            [r for r in records
+             if getattr(r, "enrichment_fingerprint", "")],
+            args,
+            "attachment-scan result(s)",
+        )
     if getattr(args, "geoip_db", None) or getattr(args, "maxmind_key", None):
         from postmortem.geoip import (
             GeoResolver, ensure_databases, annotate_records as geo_annotate)
@@ -1678,6 +1813,29 @@ def main():
         write_iocs_csv(iocs, args.ioc)
 
         print(term.c(f"IOC list ({len(iocs)} indicators) written to: {args.ioc}", "green"))
+
+    # ------------------------------------------------------------------
+    # Optional retention step: drop the extracted messages nothing flagged.
+    # Runs last, after every report has been written, so a prune can never
+    # remove a file the reporting still needed.
+    # ------------------------------------------------------------------
+    if args.prune_extracted or args.prune_dry_run:
+        if not pruneable_dir:
+            print("[!] --prune-extracted only applies to a corpus this run "
+                  "extracted from a container; nothing to prune.",
+                  file=sys.stderr)
+        else:
+            from postmortem.mailbox_ingest import prune_to_hits
+            with phase("Pruning unflagged extracted messages"):
+                pruned = prune_to_hits(pruneable_dir, records,
+                                       dry_run=args.prune_dry_run)
+            verb = "Would delete" if pruned["dry_run"] else "Deleted"
+            print(f"{verb} {pruned['removed']} unflagged .eml "
+                  f"({pruned['bytes_freed'] / 1e6:.1f}MB), kept "
+                  f"{pruned['kept']}")
+            if pruned["failures"]:
+                print(f"[!] {pruned['failures']} file(s) could not be removed",
+                      file=sys.stderr)
 
     # CI gating: exit non-zero (3) when suspects meet the requested tier.
     if args.fail_on_tier:
