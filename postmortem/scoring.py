@@ -1537,9 +1537,14 @@ V8_SOCIAL_ENGINEERING_PATTERNS = (
     re.compile(r"\b(?:keep this confidential|do not call|don't call|do not reply)\b", re.I),
 )
  
+# Traits of a suspicious URL, matched against the extracted URLs -- never
+# against the message body, where these are ordinary words. Bare link presence
+# is not a risk trait; it is counted separately as url_count.
 V8_URL_RISK_PATTERNS = (
-    re.compile(r"https?://", re.I),
     re.compile(r"\b(?:login|signin|verify|secure|account|update|payment)\b", re.I),
+    re.compile(r"https?://\d{1,3}(?:\.\d{1,3}){3}", re.I),      # IP-literal host
+    re.compile(r"https?://[^/\s]*xn--", re.I),                    # punycode host
+    re.compile(r"https?://[^/\s]*:[^/@\s]*@", re.I),              # credentials in URL
 )
  
 V8_ATTACHMENT_PATTERNS = (
@@ -1547,6 +1552,18 @@ V8_ATTACHMENT_PATTERNS = (
     re.compile(r"\.(?:docm|xlsm|pptm)$", re.I),
     re.compile(r"\.(?:html?|shtml)$", re.I),
 )
+
+
+# Individually addressable URL traits, so each can carry its own weight and
+# name its own reason rather than being pooled into a single count.
+_SCREEN_URL_CREDENTIALS_RE = re.compile(r"https?://[^/\s]*:[^/@\s]*@", re.I)
+_SCREEN_URL_IP_HOST_RE = re.compile(r"https?://\d{1,3}(?:\.\d{1,3}){3}", re.I)
+_SCREEN_URL_PUNYCODE_RE = re.compile(r"https?://[^/\s]*xn--", re.I)
+
+# An executive title carried in the display name rather than the address.
+_SCREEN_EXEC_TITLE_RE = re.compile(
+    r"\b(?:ceo|cfo|coo|cto|chief\s+\w+\s+officer|president|managing\s+director|"
+    r"executive\s+director|chairman|chairwoman|chairperson)\b", re.I)
 
 
 # Screening-time base64 heuristics: a long base64 run, and inline data: images
@@ -1565,19 +1582,44 @@ def v8_candidate_score(record, screen_chars: int = 16000):
     and suspicious structural indicators.
     """
     subject = str(getattr(record, "subject", "") or "")
-    sender = str(getattr(record, "sender", "") or "")
+    # EmailRecord has no `sender` field -- it is `sender_email`, with the
+    # display name separately in `sender_name`. Reading the wrong name meant
+    # the sender contributed nothing to screening: display-name impersonation
+    # of an executive, free-mail addresses and known attacker addresses were
+    # all invisible to the pass that decides what gets examined.
+    sender = " ".join(filter(None, (
+        str(getattr(record, "sender_name", "") or ""),
+        str(getattr(record, "sender_email", "") or ""),
+    )))
     body = str(getattr(record, "body", "") or "")
     # Screening scans only the first `screen_chars` of the body: BEC/phishing
     # asks appear in the subject and early body, and deep analysis re-examines
     # every candidate. Lowering this speeds up pass 1 on long-body mail.
-    text = f"{subject}\n{sender}\n{body[:screen_chars]}"
+    #
+    # Two texts, not one. What a message *says* is content; who it claims to be
+    # *from* is identity. Matching the content family against the sender made
+    # every message from an ordinary invoice@ or billing@ mailbox score as if
+    # it used invoice language, so the address feeds the identity family only.
+    text = f"{subject}\n{body[:screen_chars]}"
+    identity_text = f"{sender}\n{text}"
  
     score = 0
     reasons = []
  
     high = sum(bool(p.search(text)) for p in V8_HIGH_SIGNAL_PATTERNS)
-    social = sum(bool(p.search(text)) for p in V8_SOCIAL_ENGINEERING_PATTERNS)
-    url_risk = sum(bool(p.search(text)) for p in V8_URL_RISK_PATTERNS)
+    social = sum(bool(p.search(identity_text)) for p in V8_SOCIAL_ENGINEERING_PATTERNS)
+
+    # URL-risk patterns describe suspicious traits *of a URL* -- a path like
+    # /secure/verify/account. Run against the whole message they matched those
+    # words as ordinary prose, so any mail containing "update", "account" or
+    # "payment" registered as URL risk with no URL involved. Match them
+    # against the extracted URLs only. Link presence is not a risk trait and
+    # is carried by url_count below, so it is not counted here.
+    url_text = "\n".join(str(u) for u in (getattr(record, "urls", []) or []))
+    url_risk = (
+        sum(bool(p.search(url_text)) for p in V8_URL_RISK_PATTERNS)
+        if url_text else 0
+    )
  
     attachment_names = list(getattr(record, "attachments", []) or [])
     risky_attachments = sum(
@@ -1636,6 +1678,32 @@ def v8_candidate_score(record, screen_chars: int = 16000):
     if url_count and url_risk and (high or social):
         score += 2
         reasons.append("suspicious URL context")
+
+    # Traits with essentially no legitimate use in business mail. These are
+    # precise enough to stand on their own; requiring a partner signal meant a
+    # message whose only content was a credential-harvesting link scored zero.
+    if url_text:
+        if _SCREEN_URL_CREDENTIALS_RE.search(url_text):
+            score += 5
+            reasons.append("credentials embedded in a URL")
+        if _SCREEN_URL_IP_HOST_RE.search(url_text):
+            score += 5
+            reasons.append("URL points at a bare IP address")
+        if _SCREEN_URL_PUNYCODE_RE.search(url_text):
+            score += 4
+            reasons.append("punycode hostname")
+
+    # An executive title in the display name, sent from consumer webmail, is
+    # the opening move of most BEC. It carries no lure text by design -- the
+    # ask comes in the second message -- so gating it behind content signals
+    # is exactly backwards.
+    if _SCREEN_EXEC_TITLE_RE.search(str(getattr(record, "sender_name", "") or "")):
+        if str(getattr(record, "sender_domain", "") or "").lower() in COMMON_FREE_EMAIL:
+            score += 5
+            reasons.append("executive display name from a free-mail address")
+        else:
+            score += 1
+            reasons.append("executive title in display name")
  
     # Generic attachments are weak evidence; don't promote them alone.
     if attachment_count and not risky_attachments and (high or social):

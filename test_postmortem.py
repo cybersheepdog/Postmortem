@@ -463,6 +463,88 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# candidate screening: sender, URL traits, standalone signals
+# --------------------------------------------------------------------------
+def _screen_record(**kw):
+    r = make_record(sender_email=kw.get("sender_email", "s@ext.example"),
+                    sender_domain=kw.get("sender_domain", "ext.example"))
+    r.subject = kw.get("subject", "Hello")
+    r.body = kw.get("body", "Regular message.")
+    r.sender_name = kw.get("sender_name", "")
+    r.urls = kw.get("urls", [])
+    r.attachments = kw.get("attachments", [])
+    r.authentication_results = kw.get("auth", {})
+    return r
+
+
+def test_url_risk_patterns_do_not_match_body_prose():
+    # Regression: URL-risk patterns were matched against the whole message, so
+    # ordinary words like "update", "account" and "payment" registered as URL
+    # risk with no URL involved.
+    prose = _screen_record(subject="Your March product update",
+                           body="Your payment was received. Please update your account records.")
+    assert v8_candidate_score(prose)[1] == 0
+
+    # The same words inside a URL still count -- but the risky-path family
+    # stays gated behind a content signal, because plenty of legitimate URLs
+    # contain "account" or "update". Isolate its contribution by holding the
+    # lure text constant and varying only the URL.
+    lure = "Please confirm your account. "
+    risky = _screen_record(subject="Password reset",
+                           body=lure + "http://evil.example/secure/verify/account",
+                           urls=["http://evil.example/secure/verify/account"])
+    benign = _screen_record(subject="Password reset",
+                            body=lure + "https://corp.example/offsite",
+                            urls=["https://corp.example/offsite"])
+    assert v8_candidate_score(risky)[1] > v8_candidate_score(benign)[1]
+
+    # A benign link with no lure is not evidence on its own.
+    plain = _screen_record(subject="Team offsite",
+                           body="Agenda: https://corp.example/offsite",
+                           urls=["https://corp.example/offsite"])
+    assert v8_candidate_score(plain)[1] == 0
+
+
+def test_url_traits_promote_without_a_partner_signal():
+    # These have essentially no legitimate use in business mail, so a message
+    # whose only content is such a link must still be examined.
+    for body, url, reason in (
+        ("see http://u:p@evil.example/", "http://u:p@evil.example/", "credentials"),
+        ("see http://203.0.113.9/x", "http://203.0.113.9/x", "bare IP"),
+    ):
+        r = _screen_record(subject="Doc", body=body, urls=[url])
+        candidate, score, reasons = v8_candidate_score(r)
+        assert candidate is True, reason
+        assert any(reason.split()[0].lower() in x.lower() for x in reasons)
+
+
+def test_executive_display_name_from_free_mail_stands_alone():
+    # The opening move of most BEC carries no lure text by design; gating it
+    # behind content signals meant it scored zero.
+    bec = _screen_record(sender_name="Dana Whitfield (CEO)",
+                         sender_email="dana.w@gmail.com", sender_domain="gmail.com",
+                         subject="Quick favour", body="Are you at your desk?")
+    candidate, score, reasons = v8_candidate_score(bec)
+    assert candidate is True
+    assert any("free-mail" in r for r in reasons)
+
+    # The genuine executive on the corporate domain is not a candidate.
+    real = _screen_record(sender_name="Dana Whitfield, CEO",
+                          sender_email="dana@corp.example", sender_domain="corp.example",
+                          subject="All-hands Friday", body="See you there.")
+    assert v8_candidate_score(real)[0] is False
+
+
+def test_sender_address_does_not_feed_the_content_family():
+    # An ordinary accounts-payable mailbox address must not score as though the
+    # message used invoice language.
+    ap = _screen_record(sender_email="invoice@supplier.example",
+                        sender_domain="supplier.example",
+                        subject="Statement", body="Attached.")
+    assert v8_candidate_score(ap)[1] == 0
+
+
+# --------------------------------------------------------------------------
 # candidate screening: authentication signal
 # --------------------------------------------------------------------------
 def _auth_record(**auth):
