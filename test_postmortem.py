@@ -463,6 +463,68 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# candidate screening: authentication signal
+# --------------------------------------------------------------------------
+def _auth_record(**auth):
+    r = make_record(sender_email="s@ext.example", sender_domain="ext.example")
+    r.subject = "Quarterly figures"
+    r.body = "Attached as discussed."
+    r.attachments = []
+    r.authentication_results = dict(auth)
+    return r
+
+
+def test_auth_failures_promote_a_candidate():
+    # Regression: v8_candidate_score used to read record.authentication (no
+    # such field) and compare "spf"/"dkim"/"dmarc" strings (wrong shape), so a
+    # message failing every mechanism counted zero failures and was skipped by
+    # deep analysis entirely.
+    clean = _auth_record(spf_pass=True, dkim_pass=True, dmarc_pass=True)
+    assert v8_candidate_score(clean)[0] is False
+
+    failing = _auth_record(spf_fail=True, dkim_fail=True, dmarc_fail=True)
+    candidate, score, reasons = v8_candidate_score(failing)
+    assert candidate is True
+    assert score > 0
+    assert any("authentication" in r for r in reasons)
+
+    # A lone SPF failure is routine on forwarded mail and stays below the bar.
+    assert v8_candidate_score(_auth_record(spf_fail=True))[0] is False
+
+    # M365's composite verdict is its own judgement, counted alongside the
+    # three mechanisms.
+    both = _auth_record(spf_fail=True, compauth_fail=True)
+    assert both.authentication_results["compauth_fail"] is True
+    assert v8_candidate_score(both)[1] > v8_candidate_score(_auth_record(spf_fail=True))[1]
+
+
+def test_bulk_mail_is_not_promoted_by_auth_failure_alone():
+    # Relaying breaks SPF and DKIM on legitimate list traffic, so an auth
+    # failure on an otherwise unremarkable bulk message is weak evidence.
+    bulk = _auth_record(spf_fail=True, dkim_fail=True, bulk_mail=True)
+    bulk.subject = "Your March product update"
+    bulk.body = "Here is what shipped this month."
+    candidate, score, reasons = v8_candidate_score(bulk)
+    assert candidate is False
+    assert score == 0
+    assert any("not promoted" in r for r in reasons)
+
+    # But any other signal restores it: bulk is a tie-breaker, not an exemption.
+    phishy = _auth_record(spf_fail=True, dkim_fail=True, bulk_mail=True)
+    phishy.subject = "Verify your account immediately"
+    phishy.body = "Click here to confirm your identity and reset your password."
+    assert v8_candidate_score(phishy)[0] is True
+
+    attached = _auth_record(spf_fail=True, dkim_fail=True, bulk_mail=True)
+    attached.attachments = ["statement.hta"]
+    assert v8_candidate_score(attached)[0] is True
+
+    # A non-bulk message with the same failures is unaffected.
+    assert v8_candidate_score(
+        _auth_record(spf_fail=True, dkim_fail=True))[0] is True
+
+
+# --------------------------------------------------------------------------
 # scale: adaptive worker sizing, resumable extraction, shared attachment scan
 # --------------------------------------------------------------------------
 def _mk_eml(path, subject="Urgent wire transfer request", attachment=None):

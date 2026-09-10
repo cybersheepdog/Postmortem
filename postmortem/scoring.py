@@ -1631,9 +1631,6 @@ def v8_candidate_score(record, screen_chars: int = 16000):
         score += 5
         reasons.append("risky attachment type")
  
-    if auth_failures:
-        score += min(4, auth_failures * 2)
-        reasons.append("authentication anomaly")
  
     # A URL by itself is deliberately NOT enough anymore.
     if url_count and url_risk and (high or social):
@@ -1651,10 +1648,30 @@ def v8_candidate_score(record, screen_chars: int = 16000):
         score += 1
         reasons.append("large transactional body")
  
+    # Authentication is scored last, so "did anything else fire?" is simply
+    # whether the score is still zero.
+    #
+    # Bulk/marketing and mailing-list traffic routinely fails SPF and DKIM
+    # because relaying breaks them, so an authentication failure on a message
+    # that is otherwise entirely unremarkable is weak evidence. This mirrors
+    # the negative weighting the scenario path already applies to bulk_mail.
+    # Any other signal at all - content, URL, attachment - and the failure
+    # counts normally.
+    if auth_failures:
+        if auth.get("bulk_mail") and score == 0:
+            auth_failures = 0  # must not satisfy the candidate rule below
+            reasons.append("authentication anomaly on bulk mail - not promoted")
+        else:
+            score += min(4, auth_failures * 2)
+            reasons.append("authentication anomaly")
+
     # Conservative threshold: strong evidence or at least two independent
     # signal families. This should materially reduce the 96.8% candidate rate
     # seen in the prior run.
-    candidate = (
+    # bool(): the clauses below are counts, not predicates, so without this the
+    # function returns 0 or an integer where callers expect True/False -- which
+    # survives an `if` unnoticed but is wrong the moment it reaches JSON.
+    candidate = bool(
         score >= 5
         or (score >= 4 and (high or social or risky_attachments or auth_failures))
         or (high and social)
