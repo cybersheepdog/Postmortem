@@ -22,6 +22,11 @@ without a code change.
 Environment overrides:
   POSTMORTEM_WORKERS            hard worker count; skips all detection
   POSTMORTEM_MAX_WORKERS        upper clamp on the detected count
+  POSTMORTEM_MAX_WORKERS_<PHASE>  per-phase clamp, e.g. ..._EXTRACT=4.
+                                Phases: EXTRACT, PARSE, YARA, QR, DEEP, HASH.
+                                Storage often peaks at a different width for
+                                writing than the CPU does for parsing, and one
+                                global cap cannot express that.
   POSTMORTEM_CPU_RESERVE        cores to leave free (default 1)
   POSTMORTEM_MEMORY_FRACTION    fraction of available RAM usable (default 0.7)
   POSTMORTEM_WORKER_MB          per-worker footprint estimate in MB
@@ -189,6 +194,11 @@ def plan_workers(phase, requested=None, footprint=None, minimum=1):
     clamp = _env_int("POSTMORTEM_MAX_WORKERS")
     if clamp and clamp > 0:
         constraints.append((clamp, "POSTMORTEM_MAX_WORKERS=%d" % clamp))
+
+    phase_var = "POSTMORTEM_MAX_WORKERS_%s" % str(phase).upper()
+    phase_clamp = _env_int(phase_var)
+    if phase_clamp and phase_clamp > 0:
+        constraints.append((phase_clamp, "%s=%d" % (phase_var, phase_clamp)))
 
     limit, why = min(constraints, key=lambda item: item[0])
     workers = max(minimum, int(limit))

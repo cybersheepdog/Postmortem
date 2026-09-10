@@ -172,11 +172,25 @@ def measure_small_files(workdir: Path, threads: int) -> dict:
                 found += 1
     walk_s = time.perf_counter() - start
 
-    # Read them back: the parse pass, and every attachment-scan pass, does this.
+    # Read them back: the parse pass, and every attachment-scan pass, does
+    # this. Read at the same concurrency as the write test -- a per-open cost
+    # (an on-access scanner, or high per-IO latency) looks completely
+    # different from a bandwidth limit once you add threads, and that
+    # difference decides whether more workers help or do nothing.
     paths = list(root.rglob("*.eml"))
+    chunk = max(1, len(paths) // threads)
+    batches = [paths[i:i + chunk] for i in range(0, len(paths), chunk)]
+
+    def read_batch(batch):
+        for item in batch:
+            item.read_bytes()
+
     start = time.perf_counter()
-    for p in paths:
-        p.read_bytes()
+    if threads == 1:
+        read_batch(paths)
+    else:
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            list(pool.map(read_batch, batches))
     read_s = time.perf_counter() - start
 
     start = time.perf_counter()
@@ -269,7 +283,8 @@ def project(corpus_bytes: int, avg_message_kb: float, small: dict,
     print()
 
 
-def verdict(scaling: list, parse_per_s: float, cores: int) -> None:
+def verdict(scaling: list, parse_per_s: float, cores: int,
+            seq_read_mb_s: float = 0.0) -> None:
     print("WHAT THIS MEANS")
     if len(scaling) < 2:
         return
@@ -295,6 +310,21 @@ def verdict(scaling: list, parse_per_s: float, cores: int) -> None:
     print()
     print(f"  single-core parse: {parse_per_s:,.0f} messages/s "
           f"-> ~{parse_per_s * max(cores - 1, 1):,.0f}/s across {max(cores - 1, 1)} workers")
+    print()
+
+    best_read = max(scaling, key=lambda s: s["read_files_s"])
+    seq_ratio = (seq_read_mb_s * 1024) / (best_read["read_files_s"] * SMALL_FILE_KB / 1024) \
+        if best_read["read_files_s"] else 0
+    print(f"  small-file reads : {base['read_files_s']:,.0f}/s at 1 thread, "
+          f"{best_read['read_files_s']:,.0f}/s at {best_read['threads']}")
+    if best_read["read_files_s"] < 500:
+        print("  -> This is far below what the sequential figure implies. Fast")
+        print("     directory walks with slow content reads points at a")
+        print("     per-open cost rather than the disk: on-access antivirus or")
+        print("     an EDR agent scanning every file as it is opened.")
+        print("     Try excluding the container and staging directories from")
+        print("     real-time scanning and re-running this benchmark. That is")
+        print("     usually worth more than any amount of tuning.")
     print()
 
 
@@ -378,7 +408,7 @@ def main() -> int:
         if best and corpus_bytes:
             project(corpus_bytes, args.avg_message_kb, best, seq,
                     parse_per_s, cores)
-        verdict(scaling, parse_per_s, cores)
+        verdict(scaling, parse_per_s, cores, seq['read_mb_s'])
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         print(f"(cleaned up {workdir})")
