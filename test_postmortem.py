@@ -463,6 +463,72 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# process pools: spawn-safety
+# --------------------------------------------------------------------------
+def test_pool_workers_are_importable_by_module_path():
+    """Every function handed to a process pool must live outside __main__.
+
+    Windows and macOS start workers with `spawn`: the child is a fresh
+    interpreter that imports the function by its module path. A function
+    defined in postmortem/__main__.py and reached via `python -m postmortem`
+    has module path "__main__", which in the child is an empty frozen module::
+
+        AttributeError: Can't get attribute '_parse_uncached_worker'
+            on <module '__main__' (BuiltinImporter)>
+        BrokenProcessPool: A process in the pool was terminated abruptly
+
+    Every worker died on startup, so parallel parsing, deep enrichment and
+    attachment scanning never ran on Windows at all. Linux's default `fork`
+    inherits memory and hides it completely.
+    """
+    import importlib
+    from postmortem import workers, attachment_scan, mailbox_ingest
+
+    dispatched = [
+        workers._parse_uncached_worker,
+        workers._deep_analyze_worker,
+        attachment_scan._scan_one,
+        attachment_scan._init_worker,
+        mailbox_ingest._extract_folder,
+    ]
+    for fn in dispatched:
+        assert fn.__module__ != "__main__", (
+            f"{fn.__qualname__} is defined in __main__ and cannot be sent to a "
+            "spawn-based process pool")
+        module = importlib.import_module(fn.__module__)
+        assert getattr(module, fn.__name__, None) is fn, (
+            f"{fn.__qualname__} is not reachable at {fn.__module__}."
+            f"{fn.__name__}, so a spawned worker cannot import it")
+
+
+def test_broken_pool_falls_back_without_losing_or_repeating_work():
+    # A pool that dies mid-run used to abort the whole analysis. Degrading to
+    # serial must produce exactly the same results: executor.map yields in
+    # order, so the count of results already delivered is a safe resume point.
+    import postmortem.__main__ as main_module
+
+    class DyingPool:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def map(self, fn, items, chunksize=1):
+            for i, item in enumerate(items):
+                if i == 4:
+                    raise OSError("pool died")
+                yield fn(item)
+
+    original = main_module.ProcessPoolExecutor
+    main_module.ProcessPoolExecutor = DyingPool
+    try:
+        out = list(main_module.parallel_map(
+            lambda x: x * 2, list(range(10)), workers=4, chunksize=1))
+    finally:
+        main_module.ProcessPoolExecutor = original
+
+    assert out == [x * 2 for x in range(10)]
+
+
+# --------------------------------------------------------------------------
 # audit log: mailbox forwarding, merged timeline
 # --------------------------------------------------------------------------
 def _write_ual(tmp_path, events):
