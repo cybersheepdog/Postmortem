@@ -934,11 +934,20 @@ def _command_line() -> str:
 
 
 def build_run_manifest(args, records, scenario, anchors, initial_verdict,
-                       campaigns, iocs, generated_utc, elapsed_seconds):
+                       campaigns, iocs, generated_utc, elapsed_seconds,
+                       phase_timings=None, host=None):
     """Reproducibility / chain-of-custody metadata recorded in every report."""
     digest, basis = corpus_fingerprint(records)
     tier_counts = Counter(r.tier for r in records)
+    timings = {}
+    for label, seconds in (phase_timings or []):
+        timings[label] = round(timings.get(label, 0.0) + seconds, 2)
     return {
+        # Where the run spent its time, and on what hardware. Two runs of the
+        # same corpus that differ wildly in duration are usually explained by
+        # one of these, so both belong in the manifest.
+        "phase_timings_seconds": timings,
+        "host": host or "",
         "tool": "postmortem",
         "tool_version": TOOL_VERSION,
         "parser_version": V7_PARSER_VERSION,

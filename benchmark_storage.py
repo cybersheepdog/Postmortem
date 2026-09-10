@@ -26,7 +26,6 @@ import argparse
 import os
 import platform
 import shutil
-import statistics
 import sys
 import tempfile
 import time
@@ -313,8 +312,6 @@ def verdict(scaling: list, parse_per_s: float, cores: int,
     print()
 
     best_read = max(scaling, key=lambda s: s["read_files_s"])
-    seq_ratio = (seq_read_mb_s * 1024) / (best_read["read_files_s"] * SMALL_FILE_KB / 1024) \
-        if best_read["read_files_s"] else 0
     print(f"  small-file reads : {base['read_files_s']:,.0f}/s at 1 thread, "
           f"{best_read['read_files_s']:,.0f}/s at {best_read['threads']}")
     if best_read["read_files_s"] < 500:

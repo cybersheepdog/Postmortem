@@ -571,6 +571,27 @@ from postmortem import term  # noqa: E402
 from contextlib import contextmanager  # noqa: E402
 
 
+# Every timed stage of the run, in the order it ran: [(label, seconds), ...].
+# Reported as a table at the end and carried in the run manifest, so where a
+# large corpus actually spends its time is a measurement rather than a guess.
+PHASE_TIMINGS = []
+
+
+def record_timing(label, seconds):
+    """Add a stage to the run's timing ledger."""
+    PHASE_TIMINGS.append((label, float(seconds)))
+
+
+@contextmanager
+def timed(label):
+    """Time a stage silently and add it to the ledger."""
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        record_timing(label, time.monotonic() - start)
+
+
 @contextmanager
 def phase(label):
     """Announce a potentially slow phase and report how long it took, so the
@@ -580,7 +601,39 @@ def phase(label):
     try:
         yield
     finally:
-        print(term.c(f"   done: {label} ({time.monotonic() - start:.1f}s)", "green", "dim"))
+        elapsed = time.monotonic() - start
+        record_timing(label, elapsed)
+        print(term.c(f"   done: {label} ({elapsed:.1f}s)", "green", "dim"))
+
+
+def render_timings(total_seconds):
+    """Print the timing ledger, slowest first, with each stage's share."""
+    if not PHASE_TIMINGS:
+        return
+    merged = {}
+    order = []
+    for label, seconds in PHASE_TIMINGS:
+        if label not in merged:
+            order.append(label)
+            merged[label] = 0.0
+        merged[label] += seconds
+    rows = sorted(merged.items(), key=lambda kv: kv[1], reverse=True)
+    measured = sum(merged.values())
+    width = max(len(label) for label in merged)
+
+    print(term.c("=" * 80, "cyan"))
+    print(term.c("WHERE THE TIME WENT", "cyan", "bold"))
+    print(term.c("=" * 80, "cyan"))
+    for label, seconds in rows:
+        share = (100.0 * seconds / total_seconds) if total_seconds else 0.0
+        bar = "#" * int(round(share / 2.5))
+        print(f"  {label:<{width}}  {seconds:8.1f}s  {share:5.1f}%  {bar}")
+    other = max(total_seconds - measured, 0.0)
+    if other > 0.05:
+        print(f"  {'(untimed remainder)':<{width}}  {other:8.1f}s  "
+              f"{(100.0 * other / total_seconds) if total_seconds else 0:5.1f}%")
+    print(f"  {'TOTAL':<{width}}  {total_seconds:8.1f}s")
+    print("=" * 80)
 
 
 def _merge_audit_anchors(anchors, audit_summary):
@@ -1072,12 +1125,13 @@ def main():
     # stat syscall per entry, which on a corpus of millions of extracted
     # messages costs more than the parsing does.
     eml_files = []
-    for dirpath, dirnames, filenames in os.walk(scan_root):
-        dirnames.sort()
-        for name in filenames:
-            if name.lower().endswith(".eml"):
-                eml_files.append(Path(dirpath) / name)
-    eml_files.sort(key=str)
+    with timed("discovery (directory walk)"):
+        for dirpath, dirnames, filenames in os.walk(scan_root):
+            dirnames.sort()
+            for name in filenames:
+                if name.lower().endswith(".eml"):
+                    eml_files.append(Path(dirpath) / name)
+        eml_files.sort(key=str)
 
     print(
         f"Found {len(eml_files)} .eml files"
@@ -1111,13 +1165,15 @@ def main():
         # decide every file against a dict. The previous per-file fast_get()
         # issued one SQLite round trip per message.
         try:
-            path_index = cache.load_path_index()
+            with timed("cache index load"):
+                path_index = cache.load_path_index()
         except Exception as exc:  # noqa: BLE001 - cache is an optimization
             print(f"[!] Could not load cache index ({exc}); parsing fresh.",
                   file=sys.stderr)
             path_index = {}
  
         hit_paths = []
+        cache_check_started = time.monotonic()
         for index, path in enumerate(eml_files, 1):
             entry = path_index.get(str(path))
             if entry is not None:
@@ -1133,10 +1189,13 @@ def main():
                 parse_jobs.append(path)
             progress_bar(index, len(eml_files))
         print()
+        record_timing("cache check (stat per file)",
+                      time.monotonic() - cache_check_started)
  
         # Deserialize only the records that are genuine hits.
         if hit_paths:
             print(f"Loading {len(hit_paths)} cached record(s)...")
+            cache_load_started = time.monotonic()
             by_path = {}
             for loaded, (path_str, record) in enumerate(
                 cache.iter_records_by_paths([str(p) for p in hit_paths]), 1
@@ -1144,6 +1203,8 @@ def main():
                 by_path[path_str] = record
                 progress_bar(loaded, len(hit_paths))
             print()
+            record_timing("cached record deserialize",
+                          time.monotonic() - cache_load_started)
             for path in hit_paths:
                 record = by_path.get(str(path))
                 if record is None:
@@ -1175,11 +1236,13 @@ def main():
             workers, why = resources.plan_workers("parse", requested=args.workers)
             print(f"  parse workers: {workers} ({why})")
             chunksize = max(1, len(parse_jobs) // (workers * 4))
+        parse_started = time.monotonic()
         for completed, result in enumerate(
             parallel_map(_parse_uncached_worker, parse_jobs, workers, chunksize), 1
         ):
             parsed.append(result)
             progress_bar(completed, len(parse_jobs))
+        record_timing("parse (read + MIME)", time.monotonic() - parse_started)
 
         print()
  
@@ -1408,13 +1471,14 @@ def main():
     # Initial scoring
     # ------------------------------------------------------------------
  
-    for record in records:
+    with timed("scoring"):
+        for record in records:
  
-        calculate_score(
-            record,
-            internal_domains,
-            known_contacts,
-        )
+            calculate_score(
+                record,
+                internal_domains,
+                known_contacts,
+            )
  
     # ------------------------------------------------------------------
     # Thread analysis
@@ -1445,6 +1509,7 @@ def main():
     print("Pass 1/2: fast candidate screening")
  
     candidate_indexes = []
+    screen_started = time.monotonic()
     for index, record in enumerate(records):
         candidate, score, reasons = v8_candidate_score(record, args.screen_chars)
         # User threshold controls normal promotion; strong independent
@@ -1461,6 +1526,7 @@ def main():
         if (index + 1) == total_records or (index + 1) % max(1, total_records // 100 or 1) == 0:
             v6_render_progress("candidate screening", index + 1, total_records, started)
  
+    record_timing("candidate screening", time.monotonic() - screen_started)
     print()
     print(
         f"Candidate reduction: {len(candidate_indexes)}/{total_records} "
@@ -1497,12 +1563,13 @@ def main():
         )
  
     print(f"Pass 2/2: deep enrichment ({max_workers} workers, {workers_why})")
-    analyzed_indexes = v6_parallel_deep_analysis(
-        records,
-        candidate_indexes,
-        max_workers=max_workers,
-        url_cache=url_cache,
-    )
+    with timed("deep enrichment"):
+        analyzed_indexes = v6_parallel_deep_analysis(
+            records,
+            candidate_indexes,
+            max_workers=max_workers,
+            url_cache=url_cache,
+        )
  
     # Persist fully enriched candidate records. The initial cache stage has
     # already computed file hashes, so avoid hashing the entire .eml a second
@@ -1731,6 +1798,8 @@ def main():
         args, records, scenario, anchors, initial_verdict, campaigns, iocs,
         generated_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         elapsed_seconds=time.monotonic() - run_started,
+        phase_timings=list(PHASE_TIMINGS),
+        host=resources.describe_host(),
     )
 
     print()
@@ -1789,28 +1858,31 @@ def main():
 
     if args.json:
 
-        write_json(
-            records,
-            campaigns,
-            timeline,
-            precursor_verdict,
-            args.json,
-            initial_verdict,
-            iocs,
-            manifest,
-        )
+        with timed("JSON report"):
+            write_json(
+                records,
+                campaigns,
+                timeline,
+                precursor_verdict,
+                args.json,
+                initial_verdict,
+                iocs,
+                manifest,
+            )
 
         print(term.c(f"JSON report written to: {args.json}", "green"))
 
     if args.csv:
 
-        write_csv(records, args.csv)
+        with timed("CSV report"):
+            write_csv(records, args.csv)
 
         print(term.c(f"CSV (UTC) written to: {args.csv}", "green"))
 
     if args.ioc:
 
-        write_iocs_csv(iocs, args.ioc)
+        with timed("IOC report"):
+            write_iocs_csv(iocs, args.ioc)
 
         print(term.c(f"IOC list ({len(iocs)} indicators) written to: {args.ioc}", "green"))
 
@@ -1836,6 +1908,8 @@ def main():
             if pruned["failures"]:
                 print(f"[!] {pruned['failures']} file(s) could not be removed",
                       file=sys.stderr)
+
+    render_timings(time.monotonic() - run_started)
 
     # CI gating: exit non-zero (3) when suspects meet the requested tier.
     if args.fail_on_tier:
