@@ -58,7 +58,19 @@ CONFIG = {
 }
 
 # Version identifiers recorded in cache rows and the run manifest.
-V7_PARSER_VERSION = "8.2-attachment-inspection"
+# DEFERRED: the value is stale. The identifier was renamed from
+# V7_PARSER_VERSION (a development-generation prefix that outlived its
+# generation), but the *string* is deliberately unchanged, because it is the
+# analysis cache key: bumping it invalidates every cached record and forces a
+# full re-parse of the corpus.
+#
+# It should be bumped -- and must be -- the next time the EmailRecord schema or
+# the analysis semantics change in a way that makes a cached record wrong.
+# Several changes since it was last set have added fields (body_own,
+# quoted_signals, burst_copies, enrichment_fingerprint, enrichment_hits);
+# those are additive and old rows still load, so reuse stays safe for now.
+# Pair the bump with a run that can afford a cold cache.
+PARSER_VERSION = "8.2-attachment-inspection"
 TOOL_VERSION = "8.2"
 
 

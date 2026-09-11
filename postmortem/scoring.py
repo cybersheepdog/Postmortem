@@ -1581,7 +1581,7 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
 # Candidate screening, priority scoring, and basic thread/temporal analysis
 # ==========================================================================
 
-V8_HIGH_SIGNAL_PATTERNS = (
+HIGH_SIGNAL_PATTERNS = (
     re.compile(r"\b(?:wire|wiring|wire transfer|bank transfer|ach|routing number|account number)\b", re.I),
     re.compile(r"\b(?:gift card|itunes|google play|prepaid card|voucher)\b", re.I),
     re.compile(r"\b(?:password reset|verify your account|confirm your account|credential|login|sign in)\b", re.I),
@@ -1589,7 +1589,7 @@ V8_HIGH_SIGNAL_PATTERNS = (
     re.compile(r"\b(?:urgent|confidential|immediately|asap|today only)\b", re.I),
 )
  
-V8_SOCIAL_ENGINEERING_PATTERNS = (
+SOCIAL_ENGINEERING_PATTERNS = (
     re.compile(r"\b(?:ceo|cfo|director|president|executive|boss)\b", re.I),
     re.compile(r"\b(?:new bank|new account|changed bank|updated account|change.*payment)\b", re.I),
     re.compile(r"\b(?:keep this confidential|do not call|don't call|do not reply)\b", re.I),
@@ -1598,14 +1598,14 @@ V8_SOCIAL_ENGINEERING_PATTERNS = (
 # Traits of a suspicious URL, matched against the extracted URLs -- never
 # against the message body, where these are ordinary words. Bare link presence
 # is not a risk trait; it is counted separately as url_count.
-V8_URL_RISK_PATTERNS = (
+URL_RISK_PATTERNS = (
     re.compile(r"\b(?:login|signin|verify|secure|account|update|payment)\b", re.I),
     re.compile(r"https?://\d{1,3}(?:\.\d{1,3}){3}", re.I),      # IP-literal host
     re.compile(r"https?://[^/\s]*xn--", re.I),                    # punycode host
     re.compile(r"https?://[^/\s]*:[^/@\s]*@", re.I),              # credentials in URL
 )
  
-V8_ATTACHMENT_PATTERNS = (
+ATTACHMENT_PATTERNS = (
     re.compile(r"\.(?:exe|scr|js|jse|vbs|vbe|bat|cmd|ps1|hta|iso|img|lnk|zip|rar|7z)$", re.I),
     re.compile(r"\.(?:docm|xlsm|pptm)$", re.I),
     re.compile(r"\.(?:html?|shtml)$", re.I),
@@ -1630,12 +1630,12 @@ _SCREEN_B64_RE = re.compile(r"(?:^|[^A-Za-z0-9+/=])[A-Za-z0-9+/]{40,}={0,2}(?![A
 _SCREEN_DATA_URI_RE = re.compile(r"data:[^;\s]+;base64,[A-Za-z0-9+/=]+", re.I)
 
 
-def v8_candidate_score(record, screen_chars: int = 16000):
+def candidate_score(record, screen_chars: int = 16000):
     """
     Conservative first-pass classifier.
  
-    The old scorer effectively made almost every message containing a normal
-    URL or attachment a candidate. V8 requires either a strong signal or a
+    An earlier scorer made almost every message containing a normal URL or
+    attachment a candidate. This one requires either a strong signal or a
     combination of weaker signals, while preserving authentication failures
     and suspicious structural indicators.
     """
@@ -1664,8 +1664,8 @@ def v8_candidate_score(record, screen_chars: int = 16000):
     score = 0
     reasons = []
  
-    high = sum(bool(p.search(text)) for p in V8_HIGH_SIGNAL_PATTERNS)
-    social = sum(bool(p.search(identity_text)) for p in V8_SOCIAL_ENGINEERING_PATTERNS)
+    high = sum(bool(p.search(text)) for p in HIGH_SIGNAL_PATTERNS)
+    social = sum(bool(p.search(identity_text)) for p in SOCIAL_ENGINEERING_PATTERNS)
 
     # URL-risk patterns describe suspicious traits *of a URL* -- a path like
     # /secure/verify/account. Run against the whole message they matched those
@@ -1675,7 +1675,7 @@ def v8_candidate_score(record, screen_chars: int = 16000):
     # is carried by url_count below, so it is not counted here.
     url_text = "\n".join(str(u) for u in (getattr(record, "urls", []) or []))
     url_risk = (
-        sum(bool(p.search(url_text)) for p in V8_URL_RISK_PATTERNS)
+        sum(bool(p.search(url_text)) for p in URL_RISK_PATTERNS)
         if url_text else 0
     )
  
@@ -1683,7 +1683,7 @@ def v8_candidate_score(record, screen_chars: int = 16000):
     risky_attachments = sum(
         bool(p.search(str(name)))
         for name in attachment_names
-        for p in V8_ATTACHMENT_PATTERNS
+        for p in ATTACHMENT_PATTERNS
     )
  
     # EmailRecord stores these under `authentication_results`, and stores them
@@ -1806,14 +1806,14 @@ def v8_candidate_score(record, screen_chars: int = 16000):
     return candidate, score, reasons
  
  
-def v8_candidate_statistics(records):
+def candidate_statistics(records):
     stats = {
         "total": len(records),
         "candidates": 0,
         "by_reason": {},
     }
     for record in records:
-        candidate, _, reasons = v8_candidate_score(record)
+        candidate, _, reasons = candidate_score(record)
         if candidate:
             stats["candidates"] += 1
             for reason in reasons:

@@ -91,7 +91,7 @@ from pathlib import Path
 
 # Tunable weights/thresholds live in the postmortem.config module (overridable with
 # --config); imported here so the rest of this file can reference them directly.
-from postmortem.config import load_config, V7_PARSER_VERSION
+from postmortem.config import load_config, PARSER_VERSION
 
 
 # URL regexes, constants, and offline analysis live in postmortem.urls.
@@ -157,7 +157,7 @@ class AnalysisCache:
 # ============================================================================
  
 from postmortem.scoring import (  # noqa: E402
-    calculate_score, v8_candidate_score, identify_internal_domains,
+    calculate_score, candidate_score, identify_internal_domains,
     identify_known_contacts, calculate_thread_ids, analyze_temporal_signals,
     detect_possible_impersonation, build_attack_timeline,
     earliest_malicious_precursor_verdict,
@@ -231,10 +231,10 @@ class ProgressTracker:
  
  
 # ============================================================================
-# V7 PERSISTENT CACHE / STREAMING ARTIFACT HASHING
+# PERSISTENT CACHE / STREAMING ARTIFACT HASHING
 # ============================================================================
  
-# V7_PARSER_VERSION / TOOL_VERSION are defined in postmortem.config and imported at
+# PARSER_VERSION / TOOL_VERSION are defined in postmortem.config and imported at
 # the top of this file. Bump them there whenever parsing, the EmailRecord schema,
 # or the analysis logic changes, so stale cache entries are never reused.
  
@@ -271,7 +271,7 @@ def _persist_records(cache, records, args, label, batch_size=1000):
                 file_hash = sha256_file(path) if args.content_hash else ""
             rows.append((
                 str(path), st.st_size, st.st_mtime_ns, file_hash,
-                V7_PARSER_VERSION,
+                PARSER_VERSION,
                 json.dumps(asdict(record), ensure_ascii=False),
             ))
             if len(rows) >= batch_size:
@@ -287,7 +287,7 @@ def _persist_records(cache, records, args, label, batch_size=1000):
     record_timing(f"persist {label}", time.monotonic() - started)
     print(f"Persisted {stored} {label} to the cache")
     return stored
-def v8_cache_progress(phase, completed, total, started, extra=""):
+def cache_progress(phase, completed, total, started, extra=""):
     elapsed = max(time.monotonic() - started, 0.001)
     rate = completed / elapsed
     remaining = max(total - completed, 0)
@@ -307,10 +307,10 @@ def v8_cache_progress(phase, completed, total, started, extra=""):
  
  
 # ============================================================================
-# V6 EFFICIENCY INDEXES / TWO-PASS PIPELINE
+# EFFICIENCY INDEXES / TWO-PASS PIPELINE
 # ============================================================================
  
-def v6_build_indexes(records):
+def build_evidence_indexes(records):
     """Build correlation indexes once instead of rescanning all records."""
     indexes = {
         "url": {},
@@ -430,7 +430,7 @@ def _apply_deep_result(records, url_cache, index, payload):
         url_cache.urls.setdefault(url.strip(), analysis)
 
 
-def v6_parallel_deep_analysis(records, candidate_indexes, max_workers, url_cache):
+def parallel_deep_analysis(records, candidate_indexes, max_workers, url_cache):
     """Deep-enrich only candidates.
 
     Uses a process pool for large candidate sets (CPU-bound work that the GIL
@@ -489,7 +489,7 @@ def v6_parallel_deep_analysis(records, candidate_indexes, max_workers, url_cache
     return pending
  
  
-def v6_render_progress(phase, completed, total, started):
+def render_phase_progress(phase, completed, total, started):
     elapsed = max(time.monotonic() - started, 0.001)
     rate = completed / elapsed
     percent = (100.0 * completed / total) if total else 100.0
@@ -818,7 +818,7 @@ def main():
         "--candidate-threshold",
         type=int,
         default=5,
-        help="Minimum V8 fast-pass score for deep analysis (default: 5)",
+        help="Minimum fast-pass score for deep analysis (default: 5)",
     )
  
     parser.add_argument(
@@ -1108,7 +1108,7 @@ def main():
         return 0
 
     # ------------------------------------------------------------------
-    # V7 RESUMABLE FAST PARSE
+    # RESUMABLE FAST PARSE
     # ------------------------------------------------------------------
     cache_path = args.cache or (scan_root / ".postmortem_cache.sqlite3")
     cache = SQLiteRecordCache(cache_path)
@@ -1231,7 +1231,7 @@ def main():
                         f"\n[!] Cache preparation error for {path}: {exc}",
                         file=sys.stderr,
                     )
-                v8_cache_progress(
+                cache_progress(
                     "metadata cache preparation",
                     completed,
                     hash_total,
@@ -1264,7 +1264,7 @@ def main():
                             f"\n[!] Hash error for {path}: {exc}",
                             file=sys.stderr,
                         )
-                    v8_cache_progress(
+                    cache_progress(
                         "content hashing", completed, hash_total, hash_started
                     )
             else:
@@ -1286,7 +1286,7 @@ def main():
                                 f"\n[!] Hash error for {path}: {exc}",
                                 file=sys.stderr,
                             )
-                        v8_cache_progress(
+                        cache_progress(
                             "content hashing",
                             completed,
                             hash_total,
@@ -1310,7 +1310,7 @@ def main():
                         st.st_size,
                         st.st_mtime_ns,
                         "",
-                        V7_PARSER_VERSION,
+                        PARSER_VERSION,
                         json.dumps(asdict(record), ensure_ascii=False),
                     ))
                     if len(metadata_rows) >= batch_size:
@@ -1321,7 +1321,7 @@ def main():
                         f"\n[!] Metadata cache error for {path}: {exc}",
                         file=sys.stderr,
                     )
-                v8_cache_progress(
+                cache_progress(
                     "metadata cache persistence",
                     completed,
                     len(hash_jobs),
@@ -1363,7 +1363,7 @@ def main():
                             st.st_size,
                             st.st_mtime_ns,
                             file_hash,
-                            V7_PARSER_VERSION,
+                            PARSER_VERSION,
                             json.dumps(asdict(record), ensure_ascii=False),
                         ))
  
@@ -1377,7 +1377,7 @@ def main():
                     )
                     records.append(record)
  
-                v8_cache_progress(
+                cache_progress(
                     "cache persistence", completed, len(hashed), persist_started
                 )
  
@@ -1483,7 +1483,7 @@ def main():
     )
  
     # ------------------------------------------------------------------
-    # V6 TWO-PASS ANALYSIS
+    # TWO-PASS ANALYSIS
     # Pass 1 is intentionally cheap. Only candidates receive expensive
     # URL/deep enrichment in pass 2.
     # ------------------------------------------------------------------
@@ -1491,13 +1491,13 @@ def main():
     started = time.monotonic()
 
     print()
-    print("V6 two-pass analysis")
+    print("Two-pass analysis")
     print("Pass 1/2: fast candidate screening")
  
     candidate_indexes = []
     screen_started = time.monotonic()
     for index, record in enumerate(records):
-        candidate, score, reasons = v8_candidate_score(record, args.screen_chars)
+        candidate, score, reasons = candidate_score(record, args.screen_chars)
         # User threshold controls normal promotion; strong independent
         # signals remain protected.
         candidate = (
@@ -1510,7 +1510,7 @@ def main():
             candidate_indexes.append(index)
  
         if (index + 1) == total_records or (index + 1) % max(1, total_records // 100 or 1) == 0:
-            v6_render_progress("candidate screening", index + 1, total_records, started)
+            render_phase_progress("candidate screening", index + 1, total_records, started)
  
     record_timing("candidate screening", time.monotonic() - screen_started)
     print()
@@ -1550,7 +1550,7 @@ def main():
  
     print(f"Pass 2/2: deep enrichment ({max_workers} workers, {workers_why})")
     with timed("deep enrichment"):
-        analyzed_indexes = v6_parallel_deep_analysis(
+        analyzed_indexes = parallel_deep_analysis(
             records,
             candidate_indexes,
             max_workers=max_workers,
@@ -1587,7 +1587,7 @@ def main():
                 st.st_size,
                 st.st_mtime_ns,
                 file_hash,
-                V7_PARSER_VERSION,
+                PARSER_VERSION,
                 json.dumps(asdict(record), ensure_ascii=False),
             ))
  
@@ -1601,7 +1601,7 @@ def main():
                 file=sys.stderr,
             )
  
-        v8_cache_progress(
+        cache_progress(
             "deep cache persistence",
             completed,
             len(analyzed_indexes),
@@ -1628,7 +1628,7 @@ def main():
         record.attack_stage = classify_attack_stage(record)
 
     with phase("Building indexed evidence relationships"):
-        evidence_indexes = v6_build_indexes(records)
+        evidence_indexes = build_evidence_indexes(records)
 
  
     # ------------------------------------------------------------------

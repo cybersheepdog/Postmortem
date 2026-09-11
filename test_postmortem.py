@@ -18,7 +18,7 @@ import postmortem.__main__ as b
 from postmortem.config import CONFIG
 from postmortem.models import Anchors, EmailRecord
 from postmortem.scoring import (
-    find_lookalike, v8_candidate_score, classify_attack_stage,
+    find_lookalike, candidate_score, classify_attack_stage,
     run_scenario_analysis, calculate_score,
     analyze_received_chain, message_id_domain, dkim_d_domains,
     analyze_date_header,
@@ -116,13 +116,13 @@ def test_classify_attack_stage():
 # --------------------------------------------------------------------------
 # candidate screening
 # --------------------------------------------------------------------------
-def test_v8_candidate_score_flags_bec():
+def test_candidate_score_flags_bec():
     r = make_record(subject="URGENT wire transfer", body="please wire funds to new bank account")
-    candidate, score, reasons = v8_candidate_score(r)
+    candidate, score, reasons = candidate_score(r)
     assert candidate and score > 0
 
     benign = make_record(subject="lunch", body="want to grab lunch tomorrow")
-    cand2, score2, _ = v8_candidate_score(benign)
+    cand2, score2, _ = candidate_score(benign)
     assert score2 == 0
 
 
@@ -130,8 +130,8 @@ def test_screen_chars_limits_scan():
     # a high-signal term only deep in the body
     body = ("neutral text " * 500) + " wire transfer bank account gift card"
     r = make_record(subject="notes", body=body)
-    full = v8_candidate_score(r, 16000)[1]
-    short = v8_candidate_score(r, 200)[1]
+    full = candidate_score(r, 16000)[1]
+    short = candidate_score(r, 200)[1]
     assert full >= short  # scanning less can only lose signal, never gain
 
 
@@ -403,12 +403,12 @@ def test_base64_promotes_to_candidate_but_not_data_uri():
     blob = "Z28gdG8gaHR0cDovL2V2aWwtbG9naW4uZXhhbXBsZS92ZXJpZnkgbm93"
     r = make_record(subject="verify your account password",
                     body="Please review: " + blob)
-    cand, score, reasons = v8_candidate_score(r)
+    cand, score, reasons = candidate_score(r)
     assert cand and "base64-encoded content in body" in reasons
     # ...but an inline data: image alone must NOT promote a benign newsletter.
     r2 = make_record(subject="monthly newsletter",
                      body="<img src='data:image/png;base64," + "A" * 200 + "'>")
-    assert not v8_candidate_score(r2)[0]
+    assert not candidate_score(r2)[0]
 
 
 def test_archive_zip_peek(tmp_path):
@@ -852,7 +852,7 @@ def test_url_risk_patterns_do_not_match_body_prose():
     # risk with no URL involved.
     prose = _screen_record(subject="Your March product update",
                            body="Your payment was received. Please update your account records.")
-    assert v8_candidate_score(prose)[1] == 0
+    assert candidate_score(prose)[1] == 0
 
     # The same words inside a URL still count -- but the risky-path family
     # stays gated behind a content signal, because plenty of legitimate URLs
@@ -865,13 +865,13 @@ def test_url_risk_patterns_do_not_match_body_prose():
     benign = _screen_record(subject="Password reset",
                             body=lure + "https://corp.example/offsite",
                             urls=["https://corp.example/offsite"])
-    assert v8_candidate_score(risky)[1] > v8_candidate_score(benign)[1]
+    assert candidate_score(risky)[1] > candidate_score(benign)[1]
 
     # A benign link with no lure is not evidence on its own.
     plain = _screen_record(subject="Team offsite",
                            body="Agenda: https://corp.example/offsite",
                            urls=["https://corp.example/offsite"])
-    assert v8_candidate_score(plain)[1] == 0
+    assert candidate_score(plain)[1] == 0
 
 
 def test_url_traits_promote_without_a_partner_signal():
@@ -882,7 +882,7 @@ def test_url_traits_promote_without_a_partner_signal():
         ("see http://203.0.113.9/x", "http://203.0.113.9/x", "bare IP"),
     ):
         r = _screen_record(subject="Doc", body=body, urls=[url])
-        candidate, score, reasons = v8_candidate_score(r)
+        candidate, score, reasons = candidate_score(r)
         assert candidate is True, reason
         assert any(reason.split()[0].lower() in x.lower() for x in reasons)
 
@@ -893,7 +893,7 @@ def test_executive_display_name_from_free_mail_stands_alone():
     bec = _screen_record(sender_name="Dana Whitfield (CEO)",
                          sender_email="dana.w@gmail.com", sender_domain="gmail.com",
                          subject="Quick favour", body="Are you at your desk?")
-    candidate, score, reasons = v8_candidate_score(bec)
+    candidate, score, reasons = candidate_score(bec)
     assert candidate is True
     assert any("free-mail" in r for r in reasons)
 
@@ -901,7 +901,7 @@ def test_executive_display_name_from_free_mail_stands_alone():
     real = _screen_record(sender_name="Dana Whitfield, CEO",
                           sender_email="dana@corp.example", sender_domain="corp.example",
                           subject="All-hands Friday", body="See you there.")
-    assert v8_candidate_score(real)[0] is False
+    assert candidate_score(real)[0] is False
 
 
 def test_sender_address_does_not_feed_the_content_family():
@@ -910,7 +910,7 @@ def test_sender_address_does_not_feed_the_content_family():
     ap = _screen_record(sender_email="invoice@supplier.example",
                         sender_domain="supplier.example",
                         subject="Statement", body="Attached.")
-    assert v8_candidate_score(ap)[1] == 0
+    assert candidate_score(ap)[1] == 0
 
 
 # --------------------------------------------------------------------------
@@ -926,27 +926,27 @@ def _auth_record(**auth):
 
 
 def test_auth_failures_promote_a_candidate():
-    # Regression: v8_candidate_score used to read record.authentication (no
+    # Regression: candidate_score used to read record.authentication (no
     # such field) and compare "spf"/"dkim"/"dmarc" strings (wrong shape), so a
     # message failing every mechanism counted zero failures and was skipped by
     # deep analysis entirely.
     clean = _auth_record(spf_pass=True, dkim_pass=True, dmarc_pass=True)
-    assert v8_candidate_score(clean)[0] is False
+    assert candidate_score(clean)[0] is False
 
     failing = _auth_record(spf_fail=True, dkim_fail=True, dmarc_fail=True)
-    candidate, score, reasons = v8_candidate_score(failing)
+    candidate, score, reasons = candidate_score(failing)
     assert candidate is True
     assert score > 0
     assert any("authentication" in r for r in reasons)
 
     # A lone SPF failure is routine on forwarded mail and stays below the bar.
-    assert v8_candidate_score(_auth_record(spf_fail=True))[0] is False
+    assert candidate_score(_auth_record(spf_fail=True))[0] is False
 
     # M365's composite verdict is its own judgement, counted alongside the
     # three mechanisms.
     both = _auth_record(spf_fail=True, compauth_fail=True)
     assert both.authentication_results["compauth_fail"] is True
-    assert v8_candidate_score(both)[1] > v8_candidate_score(_auth_record(spf_fail=True))[1]
+    assert candidate_score(both)[1] > candidate_score(_auth_record(spf_fail=True))[1]
 
 
 def test_bulk_mail_is_not_promoted_by_auth_failure_alone():
@@ -955,7 +955,7 @@ def test_bulk_mail_is_not_promoted_by_auth_failure_alone():
     bulk = _auth_record(spf_fail=True, dkim_fail=True, bulk_mail=True)
     bulk.subject = "Your March product update"
     bulk.body = "Here is what shipped this month."
-    candidate, score, reasons = v8_candidate_score(bulk)
+    candidate, score, reasons = candidate_score(bulk)
     assert candidate is False
     assert score == 0
     assert any("not promoted" in r for r in reasons)
@@ -964,14 +964,14 @@ def test_bulk_mail_is_not_promoted_by_auth_failure_alone():
     phishy = _auth_record(spf_fail=True, dkim_fail=True, bulk_mail=True)
     phishy.subject = "Verify your account immediately"
     phishy.body = "Click here to confirm your identity and reset your password."
-    assert v8_candidate_score(phishy)[0] is True
+    assert candidate_score(phishy)[0] is True
 
     attached = _auth_record(spf_fail=True, dkim_fail=True, bulk_mail=True)
     attached.attachments = ["statement.hta"]
-    assert v8_candidate_score(attached)[0] is True
+    assert candidate_score(attached)[0] is True
 
     # A non-bulk message with the same failures is unaffected.
-    assert v8_candidate_score(
+    assert candidate_score(
         _auth_record(spf_fail=True, dkim_fail=True))[0] is True
 
 

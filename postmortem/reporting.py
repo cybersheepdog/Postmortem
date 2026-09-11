@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from postmortem import term
-from postmortem.config import CONFIG, TOOL_VERSION, V7_PARSER_VERSION
+from postmortem.config import CONFIG, TOOL_VERSION, PARSER_VERSION
 from postmortem.models import EmailRecord, CampaignInfo, AttackTimelineEvent
 from postmortem.utils import date_sort_key, to_utc_fields, clean_text, parse_date
 from postmortem.scoring import classify_attack_stage, build_evidence_graph
@@ -979,7 +979,7 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
         "entry_point_window": entry_point_window or {},
         "tool": "postmortem",
         "tool_version": TOOL_VERSION,
-        "parser_version": V7_PARSER_VERSION,
+        "parser_version": PARSER_VERSION,
         "generated_utc": generated_utc,
         "elapsed_seconds": round(elapsed_seconds, 2),
         "command_line": _command_line(),

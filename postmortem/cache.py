@@ -2,7 +2,7 @@
 
 The cache is keyed by (path, parser_version) with a content-hash fallback so an
 identical artifact that moved to a new path can still be reused. Bump
-``V7_PARSER_VERSION`` (in postmortem.config) whenever the record schema or analysis
+``PARSER_VERSION`` (in postmortem.config) whenever the record schema or analysis
 changes, so stale rows are never reused.
 """
 
@@ -12,7 +12,7 @@ import sqlite3
 from dataclasses import asdict
 from pathlib import Path
 
-from postmortem.config import V7_PARSER_VERSION
+from postmortem.config import PARSER_VERSION
 from postmortem.models import EmailRecord
 
 
@@ -62,7 +62,7 @@ class SQLiteRecordCache:
             FROM records
             WHERE path=? AND size=? AND mtime_ns=? AND parser_version=?
             """,
-            (str(path), st.st_size, st.st_mtime_ns, V7_PARSER_VERSION),
+            (str(path), st.st_size, st.st_mtime_ns, PARSER_VERSION),
         ).fetchone()
         if not row:
             return None
@@ -82,7 +82,7 @@ class SQLiteRecordCache:
         index = {}
         cursor = self.conn.execute(
             "SELECT path, size, mtime_ns FROM records WHERE parser_version=?",
-            (V7_PARSER_VERSION,),
+            (PARSER_VERSION,),
         )
         while True:
             rows = cursor.fetchmany(10000)
@@ -110,7 +110,7 @@ class SQLiteRecordCache:
                 WHERE parser_version=?
                   AND path IN ({placeholders})
                 """,
-                [V7_PARSER_VERSION, *chunk],
+                [PARSER_VERSION, *chunk],
             ).fetchall()
             for path, record_json in rows:
                 yield path, EmailRecord(**json.loads(record_json))
@@ -124,7 +124,7 @@ class SQLiteRecordCache:
             ORDER BY updated_at DESC
             LIMIT 1
             """,
-            (file_sha256, V7_PARSER_VERSION),
+            (file_sha256, PARSER_VERSION),
         ).fetchone()
         if not row:
             return None
@@ -149,7 +149,7 @@ class SQLiteRecordCache:
                 st.st_size,
                 st.st_mtime_ns,
                 file_sha256,
-                V7_PARSER_VERSION,
+                PARSER_VERSION,
                 json.dumps(asdict(record), ensure_ascii=False),
             ),
         )
@@ -190,7 +190,7 @@ class SQLiteRecordCache:
                 WHERE parser_version=?
                   AND file_sha256 IN ({placeholders})
                 """,
-                [V7_PARSER_VERSION, *chunk],
+                [PARSER_VERSION, *chunk],
             ).fetchall()
             for file_hash, record_json in rows:
                 result[file_hash] = EmailRecord(**json.loads(record_json))
