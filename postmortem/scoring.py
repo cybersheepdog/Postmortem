@@ -2156,7 +2156,23 @@ def reconstruct_attack_narrative(records, scenario, anchors, initial_verdict,
         if audit_deletions:
             parts.append(f"CONFIRMED: {audit_deletions} deletion event(s) in the audit log.")
         if not audit_rules and not audit_fwd and anchors.compromise_date:
-            parts.append(f"A malicious mailbox rule was created ({comp_iso}).")
+            # This used to assert "A malicious mailbox rule was created" in
+            # exactly the case where the evidence shows none -- a false
+            # statement of fact in a forensic report, and one that got worse
+            # once the compromise date could be derived from an audit log or
+            # a token issuance rather than only from an investigator who had
+            # already found a rule. State what is actually known instead.
+            if audit_summary:
+                parts.append(
+                    "The audit log records no mailbox rule or forwarding "
+                    f"change in its window ({comp_iso} onwards). Persistence "
+                    "by that route is not evidenced here; identity-side "
+                    "mechanisms are covered separately.")
+            else:
+                parts.append(
+                    f"Compromise timestamp supplied by the investigator "
+                    f"({comp_iso}); no audit log was provided, so what the "
+                    "attacker did inside the mailbox is unevidenced.")
         if concealed:
             parts.append(f"{len(concealed)} message(s) were deleted or moved to low-visibility folders.")
         if rule_target:
@@ -3479,8 +3495,33 @@ def audit_timeline_events(audit_summary: dict) -> list[AttackTimelineEvent]:
     return events
 
 
+
+def persistence_timeline_events(persistence: dict) -> list[AttackTimelineEvent]:
+    """Persistence mechanisms as timeline entries.
+
+    They also appear in the remediation block, deliberately: the timeline
+    exists to show what happened and the remediation list exists to make sure
+    nothing is missed while acting on it. Either alone loses one of those.
+    """
+    if not persistence:
+        return []
+    from postmortem.persistence import persistence_timeline_events as _rows
+
+    out = []
+    for row in _rows(persistence):
+        out.append(AttackTimelineEvent(
+            timestamp=row["time"], path="", message_id="",
+            sender=row["actor"], subject=row["summary"],
+            stage="persistence", score=0, campaign_id="", precursor=False,
+            evidence=list(row["evidence"]), source="persistence",
+            actor=row["actor"], client_ip=row["ip"],
+        ))
+    return out
+
+
 def build_attack_timeline(records: list[EmailRecord],
-                          audit_summary: dict = None) -> list[AttackTimelineEvent]:
+                          audit_summary: dict = None,
+                          persistence: dict = None) -> list[AttackTimelineEvent]:
     events = []
     for r in sorted(records, key=date_sort_key):
         evidence = []
@@ -3491,6 +3532,11 @@ def build_attack_timeline(records: list[EmailRecord],
     # One chronology, both sources, sorted together. AttackTimelineEvent keeps
     # its time in `timestamp`, not `date`, so date_sort_key does not apply.
     events.extend(audit_timeline_events(audit_summary))
+    # Persistence belongs in the same chronology: 'signed in, created a
+    # rule, consented an application, registered an authenticator, read
+    # the mailbox' is one attacker session, and splitting it across
+    # sections leaves the reader to interleave it by hand.
+    events.extend(persistence_timeline_events(persistence))
 
     def when(event):
         dt = parse_date(event.timestamp or "")

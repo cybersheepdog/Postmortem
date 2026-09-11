@@ -769,6 +769,152 @@ def print_signin_lures(verdict: dict):
         print("  " + _wrap_indent(lures["note"], 2))
 
 
+
+def print_persistence(persistence: dict):
+    """What the attacker left behind that outlives the obvious remediation."""
+    p = persistence or {}
+    if not p.get("available"):
+        return
+    print()
+    _hdr("PERSISTENCE MECHANISMS (does the attacker still have access?)")
+
+    src = p.get("sources") or {}
+    if src:
+        print("  Sources read: " + ", ".join(
+            f"{k} ({v})" for k, v in sorted(src.items())))
+
+    findings = p.get("findings") or []
+    if not findings:
+        print()
+        print("  No persistence mechanism was found in the supplied data.")
+        for w in p.get("warnings", []):
+            print()
+            print(term.c("  [!] " + _wrap_indent(w, 6), "yellow"))
+        return
+
+    both = p.get("survives_both_count", 0)
+    line = (f"  Mechanisms found: {len(findings)}   "
+            f"attacker-attributed: {p.get('confirmed_count', 0)}   "
+            f"survive password reset AND token revocation: {both}")
+    print(term.c(line, "red", "bold") if both else line)
+
+    for e in findings:
+        print()
+        tag = "CONFIRMED" if e.get("by_attacker") else "REVIEW   "
+        target = ", ".join(e.get("targets", [])) or e.get("role") \
+            or e.get("name") or e.get("user") or "(unnamed)"
+        head = f"  {tag}  {e.get('activity', e['kind'])}: {target}"
+        colour = ("red", "bold") if e.get("by_attacker") else ("yellow",)
+        print(term.c(head, *colour))
+        if e.get("time"):
+            print(f"      when     {e['time']}"
+                  + (f"   from {e['ip']}" if e.get("ip") else ""))
+        if e.get("actor"):
+            print(f"      actor    {e['actor']}")
+        if e.get("attribution"):
+            print(f"      basis    {e['attribution']}")
+        if e.get("mail_scopes"):
+            print(term.c("      mailbox  " + ", ".join(e["mail_scopes"]), "red"))
+        if e.get("high_risk_scopes"):
+            print("      other    " + ", ".join(e["high_risk_scopes"]))
+        if e.get("durable_scopes"):
+            print(term.c("      standing offline_access: not bound to a "
+                         "session", "red"))
+        survives = []
+        if e.get("survives_password_reset") == "survives":
+            survives.append("a password reset")
+        if e.get("survives_token_revocation") == "survives":
+            survives.append("a token revocation")
+        if survives:
+            print(term.c("      SURVIVES " + " and ".join(survives), "red", "bold"))
+        if e.get("grants"):
+            print("      " + _wrap_indent(e["grants"], 6))
+
+    mfa = p.get("mfa_state") or []
+    if mfa:
+        print()
+        print("  Authentication methods currently registered:")
+        for m in mfa[:12]:
+            print(f"    {m['user']:<38} {m.get('methods', '') or '(none recorded)'}")
+        if len(mfa) > 12:
+            print(f"    ... {len(mfa) - 12} more in the JSON report")
+        print()
+        print("  " + _wrap_indent(
+            "Confirm each of these with the account owner. A method the "
+            "owner does not recognise is the attacker's, and removing it "
+            "is part of remediation.", 2))
+
+    risk = p.get("risk_detections") or []
+    if risk:
+        print()
+        print("  Identity Protection detections (independent corroboration):")
+        for d in risk[:10]:
+            print(f"    {d.get('time', '')[:19]:<20} {d.get('level', ''):<8} "
+                  f"{d.get('detection', ''):<28} {d.get('ip', '')}")
+
+    for w in p.get("warnings", []):
+        print()
+        print(term.c("  [!] " + _wrap_indent(w, 6), "yellow"))
+
+
+def print_remediation(actions: list):
+    """The action list, ordered by what the client's usual response misses."""
+    if not actions:
+        return
+    print()
+    _hdr("REMEDIATION REQUIRED", ch="=")
+    print("  " + _wrap_indent(
+        "Ordered by what survives the response most clients have already "
+        "made. Items at the top are NOT addressed by resetting the password "
+        "or revoking sessions, and remain live until the stated action is "
+        "taken.", 2))
+
+    for a in actions:
+        print()
+        head = f"  {a['priority']}. {a['kind'].replace('_', ' ')}: {a['target']}"
+        print(term.c(head, "red", "bold") if a["by_attacker"]
+              else term.c(head, "yellow"))
+        if a.get("when"):
+            print(f"       when    {a['when']}"
+                  + (f"  ({a['attribution']})" if a.get("attribution") else ""))
+        if a.get("detail"):
+            print(f"       detail  {_wrap_indent(a['detail'], 15)}")
+        if a.get("grants"):
+            print(f"       risk    {_wrap_indent(a['grants'], 15)}")
+        print(f"       ACTION  {_wrap_indent(a['action'], 15)}")
+        if a.get("not_fixed_by"):
+            print(term.c(f"       NOTE    {_wrap_indent(a['not_fixed_by'], 15)}",
+                         "red"))
+
+
+def print_mes_manifest(mes: dict):
+    """What was collected, what was read, and what was left on the floor."""
+    if not mes or not mes.get("manifest"):
+        return
+    print()
+    _hdr("EVIDENCE COLLECTION (Microsoft-Extractor-Suite)")
+    print(f"  Files seen: {mes.get('files_seen', 0)}")
+    print()
+    print(f"  {'source':<22} {'files':>6} {'rows':>8}  status")
+    print("  " + "-" * 60)
+    for m in mes["manifest"]:
+        if m["consumed"]:
+            status = "read"
+        elif m.get("routed_to"):
+            status = "read by %s" % m["routed_to"].split(".")[-1]
+        else:
+            status = "collected, not yet used"
+        row = (f"  {m['kind']:<22} {m['files']:>6} {m['rows']:>8}  {status}")
+        print(row if m["consumed"] else term.c(row, "dim")
+              if hasattr(term, "c") else row)
+    if mes.get("unrecognised_count"):
+        print()
+        print(term.c(f"  [!] {mes['unrecognised_count']} file(s) not "
+                     "recognised and not read:", "yellow"))
+        for n in mes.get("unrecognised", [])[:8]:
+            print(f"        {n}")
+
+
 def print_summary(
     records: list[EmailRecord],
     timeline: list[AttackTimelineEvent],
@@ -836,20 +982,26 @@ def print_summary(
     # Audit events are always shown. They are the recorded facts of the case,
     # and on a large corpus a plain head-50 cut would drop every one of them
     # behind the message volume.
-    shown = [e for e in timeline if getattr(e, "source", "message") == "audit"]
+    # Recorded-fact events are never crowded out by the message cap: they are
+    # the entries an analyst reads the timeline for.
+    _recorded = ("audit", "persistence")
+    shown = [e for e in timeline if getattr(e, "source", "message") in _recorded]
     for event in timeline:
         if len(shown) >= 50:
             break
-        if getattr(event, "source", "message") != "audit":
+        if getattr(event, "source", "message") not in _recorded:
             shown.append(event)
     shown.sort(key=lambda e: timeline.index(e))
     omitted = len(timeline) - len(shown)
     for event in shown:
-        if getattr(event, "source", "message") == "audit":
+        _src = getattr(event, "source", "message")
+        if _src in _recorded:
             who = event.actor or "unknown account"
             where = f" from {event.client_ip}" if event.client_ip else ""
+            _tag, _colour = (("AUDIT", "magenta") if _src == "audit"
+                             else ("IDENT", "red"))
             line = (f"{event.timestamp or '(unknown)':25} | {event.stage:28} | "
-                    f"{term.c('AUDIT', 'magenta', 'bold')}    | {event.subject}"
+                    f"{term.c(_tag, _colour, 'bold')}    | {event.subject}"
                     f"  [{who}{where}]")
             print(line)
             for detail in event.evidence[:3]:

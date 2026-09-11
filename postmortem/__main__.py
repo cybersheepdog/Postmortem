@@ -127,6 +127,10 @@ from postmortem.auditlog import (  # noqa: E402
 from postmortem.signin import (
     analyze_signin_logs, resolve_single_groups,
 )
+from postmortem.mes import collect as collect_mes
+from postmortem.persistence import (
+    analyze_persistence, remediation_plan, strip_private,
+)
 from postmortem.mailbox_ingest import (  # noqa: E402
     find_containers, ingest_all,
 )
@@ -521,6 +525,7 @@ from postmortem.reporting import (  # noqa: E402
     write_json, write_csv, print_attack_narrative, print_audit_summary,
     print_audit_join, print_deletion_completeness,
     print_signin_analysis, print_signin_lures,
+    print_persistence, print_remediation, print_mes_manifest,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -932,6 +937,48 @@ def main():
              "JSON/JSONL, or Management/Graph JSON). Anchors (compromise date, "
              "attacker IP/address/domain, rule keywords) are derived from it "
              "automatically and its attacker actions become confirmed evidence.",
+    )
+    anchor_group.add_argument(
+        "--mes-dir",
+        type=Path,
+        metavar="DIR",
+        help="Microsoft-Extractor-Suite output directory. Every recognised artefact under it is ingested without a separate flag: directory audit, OAuth grants, MFA methods, devices, role activity and risk detections. The individual flags below still override what is found here.",
+    )
+    anchor_group.add_argument(
+        "--entra-audit",
+        type=Path,
+        metavar="FILE",
+        help="Entra ID directory audit log (Get-GraphEntraAuditLogs). Consent grants, MFA registration, role changes, device joins -- the persistence an OAuth-based attacker leaves, which is invisible in mail and sign-in data.",
+    )
+    anchor_group.add_argument(
+        "--oauth-permissions",
+        type=Path,
+        metavar="FILE",
+        help="Current OAuth grants (Get-OAuthPermissionsGraph). Shows a consent that still EXISTS, including one granted before the audit window opened.",
+    )
+    anchor_group.add_argument(
+        "--mfa-export",
+        type=Path,
+        metavar="FILE",
+        help="Registered authentication methods (Get-MFA).",
+    )
+    anchor_group.add_argument(
+        "--devices",
+        type=Path,
+        metavar="FILE",
+        help="Entra device registrations (Get-Devices).",
+    )
+    anchor_group.add_argument(
+        "--role-activity",
+        type=Path,
+        metavar="FILE",
+        help="Directory role / PIM activity (Get-PIMAssignments, Get-AllRoleActivity).",
+    )
+    anchor_group.add_argument(
+        "--risk-detections",
+        type=Path,
+        metavar="FILE",
+        help="Identity Protection detections (Get-RiskyDetections, Get-RiskyUsers). Independent corroboration.",
     )
     anchor_group.add_argument(
         "--signin-logs",
@@ -1716,16 +1763,42 @@ def main():
     # Read BEFORE the audit log: the attacker addresses and token time it
     # derives are inputs to analyze_audit_log, which builds the message
     # index, the IP profile and every attribution from them in one pass.
-    signin_summary = None
-    if getattr(args, "signin_logs", None):
+    # Discovery first: an MES tree can supply the sign-in logs too, and
+    # an explicit --signin-logs should win over whatever it found.
+    mes_bundle = None
+    _mes_overrides = {
+        "entra_audit": getattr(args, "entra_audit", None),
+        "oauth_permissions": getattr(args, "oauth_permissions", None),
+        "mfa": getattr(args, "mfa_export", None),
+        "devices": getattr(args, "devices", None),
+        "role_activity": getattr(args, "role_activity", None),
+        "risk_detections": getattr(args, "risk_detections", None),
+    }
+    _mes_overrides = {k: v for k, v in _mes_overrides.items() if v}
+    if getattr(args, "mes_dir", None) or _mes_overrides:
         try:
-            signin_summary = analyze_signin_logs(str(args.signin_logs))
+            mes_bundle = collect_mes(
+                getattr(args, "mes_dir", None), _mes_overrides)
         except Exception as exc:  # noqa: BLE001 - report and continue
-            print(f"[!] Could not parse --signin-logs {args.signin_logs}: {exc}",
+            print(f"[!] Could not read evidence collection: {exc}",
+                  file=sys.stderr)
+            mes_bundle = None
+        if mes_bundle:
+            print_mes_manifest(mes_bundle)
+
+    signin_summary = None
+    _signin_path = getattr(args, "signin_logs", None)
+    if not _signin_path and mes_bundle and mes_bundle.get("signin_paths"):
+        _signin_path = mes_bundle["signin_paths"][0]
+    if _signin_path:
+        try:
+            signin_summary = analyze_signin_logs(str(_signin_path))
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            print(f"[!] Could not parse sign-in logs {_signin_path}: {exc}",
                   file=sys.stderr)
             signin_summary = None
         if not signin_summary:
-            print(f"[!] No sign-in records found under {args.signin_logs}",
+            print(f"[!] No sign-in records found under {_signin_path}",
                   file=sys.stderr)
 
     audit_summary = None
@@ -1767,6 +1840,26 @@ def main():
                 'attacker_ips', []))
     if signin_summary:
         print_signin_analysis(signin_summary)
+
+    # Runs last of the three: attribution here is entirely borrowed from
+    # what the sign-in and audit logs established, so both must be in.
+    persistence = None
+    remediation = []
+    if mes_bundle and mes_bundle.get('sources'):
+        _atk = set((audit_summary or {}).get('derived', {}).get(
+            'attacker_ips', []))
+        _atk |= set((signin_summary or {}).get('attacker_ips', []))
+        _anchor = (signin_summary or {}).get(
+            '_earliest_token_dt')
+        if _anchor is None and anchors.compromise_date:
+            _anchor = anchors.compromise_date
+        _victims = set((signin_summary or {}).get('affected_users', []))
+        if getattr(args, 'victim_domain', None):
+            _victims |= {str(v) for v in (args.victim_domain or [])}
+        persistence = analyze_persistence(
+            mes_bundle['sources'], attacker_ips=_atk,
+            compromise_dt=_anchor, victim_users=_victims)
+        print_persistence(persistence)
 
     allowlist = []
     for value in (args.allowlist or []):
@@ -1922,7 +2015,7 @@ def main():
     # The audit log is merged in here, so the report carries one
     # chronology rather than a message timeline and a separate UAL summary.
     with timed("timeline + precursor verdict"):
-        timeline = build_attack_timeline(records, audit_summary)
+        timeline = build_attack_timeline(records, audit_summary, persistence)
         precursor_verdict = earliest_malicious_precursor_verdict(records, anchors)
 
     manifest = build_run_manifest(
@@ -1981,6 +2074,16 @@ def main():
     print_attacker_ip_activity(audit_summary)
 
     print_signin_lures(initial_verdict)
+
+    # Last section before the verdict: it is the page the client acts on,
+    # and it consolidates rules and forwarding from the audit log with the
+    # identity-side mechanisms so remediation is one list, not four.
+    if persistence or audit_summary:
+        remediation = remediation_plan(persistence, audit_summary)
+        print_remediation(remediation)
+        if persistence:
+            initial_verdict['persistence'] = strip_private(persistence)
+        initial_verdict['remediation'] = remediation
 
     print_initial_compromise(initial_verdict)
 

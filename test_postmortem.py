@@ -3551,3 +3551,402 @@ def test_confirmed_messages_rank_above_higher_scoring_ones(tmp_path):
                                     key=candidate_sort_key)]
     assert order[-1] == "/m/noisy.eml", order
     assert set(order[:2]) == {"/m/lure.eml", "/m/deleted.eml"}
+
+
+
+# --------------------------------------------------------------------------
+# Persistence: what keeps the attacker in after the obvious remediation
+#
+# The other sections of this tool answer what happened. These answer whether
+# it is still happening, which is the question a client acts on tonight and
+# the one a report can most easily get wrong -- an OAuth consent grant leaves
+# no trace in mail or in sign-in data, so a report built from those alone can
+# say "remediated" while the attacker still reads the mailbox.
+# --------------------------------------------------------------------------
+PERSIST_ATK = "45.147.230.88"
+ADMIN_IP = "198.51.100.5"
+
+
+def _audit_event(activity, when, ip, target, perms="", result="success"):
+    return {
+        "activityDateTime": when,
+        "activityDisplayName": activity,
+        "result": result,
+        "initiatedBy": {"user": {"userPrincipalName": "victim@acme.com",
+                                 "ipAddress": ip}},
+        "targetResources": [{
+            "displayName": target, "id": "sp-1", "type": "ServicePrincipal",
+            "modifiedProperties": [{"displayName": "ConsentAction.Permissions",
+                                    "newValue": perms}]}],
+    }
+
+
+def _write(tmp_path, name, payload):
+    import json
+    p = tmp_path / name
+    if name.endswith(".csv"):
+        p.write_text(payload, encoding="utf-8")
+    else:
+        p.write_text(json.dumps(payload), encoding="utf-8")
+    return str(p)
+
+
+def _compromise():
+    from datetime import datetime, timezone
+    return datetime(2026, 8, 25, 15, 40, tzinfo=timezone.utc)
+
+
+def test_a_consent_grant_is_the_worst_case_and_says_so(tmp_path):
+    from postmortem.persistence import parse_entra_audit, analyze_persistence
+
+    rows = [_audit_event("Consent to application", "2026-08-25T15:47:00Z",
+                         PERSIST_ATK, "Mail Archiver Pro",
+                         "Mail.ReadWrite Mail.Send offline_access")]
+    events = parse_entra_audit([__import__("postmortem.persistence",
+                                           fromlist=["_flatten"])._flatten(r)
+                                for r in rows])
+    out = analyze_persistence({"entra_audit": events},
+                              attacker_ips=[PERSIST_ATK],
+                              compromise_dt=_compromise(),
+                              victim_users=["victim@acme.com"])
+    assert len(out["findings"]) == 1
+    f = out["findings"][0]
+    assert f["kind"] == "oauth_consent"
+    assert f["by_attacker"] is True
+    assert PERSIST_ATK in f["attribution"]
+    assert f["mail_scopes"] == ["mail.readwrite", "mail.send"]
+    assert f["durable_scopes"] == ["offline_access"]
+
+    # The whole point: neither of the two things a client always does removes
+    # it, and the report has to say so in those words.
+    assert f["survives_password_reset"] == "survives"
+    assert f["survives_token_revocation"] == "survives"
+    assert out["survives_both_count"] == 1
+    assert "do NOT remove this" in f["not_fixed_by"]
+
+
+def test_ordinary_administration_is_not_a_finding(tmp_path):
+    # A tenant has legitimate consents. Reporting every one of them buries the
+    # attacker's, which is the same as not finding it.
+    from postmortem.persistence import (parse_entra_audit, analyze_persistence,
+                                        _flatten)
+
+    rows = [
+        _audit_event("Consent to application", "2026-06-02T11:00:00Z",
+                     ADMIN_IP, "Adobe Acrobat", "User.Read"),
+        _audit_event("Consent to application", "2026-08-25T15:47:00Z",
+                     PERSIST_ATK, "Mail Archiver Pro", "Mail.ReadWrite"),
+    ]
+    events = parse_entra_audit([_flatten(r) for r in rows])
+    out = analyze_persistence({"entra_audit": events},
+                              attacker_ips=[PERSIST_ATK],
+                              compromise_dt=_compromise(),
+                              victim_users=["victim@acme.com"])
+    names = [t for f in out["findings"] for t in f["targets"]]
+    assert names == ["Mail Archiver Pro"], names
+
+
+def test_an_unreadable_scope_is_kept_not_assumed_harmless(tmp_path):
+    # The dangerous version of the filter above. "We could not read what this
+    # application asked for" must never be treated as "it asked for nothing".
+    from postmortem.persistence import (parse_entra_audit, analyze_persistence,
+                                        _flatten, scopes_were_readable)
+
+    assert scopes_were_readable("Mail.ReadWrite offline_access")
+    assert not scopes_were_readable("")
+    assert not scopes_were_readable("consent granted by administrator")
+
+    rows = [_audit_event("Consent to application", "2026-06-02T11:00:00Z",
+                         ADMIN_IP, "Unknown App", "")]
+    out = analyze_persistence(
+        {"entra_audit": parse_entra_audit([_flatten(r) for r in rows])},
+        attacker_ips=[PERSIST_ATK], compromise_dt=_compromise())
+    assert len(out["findings"]) == 1
+    assert out["findings"][0]["by_attacker"] is False
+    assert out["findings"][0]["targets"] == ["Unknown App"]
+
+
+def test_attribution_needs_a_recorded_ground(tmp_path):
+    # The failure that would put a remediation instruction in front of a client
+    # for something their own administrator did.
+    from postmortem.persistence import (parse_entra_audit, analyze_persistence,
+                                        _flatten)
+
+    rows = [_audit_event("Add member to role", "2026-08-26T09:00:00Z",
+                         ADMIN_IP, "Exchange Administrator")]
+    events = parse_entra_audit([_flatten(r) for r in rows])
+
+    # No attacker address established at all: nothing is attributed.
+    bare = analyze_persistence({"entra_audit": events})
+    assert bare["findings"][0]["by_attacker"] is False
+    assert bare["confirmed_count"] == 0
+    assert any("nothing below is attributed" in w for w in bare["warnings"])
+
+    # Attacker address known, but this event is not from it.
+    known = analyze_persistence({"entra_audit": events},
+                                attacker_ips=[PERSIST_ATK],
+                                compromise_dt=_compromise(),
+                                victim_users=["victim@acme.com"])
+    assert known["findings"][0]["by_attacker"] is True  # in-window, victim acct
+    assert "compromise window" in known["findings"][0]["attribution"]
+
+    # ... and an event before the window is neither.
+    old = parse_entra_audit([_flatten(
+        _audit_event("Add member to role", "2026-01-01T09:00:00Z", ADMIN_IP,
+                     "Exchange Administrator"))])
+    out = analyze_persistence({"entra_audit": old}, attacker_ips=[PERSIST_ATK],
+                              compromise_dt=_compromise(),
+                              victim_users=["victim@acme.com"])
+    assert out["findings"][0]["by_attacker"] is False
+    assert out["findings"][0]["attribution"] == ""
+
+
+def test_a_failed_attempt_is_not_a_mechanism(tmp_path):
+    from postmortem.persistence import parse_entra_audit, _flatten
+
+    rows = [_audit_event("Consent to application", "2026-08-25T15:47:00Z",
+                         PERSIST_ATK, "Mail Archiver Pro", "Mail.ReadWrite",
+                         result="failure")]
+    assert parse_entra_audit([_flatten(r) for r in rows]) == []
+
+
+def test_a_grant_that_predates_the_log_is_still_found(tmp_path):
+    # The audit log only shows consents granted inside its window. One granted
+    # earlier is invisible there and is the more dangerous of the two, because
+    # nothing else would ever surface it.
+    from postmortem.persistence import parse_oauth_permissions, analyze_persistence
+
+    rows = [
+        {"applicationname": "Invoice Sync Helper", "clientid": "z9y8x7",
+         "permission": "full_access_as_app offline_access",
+         "id": "grant-4410", "permissiontype": "Application"},
+        {"applicationname": "Adobe Acrobat", "clientid": "d4",
+         "permission": "User.Read", "id": "grant-1"},
+    ]
+    grants = parse_oauth_permissions(rows)
+    # The benign one never becomes a finding at all.
+    assert [g["targets"][0] for g in grants] == ["Invoice Sync Helper"]
+
+    out = analyze_persistence({"oauth_permissions": grants})
+    f = out["findings"][0]
+    assert "full_access_as_app" in f["mail_scopes"]
+    assert f["survives_password_reset"] == "survives"
+    assert f["grant_id"] == "grant-4410"
+
+
+def test_a_surviving_grant_inherits_the_consent_attribution(tmp_path):
+    # The audit log says the attacker consented; the grant export says it is
+    # still there. The second decides whether remediation is finished, so it
+    # must not sit in a review pile while the first is flagged confirmed.
+    from postmortem.persistence import (parse_entra_audit, parse_oauth_permissions,
+                                        analyze_persistence, _flatten)
+
+    events = parse_entra_audit([_flatten(_audit_event(
+        "Consent to application", "2026-08-25T15:47:00Z", PERSIST_ATK,
+        "Mail Archiver Pro", "Mail.ReadWrite offline_access"))])
+    grants = parse_oauth_permissions([
+        {"applicationname": "Mail Archiver Pro", "clientid": "a1b2c3",
+         "permission": "Mail.ReadWrite offline_access", "id": "grant-7781"}])
+
+    out = analyze_persistence({"entra_audit": events, "oauth_permissions": grants},
+                             attacker_ips=[PERSIST_ATK],
+                             compromise_dt=_compromise(),
+                             victim_users=["victim@acme.com"])
+    existing = [f for f in out["findings"] if f["source"] == "oauth_permissions"]
+    assert existing and existing[0]["by_attacker"] is True
+    assert "still present" in existing[0]["attribution"]
+    assert out["confirmed_count"] == 2
+
+
+def test_remediation_carries_the_real_identifiers(tmp_path):
+    # A command with <id> in it is a command the analyst has to go and look up.
+    from postmortem.persistence import parse_oauth_permissions, analyze_persistence, \
+        remediation_plan
+
+    grants = parse_oauth_permissions([
+        {"applicationname": "Mail Archiver Pro", "clientid": "a1b2c3",
+         "permission": "Mail.ReadWrite offline_access", "id": "grant-7781"}])
+    plan = remediation_plan(analyze_persistence({"oauth_permissions": grants}))
+    assert len(plan) == 1
+    assert "-OAuth2PermissionGrantId grant-7781" in plan[0]["action"]
+    assert "-ServicePrincipalId a1b2c3" in plan[0]["action"]
+    assert "<id>" not in plan[0]["action"]
+
+
+def test_rules_and_forwarding_join_the_same_action_list(tmp_path):
+    # A client working through remediation needs one page, not a page per data
+    # source. Rules come from the audit log, consents from the directory log.
+    from postmortem.persistence import remediation_plan
+
+    audit = {
+        "malicious_rules": [{"time": "2026-08-25T15:54:33Z", "user": "victim@acme.com",
+                             "client_ip": PERSIST_ATK, "keywords": ["invoice"],
+                             "forwards": [], "delete": True}],
+        "forwarding_rules": [{"time": "2026-08-25T15:55:00Z", "user": "victim@acme.com",
+                        "client_ip": PERSIST_ATK,
+                        "forwards": ["exfil@attacker.example"]}],
+    }
+    plan = remediation_plan(None, audit)
+    kinds = [a["kind"] for a in plan]
+    assert "inbox_rule" in kinds and "forwarding" in kinds
+    assert all(a["by_attacker"] for a in plan)
+    assert [a["priority"] for a in plan] == [1, 2]
+    fwd = [a for a in plan if a["kind"] == "forwarding"][0]
+    assert "exfil@attacker.example" in fwd["target"]
+
+
+def test_the_action_list_leads_with_what_survives(tmp_path):
+    from postmortem.persistence import (parse_entra_audit, analyze_persistence,
+                                        remediation_plan, _flatten)
+
+    events = parse_entra_audit([_flatten(e) for e in [
+        _audit_event("Add device", "2026-08-25T15:58:00Z", PERSIST_ATK, "WIN-TEMP01"),
+        _audit_event("Consent to application", "2026-08-25T15:47:00Z",
+                     PERSIST_ATK, "Mail Archiver Pro", "Mail.ReadWrite offline_access"),
+    ]])
+    out = analyze_persistence({"entra_audit": events}, attacker_ips=[PERSIST_ATK],
+                              compromise_dt=_compromise())
+    plan = remediation_plan(out)
+    assert plan[0]["kind"] == "oauth_consent", [a["kind"] for a in plan]
+    assert plan[0]["survives_password_reset"] == "survives"
+
+
+def test_no_persistence_data_is_unknown_not_clean(tmp_path):
+    # The honest answer without the data is "cannot be assessed". Reporting a
+    # clean bill of health from sources that structurally cannot see a consent
+    # grant is the single worst thing this module could do.
+    from postmortem.persistence import analyze_persistence
+
+    out = analyze_persistence({})
+    assert out["available"] is False
+    assert out["findings"] == []
+    assert any("CANNOT be assessed" in w for w in out["warnings"])
+
+    # And a partial collection says which half is missing.
+    partial = analyze_persistence({"entra_audit": []}, attacker_ips=[PERSIST_ATK])
+    assert any("Get-OAuthPermissionsGraph" in w for w in partial["warnings"])
+
+
+def test_only_devices_registered_in_the_window_are_reported(tmp_path):
+    # The tenant's ordinary laptops are not a finding and would bury the one
+    # the attacker joined.
+    from postmortem.persistence import parse_devices, analyze_persistence
+
+    devices = parse_devices([
+        {"displayname": "DESKTOP-OLD", "deviceid": "d1",
+         "registrationdatetime": "2024-03-01T09:00:00Z"},
+        {"displayname": "WIN-TEMP01", "deviceid": "d2",
+         "registrationdatetime": "2026-08-25T15:58:00Z"},
+    ])
+    out = analyze_persistence({"devices": devices}, attacker_ips=[PERSIST_ATK],
+                              compromise_dt=_compromise())
+    assert [f["name"] for f in out["findings"]] == ["WIN-TEMP01"]
+
+
+# ---- the MES dispatcher --------------------------------------------------
+def test_files_are_identified_by_name_then_header(tmp_path):
+    from postmortem.mes import identify
+
+    # Filename alone is enough when it is unambiguous.
+    p = tmp_path / "OAuthPermissions.csv"
+    p.write_text("ApplicationName,Permission\nX,Mail.Read\n", encoding="utf-8")
+    assert identify(str(p)) == "oauth_permissions"
+
+    # "AuditLogs" matches both the directory audit and the unified audit log,
+    # so the header has to break the tie -- and getting this wrong would feed
+    # a UAL export to the directory parser and report nothing.
+    d = tmp_path / "AuditLogs-entra.json"
+    d.write_text('[{"activityDisplayName":"Consent to application",'
+                 '"initiatedBy":{},"targetResources":[]}]', encoding="utf-8")
+    assert identify(str(d)) == "entra_audit"
+
+    u = tmp_path / "AuditLogs-ual.csv"
+    u.write_text("CreationTime,RecordType,AuditData\n2026-01-01,1,{}\n",
+                 encoding="utf-8")
+    assert identify(str(u)) == "unified_audit"
+
+
+def test_an_unrecognised_file_is_reported_not_skipped(tmp_path):
+    # An analyst who exported something and does not see it counted needs to
+    # know the tool did not read it.
+    from postmortem.mes import discover
+
+    (tmp_path / "MFA.csv").write_text("UserPrincipalName,MFAEnabled\na,True\n",
+                                      encoding="utf-8")
+    (tmp_path / "notes.json").write_text('[{"hello":"world"}]', encoding="utf-8")
+    by_kind, unrecognised, seen = discover(str(tmp_path))
+
+    assert seen == 2
+    assert "mfa" in by_kind
+    assert [p.endswith("notes.json") for p in unrecognised] == [True]
+
+
+def test_an_explicit_flag_overrides_what_discovery_found(tmp_path):
+    from postmortem.mes import collect
+
+    tree = tmp_path / "mes"
+    tree.mkdir()
+    (tree / "OAuthPermissions.csv").write_text(
+        "ApplicationName,Permission,Id\nDiscovered,Mail.Read,g1\n",
+        encoding="utf-8")
+    other = tmp_path / "hand-picked.csv"
+    other.write_text("ApplicationName,Permission,Id\nChosen,Mail.Send,g2\n",
+                     encoding="utf-8")
+
+    found = collect(str(tree))
+    assert [g["targets"][0] for g in found["sources"]["oauth_permissions"]] \
+        == ["Discovered"]
+
+    overridden = collect(str(tree), {"oauth_permissions": str(other)})
+    assert [g["targets"][0] for g in overridden["sources"]["oauth_permissions"]] \
+        == ["Chosen"]
+
+
+def test_csv_and_json_are_both_read(tmp_path):
+    from postmortem.persistence import load_rows
+
+    c = tmp_path / "a.csv"
+    c.write_text("UserPrincipalName,MFAEnabled\nvictim@acme.com,True\n",
+                 encoding="utf-8")
+    assert load_rows(str(c))[0]["userprincipalname"] == "victim@acme.com"
+
+    j = tmp_path / "b.json"
+    j.write_text('{"value":[{"UserPrincipalName":"victim@acme.com"}]}',
+                 encoding="utf-8")
+    assert load_rows(str(j))[0]["userprincipalname"] == "victim@acme.com"
+
+    # A semicolon export, which is what a European locale produces.
+    s = tmp_path / "c.csv"
+    s.write_text("UserPrincipalName;MFAEnabled\nvictim@acme.com;True\n",
+                 encoding="utf-8")
+    assert load_rows(str(s))[0]["userprincipalname"] == "victim@acme.com"
+
+    assert load_rows(str(tmp_path / "missing.csv")) == []
+
+
+def test_persistence_reaches_the_timeline_and_serialises(tmp_path):
+    from postmortem.persistence import (parse_entra_audit, analyze_persistence,
+                                        strip_private, _flatten)
+    from postmortem.scoring import build_attack_timeline
+    import json
+
+    events = parse_entra_audit([_flatten(_audit_event(
+        "Consent to application", "2026-08-25T15:47:00Z", PERSIST_ATK,
+        "Mail Archiver Pro", "Mail.ReadWrite offline_access"))])
+    out = analyze_persistence({"entra_audit": events}, attacker_ips=[PERSIST_ATK],
+                              compromise_dt=_compromise())
+
+    timeline = build_attack_timeline([], None, out)
+    assert len(timeline) == 1
+    e = timeline[0]
+    assert e.source == "persistence"
+    assert e.stage == "persistence"
+    assert "Mail Archiver Pro" in e.subject
+    assert e.client_ip == PERSIST_ATK
+    assert e.score == 0, "a recorded fact carries no score"
+
+    # The parsed datetimes are working values and are not serialisable.
+    json.dumps(strip_private(out))
+
+    # And the timeline is inert without persistence, as every existing run is.
+    assert build_attack_timeline([], None, None) == []
