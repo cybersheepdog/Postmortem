@@ -184,6 +184,14 @@ class EmailRecord:
     attachment_threat_note: str = ""
     anchor_matches: list[str] = field(default_factory=list)
     scenario_score: int = 0
+    # Recorded attacker actions against THIS message, joined from the audit log
+    # by InternetMessageId. Facts, not heuristics: they carry no score and
+    # promote through `audit_confirmed` instead.
+    audit_events: list[dict] = field(default_factory=list)
+    audit_confirmed: bool = False
+    # Seen by an attacker session but not acted on -- often one line of a
+    # folder sync, so it is context rather than targeting.
+    audit_attacker_read: bool = False
     # Structured provenance for the initial-email verdict, parallel to
     # `provenance` for the main score: same shape, same make_finding().
     scenario_findings: list[dict] = field(default_factory=list)

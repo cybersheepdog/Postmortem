@@ -19,7 +19,7 @@ from postmortem.config import (
 from postmortem.models import EmailRecord, AttackTimelineEvent, Anchors
 from postmortem.utils import (
     parse_date, date_sort_key, normalize_email, normalize_subject,
-    domain_of, clean_text, registered_domain_approx,
+    domain_of, clean_text, registered_domain_approx, normalize_message_id,
 )
 from postmortem.urls import IP_URL_RE
 from pathlib import Path
@@ -1298,6 +1298,80 @@ def after_compromise(record, anchors: Anchors) -> bool:
     return bool(dt and dt > anchors.compromise_date)
 
 
+
+def attach_audit_events(records, audit_summary):
+    """Join recorded attacker actions onto the specific messages they touched.
+
+    Everything else in this module infers: it reads a message and reasons about
+    how suspicious it looks. This does not. When the audit log says a message
+    was hard-deleted from the attacker's address at 14:32, that is a recorded
+    fact about that exact item, and it is the strongest thing the tool can say
+    about any message -- stronger than any amount of language scoring, and the
+    one category of evidence here that cannot produce a false positive.
+
+    Findings are attached with weight 0. An audit event is evidence, not a
+    heuristic; it must not be blended into a score that also contains guesses
+    about wording. It promotes by a separate route: `audit_confirmed` sends a
+    message to Tier 1 in assign_tiers regardless of what it says.
+
+    Returns counts for the run log.
+    """
+    index = ((audit_summary or {}).get("message_index") or {}).get("by_message_id") or {}
+    if not index:
+        return {"matched": 0, "confirmed": 0, "events": 0}
+
+    matched = confirmed = events_used = read_only = 0
+    for r in records:
+        key = normalize_message_id(getattr(r, "message_id", "") or "")
+        if not key:
+            continue
+        hits = index.get(key)
+        if not hits:
+            continue
+
+        matched += 1
+        events_used += len(hits)
+        r.audit_events = list(hits)
+        # Two different claims, kept apart. "The attacker did something to this
+        # message" is targeting; "the attacker's session saw this message" may
+        # be one line of a folder sync that named thousands of items. Only the
+        # first promotes to Tier 1.
+        r.audit_confirmed = any(h["by_attacker"] and h["deliberate"] for h in hits)
+        r.audit_attacker_read = any(
+            h["by_attacker"] and not h["deliberate"] for h in hits)
+        if r.audit_confirmed:
+            confirmed += 1
+        elif r.audit_attacker_read:
+            read_only += 1
+
+        # One finding per distinct action, so "read and then hard-deleted" is
+        # two lines rather than a summary the reader has to unpack.
+        seen = set()
+        for h in hits:
+            who = ("the attacker" if h["by_attacker"]
+                   else (h["user"] or "the mailbox owner"))
+            where = f" from {h['client_ip']}" if h["client_ip"] else ""
+            when = f" at {h['time']}" if h["time"] else ""
+            signal = (f"Audit log: this message was {h['verb']} by {who}"
+                      f"{when}{where}")
+            if signal in seen:
+                continue
+            seen.add(signal)
+            r.indicators = list(dict.fromkeys(list(r.indicators) + [signal]))
+            r.provenance = list(r.provenance) + [make_finding(
+                signal,
+                category="audit",
+                source=f"audit:{h['operation']}",
+                matched=f"{h['operation']} {h['time']} "
+                        f"{h['client_ip'] or '(no client IP)'}"
+                        + (f" folder={h['folder']}" if h["folder"] else ""),
+                weight=0,
+                severity="high" if h["by_attacker"] else "low",
+            )]
+    return {"matched": matched, "confirmed": confirmed,
+            "read_only": read_only, "events": events_used}
+
+
 def assign_tiers(records, scenario, anchors: Anchors):
     """Sort every message into review tiers so the analyst works a small, high-
     precision set first instead of thousands of candidates.
@@ -1322,7 +1396,13 @@ def assign_tiers(records, scenario, anchors: Anchors):
         # Anchor matches are investigator ground truth and are never excluded.
         relevant = bool(r.anchor_matches) or relevant_to_incident(r, anchors)
 
-        if r.is_inbound and r.anchor_matches:
+        # A message the attacker is recorded as having touched is Tier 1 on
+        # that basis alone -- not inbound-only, not window-bounded, not
+        # dependent on its wording. It is the one signal here that is observed
+        # rather than inferred, so nothing about the message can outweigh it.
+        if getattr(r, "audit_confirmed", False):
+            r.tier = 1
+        elif r.is_inbound and r.anchor_matches:
             r.tier = 1
         elif r.is_inbound and window_ok and r.scenario_score >= _initial_strong_floor():
             r.tier = 1
@@ -1330,6 +1410,13 @@ def assign_tiers(records, scenario, anchors: Anchors):
             r.tier = 2
         else:
             r.tier = 3
+
+        # A floor, applied after the normal chain rather than inside it: being
+        # seen in an attacker session should never DEMOTE a message that earned
+        # Tier 1 on its own, only lift one that would otherwise be ignored.
+        if getattr(r, "audit_attacker_read", False) and r.tier == 3:
+            r.tier = 2
+
         counts[r.tier] += 1
     return counts
 
@@ -1701,11 +1788,17 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
         victim_address, thread_participants, contact_names,
         allowlist=allowlist,
     )
+    # Recorded attacker actions against specific messages, joined on
+    # InternetMessageId. Must run before tiering: a confirmed message is Tier 1
+    # regardless of what its wording scores.
+    audit_join = attach_audit_events(records, audit_summary)
+
     for r in records:
         score_initial_email(r, scenario, anchors)
     tier_counts = assign_tiers(records, scenario, anchors)
     verdict = anchored_initial_email_verdict(records, scenario, anchors, reason)
     verdict["tier_counts"] = {t: tier_counts.get(t, 0) for t in (1, 2, 3)}
+    verdict["audit_join"] = audit_join
     verdict["victim_address"] = victim_address
     verdict["attack_narrative"] = reconstruct_attack_narrative(
         records, scenario, anchors, verdict, audit_summary

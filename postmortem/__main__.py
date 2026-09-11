@@ -516,6 +516,7 @@ from postmortem.reporting import (  # noqa: E402
     print_summary, print_initial_compromise, print_campaigns,
     print_run_manifest, build_run_manifest, generate_html_interactive,
     write_json, write_csv, print_attack_narrative, print_audit_summary,
+    print_audit_join,
     print_top_domains, top_flagged_domains,
 )
 from postmortem import term  # noqa: E402
@@ -1713,7 +1714,15 @@ def main():
             records, internal_domains, anchors, audit_summary, allowlist=allowlist
         )
     if audit_summary:
-        initial_verdict["audit_log"] = audit_summary
+        # The message-id index is a join structure, not a finding: on a real
+        # export it is tens of thousands of entries, and every one of its
+        # matches has already been attached to the record it belongs to. Its
+        # counts stay; the body does not go into the report.
+        _audit_for_report = dict(audit_summary)
+        _idx = dict(_audit_for_report.get("message_index") or {})
+        _idx.pop("by_message_id", None)
+        _audit_for_report["message_index"] = _idx
+        initial_verdict["audit_log"] = _audit_for_report
     print("Scenario profile:  " + term.c(scenario, "magenta", "bold")
           + f" ({scenario_reason})")
     # State the period searched. A verdict of "no entry point found" means
@@ -1868,6 +1877,8 @@ def main():
         timeline,
         precursor_verdict,
     )
+
+    print_audit_join(initial_verdict)
 
     print_initial_compromise(initial_verdict)
 

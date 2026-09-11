@@ -23,6 +23,8 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 
+from postmortem.utils import normalize_message_id
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[0-9A-Fa-f:]{3,}:[0-9A-Fa-f:]+\b")
 
@@ -198,6 +200,127 @@ def _rule_findings(event):
 
 
 
+
+# Operations that touch a specific message and carry its InternetMessageId.
+# These are the join points between the audit log and the corpus: everything
+# else in the log is about the mailbox, not about a message.
+_ITEM_OPS = {
+    "harddelete": "hard-deleted",
+    "softdelete": "soft-deleted",
+    "movetodeleteditems": "moved to Deleted Items",
+    "movetofolder": "moved to another folder",
+    "move": "moved",
+    "mailitemsaccessed": "read",
+    "messagebind": "opened in the reading pane",
+    "send": "sent",
+    "sendas": "sent as the mailbox owner",
+    "sendonbehalf": "sent on behalf of the mailbox owner",
+    "create": "created",
+    "update": "modified",
+}
+
+
+# Operations where the attacker *did something to* the message, as opposed to
+# merely seeing it. The distinction matters for volume: a single
+# MailItemsAccessed sync record can name every item in a folder, so treating a
+# read as proof of targeting would promote whole mailboxes. A delete, a move or
+# a send is deliberate and specific.
+_DELIBERATE_OPS = {
+    "harddelete", "softdelete", "movetodeleteditems", "movetofolder", "move",
+    "send", "sendas", "sendonbehalf", "update",
+}
+
+
+def _walk_message_ids(node, out, depth=0):
+    """Collect (InternetMessageId, subject, folder) triples from audit data.
+
+    The id lives in a different place for each operation family -- ``Item`` for
+    a send or a bind, ``AffectedItems[]`` for a delete or a move, and
+    ``Folders[].FolderItems[]`` for MailItemsAccessed -- and Microsoft has
+    added shapes over time. Rather than encode each one, walk the structure and
+    take the ids wherever they appear, keeping the nearest subject and folder
+    for context.
+    """
+    if depth > 6 or not isinstance(node, (dict, list)):
+        return
+    if isinstance(node, list):
+        for item in node:
+            _walk_message_ids(item, out, depth + 1)
+        return
+
+    mid = ""
+    for key in ("InternetMessageId", "internetMessageId", "InternetMessageID"):
+        if node.get(key):
+            mid = str(node[key])
+            break
+    if mid:
+        folder = ""
+        parent = node.get("ParentFolder") or node.get("Folder") or {}
+        if isinstance(parent, dict):
+            folder = str(parent.get("Path") or parent.get("Name") or "")
+        out.append((mid, str(node.get("Subject") or ""), folder))
+
+    for value in node.values():
+        if isinstance(value, (dict, list)):
+            _walk_message_ids(value, out, depth + 1)
+
+
+def build_message_index(events, attacker_ips=(), compromise_dt=None):
+    """Map normalized Message-ID -> the audit events that touched that message.
+
+    This is the join the tool was missing. Every other audit finding describes
+    the mailbox; these describe a *specific message*, which is what lets the
+    report say "hard-deleted by the attacker at 14:32 from 203.0.113.9" of a
+    named item rather than inferring anything from its wording.
+    """
+    attacker_ips = set(attacker_ips or ())
+    index = {}
+    matched_events = 0
+
+    for e in events:
+        verb = _ITEM_OPS.get(e["op_lower"])
+        if not verb:
+            continue
+        found = []
+        _walk_message_ids(e["audit"], found)
+        if not found:
+            continue
+        matched_events += 1
+
+        ip = e["client_ip"]
+        ts = e["timestamp"]
+        # Attribution is by IP, not by operation: a user reading or deleting
+        # their own mail is routine, and the same operation from the address
+        # that built the malicious rule is not.
+        by_attacker = bool(ip and ip in attacker_ips)
+        post = bool(ts and compromise_dt and ts >= compromise_dt)
+
+        for mid, subject, folder in found:
+            key = normalize_message_id(mid)
+            if not key:
+                continue
+            index.setdefault(key, []).append({
+                "time": ts.strftime("%Y-%m-%dT%H:%M:%SZ") if ts else "",
+                "operation": e["operation"],
+                "verb": verb,
+                "user": e["user"],
+                "client_ip": ip,
+                "subject": subject,
+                "folder": folder,
+                "by_attacker": by_attacker,
+                "deliberate": e["op_lower"] in _DELIBERATE_OPS,
+                "post_compromise": post,
+            })
+
+    for key in index:
+        index[key].sort(key=lambda x: x["time"])
+    return {
+        "by_message_id": index,
+        "messages_referenced": len(index),
+        "events_with_message_id": matched_events,
+    }
+
+
 def _coverage(events):
     """What this export can and cannot speak to.
 
@@ -366,10 +489,17 @@ def analyze_audit_log(path):
         "attacker_domains": sorted(attacker_domains),
         "rule_keywords": sorted(rule_keywords),
     }
+    # Built last: it needs the attacker IPs and the compromise date derived
+    # above in order to say who did each thing, not merely that it happened.
+    message_index = build_message_index(
+        events, attacker_ips=attacker_ips, compromise_dt=compromise_dt)
+
     return {
         "events_parsed": len(events),
         # What the export can speak to. Every finding below is bounded by it.
         "coverage": _coverage(events),
+        # message-id -> the audit events that touched that specific message.
+        "message_index": message_index,
         "malicious_rules": malicious_rules,
         "forwarding_rules": forwarding,
         "attacker_logins": sorted(attacker_logins, key=lambda x: x["time"]),

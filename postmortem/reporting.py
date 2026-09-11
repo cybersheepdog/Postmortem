@@ -214,6 +214,39 @@ def print_campaigns(
             )
  
  
+def print_audit_join(verdict: dict):
+    """What the audit log proved about specific messages in this corpus.
+
+    Separate from the audit summary above, which describes the mailbox. This
+    is the join: recorded attacker actions matched to items actually present
+    here, and it is the only place the tool states a fact about a message
+    rather than an inference from it.
+    """
+    join = (verdict or {}).get("audit_join") or {}
+    if not join.get("matched"):
+        return
+    print()
+    _hdr("AUDIT LOG JOINED TO MESSAGES (recorded, not inferred)")
+    print(f"  Messages in this corpus named by the audit log: {join['matched']}")
+    print(f"  Audit events attached to them:                  {join['events']}")
+    print(f"  Acted on by an attacker session:                {join['confirmed']}"
+          + ("   -> Tier 1" if join["confirmed"] else ""))
+    print(f"  Only seen by an attacker session:               "
+          f"{join.get('read_only', 0)}"
+          + ("   -> Tier 2 floor" if join.get("read_only") else ""))
+    if not join["confirmed"]:
+        print()
+        print("  No deliberate message-level action (delete, move, send) was")
+        print("  attributable to an attacker IP. Events with no ClientIP, or")
+        print("  from the mailbox owner's own address, are attached as context")
+        print("  but do not promote.")
+    else:
+        print()
+        print("  'Acted on' means delete, move or send -- a deliberate act on a")
+        print("  named item. A read is kept separate because one")
+        print("  MailItemsAccessed sync record can name an entire folder.")
+
+
 def print_initial_compromise(verdict: dict):
     print()
     _hdr("INITIAL COMPROMISE ANALYSIS")
@@ -337,6 +370,12 @@ def print_audit_summary(audit: dict, warnings=None):
         print()
 
     print(f"  Events parsed:          {audit.get('events_parsed', 0)}")
+
+    idx = audit.get("message_index") or {}
+    if idx.get("messages_referenced"):
+        print(f"  Message-level events:   "
+              f"{idx['events_with_message_id']} event(s) naming "
+              f"{idx['messages_referenced']} distinct message(s)")
     if d.get("compromise_date"):
         print(f"  Compromise (earliest):  {d['compromise_date']}")
     if d.get("attacker_ips"):

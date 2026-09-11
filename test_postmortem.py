@@ -2176,6 +2176,242 @@ def test_manifest_carries_audit_provenance_and_stays_serialisable(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# E2: joining audit events to the messages they touched
+#
+# Every other signal in this tool infers from what a message says. These are
+# the only ones that record what was done to it.
+# --------------------------------------------------------------------------
+ATTACKER_IP = "37.19.210.182"
+OWNER_IP = "203.0.113.10"
+
+
+def _rule_event(when="2026-08-25T15:54:33"):
+    return {"CreationTime": when, "Operation": "New-InboxRule",
+            "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+            "Parameters": [{"Name": "SubjectContainsWords", "Value": "remittance"},
+                           {"Name": "DeleteMessage", "Value": "True"}]}
+
+
+def _audit(tmp_path, events, name="ual.json"):
+    import json
+    p = tmp_path / name
+    p.write_text(json.dumps([_rule_event()] + events), encoding="utf-8")
+    from postmortem.auditlog import analyze_audit_log
+    return analyze_audit_log(str(p))
+
+
+def test_message_ids_are_found_in_every_audit_shape(tmp_path):
+    # The id sits somewhere different for each operation family, and Microsoft
+    # has added shapes over time, so the walk must not depend on the layout.
+    summary = _audit(tmp_path, [
+        # AffectedItems[] -- deletes and moves
+        {"CreationTime": "2026-08-25T16:00:00", "Operation": "HardDelete",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "AffectedItems": [{"InternetMessageId": "<a@x.example>",
+                            "Subject": "Remittance",
+                            "ParentFolder": {"Path": "\\Inbox"}}]},
+        # Folders[].FolderItems[] -- MailItemsAccessed
+        {"CreationTime": "2026-08-25T16:01:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "Folders": [{"Path": "\\Inbox",
+                      "FolderItems": [{"InternetMessageId": "<b@x.example>"}]}]},
+        # Item{} -- sends and binds
+        {"CreationTime": "2026-08-25T16:02:00", "Operation": "Send",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "Item": {"InternetMessageId": "<c@x.example>", "Subject": "Invoice"}},
+    ])
+    idx = summary["message_index"]
+    assert idx["messages_referenced"] == 3
+    assert idx["events_with_message_id"] == 3
+    by_id = idx["by_message_id"]
+    assert set(by_id) == {"<a@x.example>", "<b@x.example>", "<c@x.example>"}
+
+    # Context is carried through, and the deliberate/read split is recorded.
+    deleted = by_id["<a@x.example>"][0]
+    assert deleted["verb"] == "hard-deleted"
+    assert deleted["by_attacker"] is True
+    assert deleted["deliberate"] is True
+    assert deleted["folder"] == "\\Inbox"
+    assert by_id["<b@x.example>"][0]["deliberate"] is False   # a read
+    assert by_id["<c@x.example>"][0]["deliberate"] is True    # a send
+
+
+def test_a_bland_message_the_attacker_deleted_becomes_tier_one(tmp_path):
+    # The case E2 exists for. This message has no lure language, no bad URL and
+    # no attachment -- it scores almost nothing and would previously have sat
+    # in Tier 3 forever. The audit log records the attacker hard-deleting it,
+    # which is worth more than anything its wording could have said.
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    bland = make_record(sender_email="ap@supplier.example",
+                        sender_domain="supplier.example",
+                        subject="Remittance advice 88214",
+                        path="/m/bland.eml",
+                        date="Wed, 12 Aug 2026 09:00:00 +0000")
+    bland.body = "Please see the remittance advice for last month."
+    bland.message_id = "<bland-002@supplier.example>"
+    for r in (bland,):
+        r.urls = []; r.url_analysis = []; r.attachments = []
+        r.attachment_details = []; r.authentication_results = {}
+
+    summary = _audit(tmp_path, [
+        {"CreationTime": "2026-08-25T16:32:44", "Operation": "HardDelete",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "AffectedItems": [{"InternetMessageId": "<bland-002@supplier.example>",
+                            "ParentFolder": {"Path": "\\Inbox"}}]},
+    ])
+    anchors = Anchors()
+    anchors.compromise_date = summary["_compromise_dt"]
+
+    _s, _r, verdict = run_scenario_analysis(
+        [bland], {"acme.com"}, anchors, summary)
+
+    assert bland.audit_confirmed is True
+    assert bland.tier == 1, "a recorded attacker deletion must reach Tier 1"
+
+    # And it says what it knows, with the operation, time and address.
+    finding = [f for f in bland.provenance if f["category"] == "audit"]
+    assert finding, [i for i in bland.indicators]
+    assert "hard-deleted by the attacker" in finding[0]["signal"]
+    assert ATTACKER_IP in finding[0]["signal"]
+    # An audit event is evidence, not a heuristic: it must not move the score.
+    assert finding[0]["weight"] == 0
+
+    join = verdict["audit_join"]
+    assert join["matched"] == 1 and join["confirmed"] == 1
+
+
+def test_being_seen_in_a_sync_does_not_reach_tier_one(tmp_path):
+    # One MailItemsAccessed sync record can name every item in a folder, so
+    # treating a read as targeting would promote whole mailboxes to Tier 1.
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    recs = []
+    for i in range(3):
+        r = make_record(sender_email="s%d@ext.example" % i,
+                        sender_domain="ext.example",
+                        subject="Monthly statement %d" % i,
+                        path="/m/%d.eml" % i,
+                        date="Wed, 12 Aug 2026 09:00:00 +0000")
+        r.body = "Statement attached."
+        r.message_id = "<seen-%d@ext.example>" % i
+        r.urls = []; r.url_analysis = []; r.attachments = []
+        r.attachment_details = []; r.authentication_results = {}
+        recs.append(r)
+
+    summary = _audit(tmp_path, [
+        {"CreationTime": "2026-08-25T16:01:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "Folders": [{"Path": "\\Inbox", "FolderItems": [
+             {"InternetMessageId": "<seen-%d@ext.example>" % i}
+             for i in range(3)]}]},
+    ])
+    anchors = Anchors()
+    anchors.compromise_date = summary["_compromise_dt"]
+    _s, _r, verdict = run_scenario_analysis(recs, {"acme.com"}, anchors, summary)
+
+    assert all(r.audit_confirmed is False for r in recs)
+    assert all(r.audit_attacker_read is True for r in recs)
+    assert all(r.tier == 2 for r in recs), [r.tier for r in recs]
+    assert verdict["audit_join"]["confirmed"] == 0
+    assert verdict["audit_join"]["read_only"] == 3
+
+
+def test_the_owners_own_actions_do_not_promote(tmp_path):
+    # A user reading and deleting their own mail is the most ordinary thing in
+    # a mailbox. It is attached as context and nothing more.
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    r = make_record(sender_email="news@list.example", sender_domain="list.example",
+                    subject="Weekly digest", path="/m/own.eml",
+                    date="Wed, 12 Aug 2026 09:00:00 +0000")
+    r.body = "This week's digest."
+    r.message_id = "<own-1@list.example>"
+    r.urls = []; r.url_analysis = []; r.attachments = []
+    r.attachment_details = []; r.authentication_results = {}
+
+    summary = _audit(tmp_path, [
+        {"CreationTime": "2026-08-21T08:15:00", "Operation": "HardDelete",
+         "UserId": "victim@acme.com", "ClientIP": OWNER_IP,
+         "AffectedItems": [{"InternetMessageId": "<own-1@list.example>"}]},
+    ])
+    anchors = Anchors()
+    anchors.compromise_date = summary["_compromise_dt"]
+    run_scenario_analysis([r], {"acme.com"}, anchors, summary)
+
+    assert r.audit_confirmed is False
+    assert r.audit_attacker_read is False
+    assert r.tier == 3
+    # The event is still recorded -- it is evidence of what happened, just not
+    # evidence against anyone.
+    audit = [f for f in r.provenance if f["category"] == "audit"]
+    assert audit and "victim@acme.com" in audit[0]["signal"]
+    assert audit[0]["severity"] == "low"
+
+
+def test_a_high_scoring_message_is_never_demoted_by_being_read(tmp_path):
+    # The Tier 2 floor must only lift; a message that earned Tier 1 on its own
+    # signals keeps it.
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    phish = make_record(sender_email="it@acrne-secure.example",
+                        sender_domain="acrne-secure.example",
+                        subject="Verify your account now",
+                        path="/m/phish.eml",
+                        date="Wed, 20 Aug 2026 09:00:00 +0000")
+    phish.body = ("Your password expires today. Verify your account at "
+                  "https://acrne-secure.example/owa/login and sign in.")
+    phish.message_id = "<phish-3@acrne-secure.example>"
+    phish.urls = ["https://acrne-secure.example/owa/login"]
+    phish.url_analysis = [{"url": "https://acrne-secure.example/owa/login",
+                           "path": "/owa/login", "suspicious_score": 12,
+                           "registrable_domain": "acrne-secure.example"}]
+    phish.attachments = []; phish.attachment_details = []
+    phish.authentication_results = {}
+
+    summary = _audit(tmp_path, [
+        {"CreationTime": "2026-08-25T16:01:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "Folders": [{"Path": "\\Inbox", "FolderItems": [
+             {"InternetMessageId": "<phish-3@acrne-secure.example>"}]}]},
+    ])
+    anchors = Anchors()
+    anchors.compromise_date = summary["_compromise_dt"]
+    run_scenario_analysis([phish], {"acme.com"}, anchors, summary)
+
+    assert phish.audit_attacker_read is True
+    assert phish.tier == 1, "the read floor must not demote an earned Tier 1"
+
+
+def test_no_audit_log_changes_nothing(tmp_path):
+    # The join must be inert when there is no log, so every existing run keeps
+    # behaving exactly as before.
+    from postmortem.scoring import run_scenario_analysis, attach_audit_events
+    from postmortem.models import Anchors
+
+    r = make_record(sender_email="a@ext.example", sender_domain="ext.example",
+                    path="/m/1.eml")
+    r.body = "Hello."
+    r.message_id = "<x@ext.example>"
+    r.urls = []; r.url_analysis = []; r.attachments = []
+    r.attachment_details = []; r.authentication_results = {}
+
+    assert attach_audit_events([r], None) == {
+        "matched": 0, "confirmed": 0, "events": 0}
+    assert attach_audit_events([r], {}) == {
+        "matched": 0, "confirmed": 0, "events": 0}
+
+    _s, _rsn, verdict = run_scenario_analysis([r], {"acme.com"}, Anchors(), None)
+    assert r.audit_confirmed is False
+    assert not r.audit_events
+    assert verdict["audit_join"]["matched"] == 0
+
+
+# --------------------------------------------------------------------------
 # minimal fallback runner
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
