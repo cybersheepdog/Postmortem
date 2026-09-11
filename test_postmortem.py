@@ -2412,6 +2412,209 @@ def test_no_audit_log_changes_nothing(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# E5: what is missing from the corpus
+#
+# Every other section of the report describes messages that are present. These
+# describe messages that are not, which the message-only pipeline has no way
+# to notice: a hard-deleted item is simply absent from the PST.
+# --------------------------------------------------------------------------
+def _del_event(mid, subject, when, ip, op="HardDelete"):
+    return {"CreationTime": when, "Operation": op, "UserId": "victim@acme.com",
+            "ClientIP": ip,
+            "AffectedItems": [{"InternetMessageId": mid, "Subject": subject,
+                               "ParentFolder": {"Path": "\\Inbox"}}]}
+
+
+def _corpus_record(mid, subject="Kept", path=None):
+    r = make_record(sender_email="ap@supplier.example",
+                    sender_domain="supplier.example",
+                    subject=subject,
+                    path=path or ("/m/%s.eml" % abs(hash(mid))),
+                    date="Wed, 12 Aug 2026 09:00:00 +0000")
+    r.body = "Body text."
+    r.message_id = mid
+    r.urls = []; r.url_analysis = []; r.attachments = []
+    r.attachment_details = []; r.authentication_results = {}
+    return r
+
+
+def test_deleted_messages_absent_from_the_corpus_are_named(tmp_path):
+    # The finding E5 exists for: the attacker destroyed three messages, they
+    # are not in the export, and the only surviving record of them is what the
+    # audit log retained -- which includes the subjects, and the subjects are
+    # usually the whole point.
+    from postmortem.scoring import deletion_completeness
+
+    summary = _audit(tmp_path, [
+        _del_event("<gone-1@bank.example>", "Updated bank details",
+                   "2026-08-25T16:10:00", ATTACKER_IP),
+        _del_event("<gone-2@bank.example>", "RE: Updated bank details",
+                   "2026-08-25T16:11:00", ATTACKER_IP),
+        _del_event("<gone-3@partner.example>", "Wire confirmation 44812",
+                   "2026-08-25T16:12:00", ATTACKER_IP),
+        # deleted by the owner, also absent -- ordinary housekeeping
+        _del_event("<gone-4@news.example>", "Weekly digest",
+                   "2026-08-01T08:00:00", OWNER_IP, op="SoftDelete"),
+        # deleted, but the export was taken first so it is still here
+        _del_event("<keep-2@supplier.example>", "Remittance advice",
+                   "2026-08-26T09:00:00", ATTACKER_IP),
+    ])
+    records = [_corpus_record("<keep-1@supplier.example>"),
+               _corpus_record("<keep-2@supplier.example>")]
+
+    c = deletion_completeness(records, summary)
+    assert c["reliable"] is True
+    assert c["deleted_total"] == 5
+    assert c["deleted_still_present"] == 1
+    assert c["deleted_absent"] == 4
+    assert c["deleted_absent_by_attacker"] == 3
+
+    # Attacker deletions sort first: they are the ones worth reading.
+    assert c["absent"][0]["by_attacker"] is True
+    subjects = [e["subject"] for e in c["absent"]]
+    assert "Updated bank details" in subjects
+    assert "Wire confirmation 44812" in subjects
+
+    # The surviving one is not reported as missing.
+    assert all(e["message_id"] != "<keep-2@supplier.example>"
+               for e in c["absent"])
+    assert c["recovered"][0]["message_id"] == "<keep-2@supplier.example>"
+
+
+def test_a_log_for_another_mailbox_makes_no_completeness_claim(tmp_path):
+    # Without this guard the tool would report every message the log names as
+    # missing -- a large, alarming and entirely meaningless number whenever
+    # the log and the export do not correspond.
+    from postmortem.scoring import deletion_completeness
+
+    # The realistic form of the mistake: the log was exported for a different
+    # user than the mailbox that was collected.
+    other = []
+    for mid, subj in (("<x-1@other.example>", "Something"),
+                      ("<x-2@other.example>", "Something else")):
+        e = _del_event(mid, subj, "2026-08-25T16:10:00", ATTACKER_IP)
+        e["UserId"] = "someone.else@acme.com"
+        other.append(e)
+    summary = _audit(tmp_path, other)
+    records = [_corpus_record("<unrelated@supplier.example>")]
+
+    c = deletion_completeness(records, summary)
+    assert c["reliable"] is False
+    assert c["same_mailbox"] is False
+    assert c["named_and_present"] == 0
+    assert c["messages_named_by_log"] == 2
+
+    # And the manifest refuses to assert completeness on that basis.
+    from postmortem.reporting import _completeness_block
+    block = _completeness_block(c)
+    assert block["assessed"] is False
+    assert "do not correspond" in block["note"]
+
+
+def test_zero_overlap_is_still_reliable_when_the_mailbox_matches(tmp_path):
+    # The case E5 exists for: the attacker destroyed every message the log
+    # names, so NOTHING the log references survives in the corpus. Judging
+    # correspondence by overlap would suppress the finding precisely here.
+    from postmortem.scoring import deletion_completeness
+
+    summary = _audit(tmp_path, [
+        _del_event("<gone-1@bank.example>", "Updated bank details",
+                   "2026-08-25T16:10:00", ATTACKER_IP),
+        _del_event("<gone-2@bank.example>", "Wire confirmation",
+                   "2026-08-25T16:11:00", ATTACKER_IP),
+    ])
+    # The log's UserId is victim@acme.com, which is this corpus's recipient.
+    records = [_corpus_record("<survivor@supplier.example>")]
+
+    c = deletion_completeness(records, summary)
+    assert c["named_and_present"] == 0
+    assert c["same_mailbox"] is True
+    assert c["reliable"] is True, "same mailbox, so absence is a real finding"
+    assert c["deleted_absent"] == 2
+    assert c["deleted_absent_by_attacker"] == 2
+
+
+def test_moves_within_the_mailbox_are_not_deletions(tmp_path):
+    # A message moved to another folder is still in the export. Counting it as
+    # missing would overstate the gap.
+    from postmortem.scoring import deletion_completeness
+
+    summary = _audit(tmp_path, [
+        {"CreationTime": "2026-08-25T16:00:00", "Operation": "MoveToFolder",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "AffectedItems": [{"InternetMessageId": "<moved@supplier.example>",
+                            "Subject": "Invoice"}]},
+        _del_event("<gone@supplier.example>", "Invoice 2",
+                   "2026-08-25T16:05:00", ATTACKER_IP),
+    ])
+    c = deletion_completeness([_corpus_record("<keep@supplier.example>")], summary)
+    assert c["deleted_total"] == 1
+    assert [e["message_id"] for e in c["absent"]] == ["<gone@supplier.example>"]
+
+
+def test_complete_corpus_says_so(tmp_path):
+    # Stating that nothing is missing is as much a completeness claim as
+    # stating that something is, and the manifest should carry it either way.
+    from postmortem.scoring import deletion_completeness
+    from postmortem.reporting import _completeness_block
+
+    summary = _audit(tmp_path, [
+        _del_event("<here@supplier.example>", "Statement",
+                   "2026-08-26T09:00:00", ATTACKER_IP),
+    ])
+    c = deletion_completeness([_corpus_record("<here@supplier.example>")], summary)
+    assert c["reliable"] is True
+    assert c["deleted_absent"] == 0
+    assert c["deleted_still_present"] == 1
+
+    block = _completeness_block(c)
+    assert block["assessed"] is True
+    assert block["deleted_absent"] == 0
+
+
+def test_no_audit_log_means_completeness_is_unassessed(tmp_path):
+    # The honest answer without a log is "cannot be assessed", not "complete".
+    from postmortem.scoring import deletion_completeness
+    from postmortem.reporting import _completeness_block
+
+    assert deletion_completeness([_corpus_record("<a@b.example>")], None) == {}
+    assert deletion_completeness([_corpus_record("<a@b.example>")], {}) == {}
+
+    block = _completeness_block(None)
+    assert block["assessed"] is False
+    assert "cannot be assessed" in block["note"]
+
+
+def test_completeness_reaches_the_manifest(tmp_path):
+    import json
+    from types import SimpleNamespace
+    from postmortem.scoring import deletion_completeness
+    from postmortem.reporting import build_run_manifest
+    from postmortem.models import Anchors
+
+    summary = _audit(tmp_path, [
+        _del_event("<gone@bank.example>", "Updated bank details",
+                   "2026-08-25T16:10:00", ATTACKER_IP),
+    ])
+    records = [_corpus_record("<keep@supplier.example>")]
+    c = deletion_completeness(records, summary)
+
+    args = SimpleNamespace(directory=str(tmp_path), audit_log="ual.json",
+                           lookback_days=90)
+    m = build_run_manifest(args, records, "ato", Anchors(), {}, [], [],
+                           generated_utc="2026-09-11T00:00:00Z",
+                           elapsed_seconds=1.0, audit_summary=summary,
+                           completeness=c)
+    cc = m["corpus_completeness"]
+    assert cc["assessed"] is True
+    assert cc["deleted_absent"] == 1
+    assert cc["deleted_absent_by_attacker"] == 1
+    # The ids are recorded so a later reader knows exactly what was never seen.
+    assert cc["absent_items"][0]["message_id"] == "<gone@bank.example>"
+    json.dumps(m["corpus_completeness"])
+
+
+# --------------------------------------------------------------------------
 # minimal fallback runner
 # --------------------------------------------------------------------------
 if __name__ == "__main__":

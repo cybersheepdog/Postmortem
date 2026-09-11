@@ -1372,6 +1372,103 @@ def attach_audit_events(records, audit_summary):
             "read_only": read_only, "events": events_used}
 
 
+
+# Operations that remove a message from where an investigator would look for
+# it. A move to an ordinary folder is not one of these -- the message is still
+# in the export, just filed elsewhere.
+_DELETION_VERBS = {"hard-deleted", "soft-deleted", "moved to Deleted Items"}
+
+
+def deletion_completeness(records, audit_summary):
+    """Which deleted messages are missing from the corpus under analysis.
+
+    The message-only pipeline cannot know that it is working from an
+    incomplete set. A message the attacker hard-deleted is simply not in the
+    exported PST, and nothing about the remaining messages reveals its
+    absence. The audit log is the only place that gap is visible, and stating
+    it is a completeness claim about the evidence rather than a finding about
+    any message.
+
+    Returns a dict with counts, the absent items, and a `reliable` flag. When
+    the log names messages but none of them are in the corpus, the two do not
+    correspond -- a different mailbox, or non-overlapping windows -- and the
+    absent count would be a frightening number that means nothing. That case
+    is reported as a correspondence problem instead.
+    """
+    index = ((audit_summary or {}).get("message_index") or {}).get("by_message_id") or {}
+    if not index:
+        return {}
+
+    present = {
+        normalize_message_id(r.message_id)
+        for r in records if getattr(r, "message_id", "")
+    }
+    named = set(index)
+    overlap = len(named & present)
+
+    # Whether the log and the corpus describe the same mailbox. Overlap alone
+    # is the wrong test: in the case this function exists for -- the attacker
+    # destroyed everything the log names -- overlap is legitimately zero, and
+    # judging by overlap would suppress the finding precisely when it matters.
+    # Mailbox identity is the question, so ask it directly.
+    corpus_addresses = set()
+    for r in records:
+        if getattr(r, "sender_email", ""):
+            corpus_addresses.add(r.sender_email.lower())
+        for a in (getattr(r, "recipients", None) or []):
+            if a:
+                corpus_addresses.add(str(a).lower())
+    log_mailboxes = {
+        str(h.get("user", "")).lower()
+        for hits in index.values() for h in hits if h.get("user")
+    }
+    same_mailbox = bool(log_mailboxes & corpus_addresses)
+
+    absent, still_present = [], []
+    for mid, hits in index.items():
+        deletions = [h for h in hits if h["verb"] in _DELETION_VERBS]
+        if not deletions:
+            continue
+        last = deletions[-1]
+        # Prefer a subject recorded by any event on this message; a delete
+        # record often carries one where an access record does not.
+        subject = next((h["subject"] for h in hits if h.get("subject")), "")
+        folder = next((h["folder"] for h in hits if h.get("folder")), "")
+        entry = {
+            "message_id": mid,
+            "subject": subject,
+            "folder": folder,
+            "verb": last["verb"],
+            "time": last["time"],
+            "by_attacker": any(d["by_attacker"] for d in deletions),
+            "actor": last["user"],
+            "client_ip": last["client_ip"],
+        }
+        (still_present if mid in present else absent).append(entry)
+
+    absent.sort(key=lambda e: (not e["by_attacker"], e["time"]))
+    still_present.sort(key=lambda e: e["time"])
+
+    # Either signal is enough. Both absent means there is nothing tying this
+    # log to this export, and an absent count would be a frightening number
+    # that means nothing.
+    reliable = bool(overlap) or same_mailbox or not named
+    by_attacker = [e for e in absent if e["by_attacker"]]
+
+    return {
+        "reliable": reliable,
+        "same_mailbox": same_mailbox,
+        "messages_named_by_log": len(named),
+        "named_and_present": overlap,
+        "deleted_total": len(absent) + len(still_present),
+        "deleted_absent": len(absent),
+        "deleted_absent_by_attacker": len(by_attacker),
+        "deleted_still_present": len(still_present),
+        "absent": absent,
+        "recovered": still_present,
+    }
+
+
 def assign_tiers(records, scenario, anchors: Anchors):
     """Sort every message into review tiers so the analyst works a small, high-
     precision set first instead of thousands of candidates.
@@ -1792,6 +1889,9 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     # InternetMessageId. Must run before tiering: a confirmed message is Tier 1
     # regardless of what its wording scores.
     audit_join = attach_audit_events(records, audit_summary)
+    # What the attacker removed, and whether it is still in the export. This
+    # is a claim about the completeness of the evidence, not about a message.
+    completeness = deletion_completeness(records, audit_summary)
 
     for r in records:
         score_initial_email(r, scenario, anchors)
@@ -1799,6 +1899,7 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     verdict = anchored_initial_email_verdict(records, scenario, anchors, reason)
     verdict["tier_counts"] = {t: tier_counts.get(t, 0) for t in (1, 2, 3)}
     verdict["audit_join"] = audit_join
+    verdict["deletion_completeness"] = completeness
     verdict["victim_address"] = victim_address
     verdict["attack_narrative"] = reconstruct_attack_narrative(
         records, scenario, anchors, verdict, audit_summary

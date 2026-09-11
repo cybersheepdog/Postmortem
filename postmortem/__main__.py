@@ -516,7 +516,7 @@ from postmortem.reporting import (  # noqa: E402
     print_summary, print_initial_compromise, print_campaigns,
     print_run_manifest, build_run_manifest, generate_html_interactive,
     write_json, write_csv, print_attack_narrative, print_audit_summary,
-    print_audit_join,
+    print_audit_join, print_deletion_completeness,
     print_top_domains, top_flagged_domains,
 )
 from postmortem import term  # noqa: E402
@@ -1850,6 +1850,7 @@ def main():
             {"start": "", "end": "", "lookback_days": None}
         ),
         audit_summary=audit_summary,
+        completeness=(initial_verdict or {}).get("deletion_completeness"),
     )
 
     print()
@@ -1879,6 +1880,8 @@ def main():
     )
 
     print_audit_join(initial_verdict)
+
+    print_deletion_completeness(initial_verdict)
 
     print_initial_compromise(initial_verdict)
 

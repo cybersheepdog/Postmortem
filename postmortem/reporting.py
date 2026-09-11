@@ -247,6 +247,73 @@ def print_audit_join(verdict: dict):
         print("  MailItemsAccessed sync record can name an entire folder.")
 
 
+
+def print_deletion_completeness(verdict: dict, limit: int = 15):
+    """State plainly what is missing from the corpus and why.
+
+    Every other section describes messages that are here. This one describes
+    messages that are not, which the message-only pipeline has no way to
+    notice: a hard-deleted item is simply absent from the PST, and nothing
+    about the remaining mail reveals the hole.
+    """
+    c = (verdict or {}).get("deletion_completeness") or {}
+    if not c:
+        return
+
+    print()
+    _hdr("EVIDENCE COMPLETENESS (what is missing from this export)")
+
+    if not c.get("reliable"):
+        # The alternative is printing "4,106 messages are missing", which is
+        # both alarming and meaningless when the log describes a different
+        # mailbox than the one exported.
+        print(f"  The audit log names {c['messages_named_by_log']} message(s) and "
+              "NONE of them are in this corpus.")
+        print("  The log and the export do not correspond -- most likely a "
+              "different mailbox,")
+        print("  or windows that do not overlap. No completeness claim can be "
+              "made until")
+        print("  that is resolved; every deletion would otherwise read as a "
+              "false absence.")
+        return
+
+    if not c.get("deleted_total"):
+        print("  The audit log records no message-level deletions.")
+        return
+
+    print(f"  Messages the log records as deleted:      {c['deleted_total']}")
+    print(f"    still present in this export:           {c['deleted_still_present']}")
+    print(f"    ABSENT from this export:                {c['deleted_absent']}")
+    if c.get("deleted_absent_by_attacker"):
+        print(f"      of those, deleted by the attacker:    "
+              f"{c['deleted_absent_by_attacker']}")
+
+    if not c.get("deleted_absent"):
+        print()
+        print("  Every deleted message is still in the export, so the corpus is")
+        print("  complete with respect to what the log records.")
+        return
+
+    print()
+    print(f"  {c['deleted_absent']} message(s) were deleted and are not in this "
+          "export. They cannot be")
+    print("  scored, clustered or read. What follows is everything the audit log")
+    print("  retained about them -- often the subject alone, which is still the "
+          "only")
+    print("  record that they existed:")
+    print()
+    for e in c["absent"][:limit]:
+        who = "attacker" if e["by_attacker"] else (e["actor"] or "unknown")
+        print(f"    {e['time'] or '(no time)':20} {e['verb']:22} by {who}"
+              + (f" from {e['client_ip']}" if e["client_ip"] else ""))
+        print(f"      subject: {e['subject'] or '(not recorded in the log)'}")
+        if e["folder"]:
+            print(f"      folder:  {e['folder']}")
+    if len(c["absent"]) > limit:
+        print(f"    ... and {len(c['absent']) - limit} more "
+              "(complete list in the JSON report)")
+
+
 def print_initial_compromise(verdict: dict):
     print()
     _hdr("INITIAL COMPROMISE ANALYSIS")
@@ -1057,7 +1124,7 @@ def _command_line() -> str:
 def build_run_manifest(args, records, scenario, anchors, initial_verdict,
                        campaigns, iocs, generated_utc, elapsed_seconds,
                        phase_timings=None, host=None, entry_point_window=None,
-                       audit_summary=None):
+                       audit_summary=None, completeness=None):
     """Reproducibility / chain-of-custody metadata recorded in every report."""
     digest, basis = corpus_fingerprint(records)
     tier_counts = Counter(r.tier for r in records)
@@ -1079,6 +1146,10 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
         # gaps belong in the chain-of-custody record alongside the corpus
         # hash -- otherwise a reader cannot tell what the run could not see.
         "audit_log": _audit_provenance(args, audit_summary),
+        # A completeness statement about the evidence, recorded beside the
+        # corpus hash. The hash says what was analysed; this says what was
+        # missing from it and could not be.
+        "corpus_completeness": _completeness_block(completeness),
         "tool": "postmortem",
         "tool_version": TOOL_VERSION,
         "parser_version": PARSER_VERSION,
@@ -1123,6 +1194,29 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
     }
 
 
+def _completeness_block(c):
+    if not c:
+        return {"assessed": False,
+                "note": "No audit log, so corpus completeness cannot be assessed."}
+    if not c.get("reliable"):
+        return {
+            "assessed": False,
+            "note": ("The audit log names %d message(s), none of which are in "
+                     "this corpus; the log and the export do not correspond."
+                     % c.get("messages_named_by_log", 0)),
+        }
+    return {
+        "assessed": True,
+        "deleted_recorded": c.get("deleted_total", 0),
+        "deleted_still_present": c.get("deleted_still_present", 0),
+        "deleted_absent": c.get("deleted_absent", 0),
+        "deleted_absent_by_attacker": c.get("deleted_absent_by_attacker", 0),
+        # The ids and what the log retained about them, so a later reader can
+        # tell exactly which items this analysis never saw.
+        "absent_items": c.get("absent", []),
+    }
+
+
 def _audit_provenance(args, audit_summary):
     path = str(getattr(args, "audit_log", "") or "")
     if not audit_summary:
@@ -1154,6 +1248,15 @@ def print_run_manifest(manifest):
               f" ({cov.get('span_days', 0)}d)"
               + (f" | {len(a['warnings'])} coverage warning(s)"
                  if a.get("warnings") else ""))
+        cc = manifest.get("corpus_completeness") or {}
+        if cc.get("assessed") and cc.get("deleted_absent"):
+            print(f"Corpus completeness: {cc['deleted_absent']} deleted "
+                  f"message(s) absent from this export"
+                  + (f" ({cc['deleted_absent_by_attacker']} by the attacker)"
+                     if cc.get("deleted_absent_by_attacker") else ""))
+        elif cc.get("assessed"):
+            print("Corpus completeness: no recorded deletion is missing from "
+                  "this export")
     elif a.get("supplied"):
         print("Audit log: supplied but no events were parsed")
     else:
