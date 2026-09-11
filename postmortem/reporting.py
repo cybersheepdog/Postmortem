@@ -617,19 +617,165 @@ def print_audit_summary(audit: dict, warnings=None):
     print()
 
 
+
+def candidate_sort_key(record):
+    """Ranking for every candidate list: recorded fact first, then score.
+
+    A message an attacker is recorded as having deleted, or a lure tied to a
+    token issuance, carries no score -- those are facts, and the score means
+    "how suspicious is this text". Ordering by score alone therefore buried
+    the best-evidenced message in the case under whatever content heuristic
+    happened to rank highest. This restores the ranking benefit without
+    putting a fact on the heuristic scale.
+    """
+    confirmed = (getattr(record, "audit_confirmed", False)
+                 or getattr(record, "signin_confirmed", False)
+                 or getattr(record, "attacker_authored", False))
+    return (not confirmed, -record.score, date_sort_key(record))
+
+
+
+def print_signin_analysis(signin_summary: dict):
+    """What the Entra sign-in log recorded about device code authentication.
+
+    The mail corpus cannot see this attack at all. There is no attacker
+    domain in the lure, no credential-harvesting page and nothing for URL
+    analysis to score -- the victim authenticates on the real Microsoft page
+    and passes real MFA. The only record that it happened is here.
+    """
+    s = signin_summary or {}
+    if not s.get("available"):
+        return
+    cov = s.get("coverage") or {}
+    print()
+    _hdr("ENTRA SIGN-IN LOG: DEVICE CODE FLOW")
+    print(f"  Records read:            {s['records']} from {s['files']} file(s)")
+    print(f"  Window:                  {cov.get('first_event') or '?'}"
+          f"  ->  {cov.get('last_event') or '?'}")
+    print(f"  Accounts in export:      {cov.get('accounts', 0)}")
+
+    blind = cov.get("blind")
+    detect = "  originalTransferMethod:  %d of %d      authenticationProtocol:  %d of %d" % (
+        cov.get("have_transfer", 0), s["records"],
+        cov.get("have_protocol", 0), s["records"])
+    print(term.c(detect, "red") if blind else detect)
+    if blind:
+        print()
+        print(term.c("  " + _wrap_indent(
+            "Neither field is present. This export cannot answer the device "
+            "code question at all, and a clean result here is not a negative.",
+            2), "red", "bold"))
+        return
+
+    print(f"  Device code sign-ins:    {s['device_code_records']}")
+    if not s["device_code_records"]:
+        print()
+        print("  No device code authentication in the covered window.")
+        return
+
+    attack = s.get("attack_groups", 0)
+    line = f"  Groups showing a location split: {attack}"
+    print(term.c(line, "red", "bold") if attack else line)
+    print(f"  Tokens issued to an attacker address: {s.get('tokens_issued', 0)}")
+    if s.get("earliest_token"):
+        print(term.c(f"  First token issued:      {s['earliest_token']}"
+                     "   <- true compromise T0", "red"))
+
+    if s.get("attacker_ips"):
+        print()
+        print("  Attacker addresses established here (seeded into the audit-log")
+        print("  attribution, which otherwise derives them only from rules):")
+        for ip in s["attacker_ips"]:
+            print(term.c(f"    {ip}", "red"))
+
+    for g in s.get("groups", []):
+        if g["verdict"] != "attack":
+            continue
+        print()
+        print(term.c(f"  [{g['verdict'].upper()}] {g['user']}   "
+                     f"differs by: {', '.join(g['differs'])}", "red", "bold"))
+        print(f"    correlation {g['correlation']}   "
+              f"attribution: {g['attribution_basis'] or 'not established'}")
+        for leg in g["legs"]:
+            role = "victim (interactive)" if leg["interactive"] else "polling client"
+            mark = "  " if leg["interactive"] else "->"
+            row = (f"    {mark} {leg['time']}  {leg['ip']:<16} {leg['location']:<22} "
+                   f"{role}")
+            print(row if leg["interactive"] else term.c(row, "red"))
+            detail = f"         {leg['app']}"
+            if leg["resource"]:
+                detail += f" -> {leg['resource']}"
+            if leg["status"] != "success":
+                detail += f"   [{leg['status']}]"
+            print(term.c(detail, "dim") if hasattr(term, "c") else detail)
+
+    singles = s.get("single_groups") or []
+    if singles:
+        print()
+        print("  " + _wrap_indent(
+            "%d device code group(s) have only one recorded leg. These are "
+            "UNRESOLVED, not clean: the export did not capture the other leg, "
+            "or the attacker's address resembled the victim's. A residential "
+            "proxy in the victim's own country produces exactly this picture."
+            % len(singles), 2))
+
+    for w in s.get("warnings", []):
+        print()
+        print(term.c("  [!] " + _wrap_indent(w, 6), "yellow"))
+
+
+def print_signin_lures(verdict: dict):
+    """The message that produced the token, matched by time rather than words."""
+    lures = (verdict or {}).get("signin_lures") or {}
+    if not lures.get("available"):
+        return
+    print()
+    _hdr("DEVICE CODE LURE (sign-in log joined to the corpus)")
+    print(f"  Token issuances examined: {lures['tokens']}")
+    print(f"  Search window:            {lures['window_minutes']} minutes before each")
+
+    for e in lures.get("confirmed", []):
+        print()
+        print(term.c(f"  CONFIRMED  {e['subject'] or '(no subject)'}", "red", "bold"))
+        print(f"    from     {e['sender']}")
+        print(f"    arrived  {e['arrival']}")
+        print(term.c(f"    token    {e['token_time']}  "
+                     f"({e['delta_seconds']}s later) from {e['attacker_ip']}", "red"))
+        if e.get("code"):
+            print(f"    code     {e['code']}")
+        if e.get("url"):
+            print(f"    url      {e['url']}")
+        print(f"    file     {e['path']}")
+
+    barren = lures.get("tokens_without_lure") or []
+    if barren and not lures.get("confirmed"):
+        print()
+        for t in barren:
+            print(term.c(f"  Token issued {t['time']} to {t['user']} "
+                         f"from {t['ip']} -- no lure found", "yellow"))
+
+    cands = lures.get("in_window_only") or []
+    if cands and not lures.get("confirmed"):
+        print()
+        print(f"  {len(cands)} message(s) arrived in the window but carry no")
+        print("  device login URL. Listed for review, not promoted:")
+        for e in cands[:10]:
+            print(f"    {e['arrival']}  {e['sender']:<34} {e['subject'][:34]}")
+        if len(cands) > 10:
+            print(f"    ... {len(cands) - 10} more in the JSON report")
+
+    if lures.get("note"):
+        print()
+        print("  " + _wrap_indent(lures["note"], 2))
+
+
 def print_summary(
     records: list[EmailRecord],
     timeline: list[AttackTimelineEvent],
     precursor_verdict: dict,
 ):
 
-    records_sorted = sorted(
-        records,
-        key=lambda r: (
-            -r.score,
-            date_sort_key(r),
-        ),
-    )
+    records_sorted = sorted(records, key=candidate_sort_key)
  
     print()
     print(term.c("=" * 80, "cyan"))
@@ -842,13 +988,7 @@ def generate_html(
     precursor_verdict: dict,
 ):
  
-    records_sorted = sorted(
-        records,
-        key=lambda r: (
-            -r.score,
-            date_sort_key(r),
-        ),
-    )
+    records_sorted = sorted(records, key=candidate_sort_key)
  
     campaign_rows = []
  
@@ -1621,7 +1761,7 @@ def generate_html_interactive(records, campaigns, output, timeline, precursor_ve
     # A: embed only the investigation subset (top-N by score), plus any message
     # named by the initial-email verdict so the key finding is always present.
     # The full dataset remains in the JSON/CSV reports.
-    ranked = sorted(records, key=lambda r: (-r.score, date_sort_key(r)))
+    ranked = sorted(records, key=candidate_sort_key)
     if limit and limit > 0:
         subset = ranked[:limit]
     else:

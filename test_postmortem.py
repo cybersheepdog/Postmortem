@@ -3161,3 +3161,393 @@ if __name__ == "__main__":
             print(f"FAIL {name}: {type(exc).__name__}: {exc}")
     print(f"\n{'PASSED' if not failures else str(failures) + ' FAILED'}")
     raise SystemExit(1 if failures else 0)
+
+
+
+# --------------------------------------------------------------------------
+# Entra sign-in ingestion: device code flow, and the join to the mail corpus
+#
+# This is the only attack in the tool that the mail corpus cannot see. The
+# lure has no attacker domain, no credential page and nothing for URL analysis
+# to score, because the victim authenticates on the real Microsoft page and
+# passes real MFA. Only the sign-in log records that it happened.
+# --------------------------------------------------------------------------
+VICTIM_IP = "203.0.113.10"
+POLLER_IP = "45.147.230.88"
+
+
+def _signin(**kw):
+    """One Entra sign-in record, in the portal's nested shape."""
+    rec = {
+        "createdDateTime": kw.get("time", "2026-08-25T15:40:00Z"),
+        "userPrincipalName": kw.get("user", "victim@acme.com"),
+        "correlationId": kw.get("cid", "cid-1"),
+        "appDisplayName": kw.get("app", "Microsoft Office"),
+        "resourceDisplayName": kw.get("resource", "Microsoft Graph"),
+        "ipAddress": kw.get("ip", VICTIM_IP),
+        "isInteractive": kw.get("interactive", True),
+        "userAgent": kw.get("agent", "Mozilla/5.0 Chrome/128"),
+        "status": {"errorCode": kw.get("error", 0)},
+        "location": {"city": kw.get("city", "Tampa"),
+                     "countryOrRegion": kw.get("country", "US")},
+        "autonomousSystemNumber": kw.get("asn", 7018),
+    }
+    if kw.get("device_code", True):
+        rec["originalTransferMethod"] = "deviceCodeFlow"
+    else:
+        rec["originalTransferMethod"] = "none"
+    return rec
+
+
+def _write_signin(tmp_path, records, name="signins.json"):
+    import json
+    p = tmp_path / name
+    p.write_text(json.dumps(records), encoding="utf-8")
+    return str(p)
+
+
+def _phished_pair(tmp_path, cid="cid-1", when="2026-08-25T15:40:00Z"):
+    """The shape of the attack: the victim types the code in Tampa, the
+    attacker's client polls the token endpoint from another country."""
+    return _write_signin(tmp_path, [
+        _signin(cid=cid, time=when, ip=VICTIM_IP, interactive=True),
+        _signin(cid=cid, time=when, ip=POLLER_IP, interactive=False,
+                city="Frankfurt", country="DE", asn=200000,
+                agent="python-requests/2.31"),
+    ])
+
+
+def test_a_location_split_names_the_attacker_leg(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    s = analyze_signin_logs(_phished_pair(tmp_path))
+    assert s["available"] is True
+    assert s["device_code_records"] == 2
+    assert s["attack_groups"] == 1
+
+    g = s["groups"][0]
+    assert g["verdict"] == "attack"
+    assert "country" in g["differs"] and "IP" in g["differs"]
+    assert g["attribution_basis"] == "isInteractive"
+
+    # Only the polling leg is named. The victim's own address must never be
+    # seeded as the attacker's -- it would mislabel every action the mailbox
+    # owner took for the rest of the report.
+    assert s["attacker_ips"] == [POLLER_IP]
+    assert VICTIM_IP not in s["attacker_ips"]
+
+    assert s["tokens_issued"] == 1
+    assert s["earliest_token"].startswith("2026-08-25T15:40")
+
+
+def test_the_victims_address_is_never_attributed(tmp_path):
+    # The catastrophic failure mode. If isInteractive is absent the legs are
+    # indistinguishable, and guessing wrong poisons the entire audit-log
+    # attribution chain. The tool must decline instead.
+    from postmortem.signin import analyze_signin_logs
+
+    records = []
+    for ip, city, country in ((VICTIM_IP, "Tampa", "US"),
+                              (POLLER_IP, "Frankfurt", "DE")):
+        r = _signin(ip=ip, city=city, country=country)
+        del r["isInteractive"]
+        records.append(r)
+    s = analyze_signin_logs(_write_signin(tmp_path, records))
+
+    assert s["attacker_ips"] == [], "no leg may be attributed without a basis"
+    assert s["unattributed_groups"], "the group must still be reported"
+    assert "isInteractive" in s["unattributed_groups"][0]["reason"]
+
+
+def test_an_address_the_user_signs_in_from_is_vetoed(tmp_path):
+    # A device code flow the user completed themselves across two of their own
+    # machines looks like a split. The veto is that the account demonstrably
+    # signs in interactively from the "attacker" address.
+    from postmortem.signin import analyze_signin_logs
+
+    other = "198.51.100.22"
+    s = analyze_signin_logs(_write_signin(tmp_path, [
+        _signin(cid="c1", ip=VICTIM_IP, interactive=True),
+        _signin(cid="c1", ip=other, interactive=False, city="Orlando"),
+        # ... and here the user is plainly signing in from it themselves.
+        _signin(cid="c2", ip=other, interactive=True, city="Orlando",
+                time="2026-08-01T09:00:00Z", device_code=False),
+    ]))
+    assert other not in s["attacker_ips"]
+    assert other in s["vetoed_ips"]
+    assert any("interactively" in w for w in s["warnings"])
+
+
+def test_a_consistent_flow_is_not_an_attack(tmp_path):
+    # Device code flow is a legitimate protocol. Using it is not a finding.
+    from postmortem.signin import analyze_signin_logs
+
+    s = analyze_signin_logs(_write_signin(tmp_path, [
+        _signin(cid="c1", ip=VICTIM_IP, interactive=True),
+        _signin(cid="c1", ip=VICTIM_IP, interactive=False,
+                agent="python-requests/2.31"),
+    ]))
+    assert s["device_code_records"] == 2
+    assert s["attack_groups"] == 0
+    assert s["attacker_ips"] == []
+    assert s["groups"][0]["verdict"] == "consistent"
+    # The user-agent difference is reported but does not convict.
+    assert s["groups"][0]["differs"] == ["user agent"]
+
+
+def test_an_export_without_the_fields_says_it_is_blind(tmp_path):
+    # The dangerous false negative: an export that cannot answer the question
+    # must not read as "no device code flow found".
+    from postmortem.signin import analyze_signin_logs
+
+    r = _signin()
+    del r["originalTransferMethod"]
+    s = analyze_signin_logs(_write_signin(tmp_path, [r]))
+
+    assert s["coverage"]["blind"] is True
+    assert s["device_code_records"] == 0
+    assert any("cannot answer" in w for w in s["warnings"])
+
+
+def test_failed_token_requests_are_not_issuances(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    s = analyze_signin_logs(_write_signin(tmp_path, [
+        _signin(cid="c1", ip=VICTIM_IP, interactive=True),
+        _signin(cid="c1", ip=POLLER_IP, interactive=False, country="DE",
+                error=50126),
+    ]))
+    assert s["attack_groups"] == 1
+    assert s["attacker_ips"] == [POLLER_IP]   # still an attacker address
+    assert s["tokens_issued"] == 0            # but no token was minted
+    assert s["earliest_token"] == ""
+
+
+# ---- the merge into the audit log ----------------------------------------
+def test_signin_ips_make_attribution_work_without_a_rule(tmp_path):
+    # The structural gap this closes. analyze_audit_log seeds its attacker set
+    # ONLY from malicious inbox-rule events, so an intruder who read and
+    # deleted but never made a rule leaves it empty -- and every attribution
+    # downstream silently reports nothing.
+    import json
+    from postmortem.auditlog import analyze_audit_log
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        {"CreationTime": "2026-08-25T16:30:00", "Operation": "HardDelete",
+         "UserId": "victim@acme.com", "ClientIP": POLLER_IP,
+         "AffectedItems": [{"InternetMessageId": "<gone@bank.example>",
+                            "Subject": "Updated bank details"}]},
+    ]), encoding="utf-8")
+
+    # Without the sign-in log: nothing is attributable.
+    bare = analyze_audit_log(str(p))
+    assert bare["derived"]["attacker_ips"] == []
+    assert bare["attacker_operations"] == []
+
+    # With it: the same log now names who did it.
+    merged = analyze_audit_log(str(p), extra_attacker_ips=[POLLER_IP])
+    assert merged["derived"]["attacker_ips"] == [POLLER_IP]
+    assert [x["operation"] for x in merged["attacker_operations"]] == ["HardDelete"]
+    idx = merged["message_index"]["by_message_id"]
+    assert idx["<gone@bank.example>"][0]["by_attacker"] is True
+
+
+def test_the_token_time_only_moves_the_compromise_earlier(tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from postmortem.auditlog import analyze_audit_log
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        {"CreationTime": "2026-08-25T15:54:33", "Operation": "New-InboxRule",
+         "UserId": "victim@acme.com", "ClientIP": POLLER_IP,
+         "Parameters": [{"Name": "SubjectContainsWords", "Value": "invoice"},
+                        {"Name": "DeleteMessage", "Value": "True"}]},
+    ]), encoding="utf-8")
+
+    earlier = datetime(2026, 8, 25, 15, 40, tzinfo=timezone.utc)
+    later = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+
+    assert analyze_audit_log(str(p))["derived"]["compromise_date"] \
+        == "2026-08-25T15:54:33Z"
+    # Token issuance precedes the first action taken with the token.
+    assert analyze_audit_log(str(p), anchor_dt=earlier)["derived"]["compromise_date"] \
+        == "2026-08-25T15:40:00Z"
+    # A later anchor must never shrink the investigated window.
+    assert analyze_audit_log(str(p), anchor_dt=later)["derived"]["compromise_date"] \
+        == "2026-08-25T15:54:33Z"
+
+
+def test_audit_log_behaviour_is_unchanged_without_the_new_arguments(tmp_path):
+    import json
+    from postmortem.auditlog import analyze_audit_log
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        {"CreationTime": "2026-08-25T15:54:33", "Operation": "New-InboxRule",
+         "UserId": "victim@acme.com", "ClientIP": POLLER_IP,
+         "Parameters": [{"Name": "SubjectContainsWords", "Value": "invoice"},
+                        {"Name": "DeleteMessage", "Value": "True"}]},
+    ]), encoding="utf-8")
+    a = analyze_audit_log(str(p))
+    b = analyze_audit_log(str(p), extra_attacker_ips=(), anchor_dt=None)
+    assert a["derived"] == b["derived"]
+
+
+def test_the_audit_log_resolves_an_unresolved_device_code_group(tmp_path):
+    # The reverse direction. One recorded leg is not a clean result -- and the
+    # audit log derives attacker addresses from unrelated evidence, so it can
+    # answer what the sign-in log left open.
+    from postmortem.signin import analyze_signin_logs, resolve_single_groups
+
+    s = analyze_signin_logs(_write_signin(tmp_path, [
+        _signin(cid="lonely", ip=POLLER_IP, interactive=False, country="DE"),
+    ]))
+    assert s["groups"][0]["verdict"] == "single"
+    assert s["attacker_ips"] == []
+
+    out = resolve_single_groups(s, [POLLER_IP])
+    assert out["resolved"] == 1
+    assert s["groups"][0]["verdict"] == "attack"
+    assert s["groups"][0]["attribution_basis"] == "audit log attacker IP"
+    assert s["single_groups"] == []
+
+
+# ---- the lure window -----------------------------------------------------
+def _lure_record(subject, body, when, path="/m/lure.eml"):
+    r = make_record(sender_email="it-support@acme.com", sender_domain="acme.com",
+                    subject=subject, path=path, date=when)
+    r.body = body
+    r.urls = []
+    r.url_domains = []
+    r.url_analysis = []
+    r.attachments = []
+    r.attachment_details = []
+    r.authentication_results = {}
+    return r
+
+
+def test_the_lure_is_found_by_time_not_only_by_wording(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+    from postmortem.scoring import signin_lure_window
+
+    s = analyze_signin_logs(_phished_pair(tmp_path, when="2026-08-25T15:40:00Z"))
+
+    lure = _lure_record(
+        "Action required: enroll your device",
+        "Open https://microsoft.com/devicelogin and enter code F7K2QX9B to "
+        "finish enrolling.",
+        "Tue, 25 Aug 2026 15:33:00 +0000")
+    unrelated = _lure_record("Lunch?", "Are you free at 1?",
+                             "Tue, 25 Aug 2026 15:35:00 +0000",
+                             path="/m/lunch.eml")
+    old = _lure_record(
+        "Enroll your device",
+        "Go to https://microsoft.com/devicelogin and enter the code.",
+        "Mon, 10 Aug 2026 09:00:00 +0000", path="/m/old.eml")
+
+    out = signin_lure_window([lure, unrelated, old], s, window_minutes=20)
+    assert out["available"] is True
+    assert out["tokens"] == 1
+    assert [e["path"] for e in out["confirmed"]] == ["/m/lure.eml"]
+    assert lure.signin_confirmed is True
+    assert out["confirmed"][0]["code"] == "F7K2QX9B"
+    assert out["confirmed"][0]["delta_seconds"] == 420
+
+    # In the window but carrying no device login URL: listed, not promoted.
+    assert unrelated.signin_confirmed is False
+    assert unrelated.signin_lure_candidate is True
+    assert [e["path"] for e in out["in_window_only"]] == ["/m/lunch.eml"]
+
+    # The same wording two weeks earlier is not this lure.
+    assert old.signin_confirmed is False
+    assert old.signin_lure_candidate is False
+
+
+def test_a_confirmed_lure_scores_nothing_and_still_reaches_tier_one(tmp_path):
+    # The decision this was built on: recorded facts are evidence, not
+    # heuristics. Were it weighted, the baseline modifiers would suppress it
+    # for arriving from an aligned, familiar sender -- which is exactly what a
+    # second-hop BEC lure does.
+    from postmortem.signin import analyze_signin_logs
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    s = analyze_signin_logs(_phished_pair(tmp_path, when="2026-08-25T15:40:00Z"))
+    lure = _lure_record(
+        "Device enrollment",
+        "Visit https://microsoft.com/devicelogin and enter code F7K2QX9B.",
+        "Tue, 25 Aug 2026 15:33:00 +0000")
+    before = lure.score
+
+    run_scenario_analysis([lure], {"acme.com"}, Anchors(), None,
+                          signin_summary=s)
+
+    assert lure.signin_confirmed is True
+    assert lure.tier == 1
+    finding = [f for f in lure.provenance
+               if f["source"] == "entra:signin_log"]
+    assert finding, "the finding must be stated, with its evidence"
+    assert finding[0]["weight"] == 0
+    assert lure.score == before, "a recorded fact must not move the score"
+    assert POLLER_IP in finding[0]["signal"]
+
+
+def test_a_token_with_no_lure_in_the_corpus_is_its_own_finding(tmp_path):
+    # Device code lures are often delivered over Teams precisely because the
+    # code expires in fifteen minutes. Silence here is a result, not a gap.
+    from postmortem.signin import analyze_signin_logs
+    from postmortem.scoring import signin_lure_window
+
+    s = analyze_signin_logs(_phished_pair(tmp_path))
+    out = signin_lure_window([], s, window_minutes=20)
+
+    assert out["confirmed"] == []
+    assert len(out["tokens_without_lure"]) == 1
+    assert out["tokens_without_lure"][0]["ip"] == POLLER_IP
+    assert "Teams" in out["note"]
+
+
+def test_no_signin_log_changes_nothing(tmp_path):
+    # Every existing run must behave exactly as before.
+    from postmortem.scoring import signin_lure_window, run_scenario_analysis
+    from postmortem.models import Anchors
+
+    r = _lure_record("Hello", "Ordinary message.",
+                     "Tue, 25 Aug 2026 15:33:00 +0000")
+    for empty in (None, {}):
+        out = signin_lure_window([r], empty)
+        assert out["available"] is False
+        assert out["confirmed"] == []
+
+    _s, _rsn, verdict = run_scenario_analysis([r], {"acme.com"}, Anchors(), None)
+    assert r.signin_confirmed is False
+    assert verdict["signin_lures"]["available"] is False
+
+
+def test_confirmed_messages_rank_above_higher_scoring_ones(tmp_path):
+    # The cost of weight 0: ordering by score alone buried the best-evidenced
+    # message in the case under whatever content heuristic ranked highest.
+    from postmortem.reporting import candidate_sort_key
+
+    bland = _lure_record("Device enrollment", "Body.",
+                         "Tue, 25 Aug 2026 15:33:00 +0000")
+    bland.score = 2
+    bland.signin_confirmed = True
+
+    noisy = _lure_record("URGENT wire transfer", "Body.",
+                         "Tue, 25 Aug 2026 15:33:00 +0000",
+                         path="/m/noisy.eml")
+    noisy.score = 31
+
+    deleted = _lure_record("Remittance", "Body.",
+                           "Tue, 25 Aug 2026 15:33:00 +0000",
+                           path="/m/deleted.eml")
+    deleted.score = 0
+    deleted.audit_confirmed = True
+
+    order = [r.path for r in sorted([noisy, bland, deleted],
+                                    key=candidate_sort_key)]
+    assert order[-1] == "/m/noisy.eml", order
+    assert set(order[:2]) == {"/m/lure.eml", "/m/deleted.eml"}

@@ -124,6 +124,9 @@ from postmortem.iocs import extract_iocs, write_iocs_csv  # noqa: E402
 from postmortem.auditlog import (  # noqa: E402
     analyze_audit_log, coverage_warnings, annotate_audit_geoip,
 )
+from postmortem.signin import (
+    analyze_signin_logs, resolve_single_groups,
+)
 from postmortem.mailbox_ingest import (  # noqa: E402
     find_containers, ingest_all,
 )
@@ -517,6 +520,7 @@ from postmortem.reporting import (  # noqa: E402
     print_run_manifest, build_run_manifest, generate_html_interactive,
     write_json, write_csv, print_attack_narrative, print_audit_summary,
     print_audit_join, print_deletion_completeness,
+    print_signin_analysis, print_signin_lures,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -928,6 +932,19 @@ def main():
              "JSON/JSONL, or Management/Graph JSON). Anchors (compromise date, "
              "attacker IP/address/domain, rule keywords) are derived from it "
              "automatically and its attacker actions become confirmed evidence.",
+    )
+    anchor_group.add_argument(
+        "--signin-logs",
+        type=Path,
+        metavar="PATH",
+        help="Entra ID sign-in log export (file or folder of JSON/JSONL). Detects device code flow phishing, which leaves no trace in the mail itself, and contributes the attacker addresses and the token-issuance T0 to the audit-log attribution.",
+    )
+    anchor_group.add_argument(
+        "--signin-window-minutes",
+        type=int,
+        default=20,
+        metavar="N",
+        help="How long before a token issuance to search the corpus for the lure (default: 20). A device code expires in about 15 minutes.",
     )
     anchor_group.add_argument(
         "--allowlist",
@@ -1696,10 +1713,29 @@ def main():
 
     # Optional: ingest an M365 Unified Audit Log to derive anchors from the
     # attacker's own recorded actions and add confirmed evidence.
+    # Read BEFORE the audit log: the attacker addresses and token time it
+    # derives are inputs to analyze_audit_log, which builds the message
+    # index, the IP profile and every attribution from them in one pass.
+    signin_summary = None
+    if getattr(args, "signin_logs", None):
+        try:
+            signin_summary = analyze_signin_logs(str(args.signin_logs))
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            print(f"[!] Could not parse --signin-logs {args.signin_logs}: {exc}",
+                  file=sys.stderr)
+            signin_summary = None
+        if not signin_summary:
+            print(f"[!] No sign-in records found under {args.signin_logs}",
+                  file=sys.stderr)
+
     audit_summary = None
     if getattr(args, "audit_log", None):
         try:
-            audit_summary = analyze_audit_log(args.audit_log)
+            audit_summary = analyze_audit_log(
+                args.audit_log,
+                extra_attacker_ips=(signin_summary or {}).get('attacker_ips', ()),
+                anchor_dt=(signin_summary or {}).get('_earliest_token_dt'),
+            )
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"[!] Could not parse --audit-log {args.audit_log}: {exc}",
                   file=sys.stderr)
@@ -1721,6 +1757,17 @@ def main():
                 (audit_summary.get("coverage") or {}).pop(_k, None)
             print_audit_summary(audit_summary, audit_warnings)
 
+    # Second pass, now that both sides have named addresses: a device code
+    # group with one recorded leg is unresolved, and the audit log's own
+    # attacker IP can be the thing that resolves it. The two derive
+    # addresses from unrelated evidence, so either can answer the other.
+    if signin_summary and audit_summary:
+        signin_summary['cross_resolved'] = resolve_single_groups(
+            signin_summary, (audit_summary.get('derived') or {}).get(
+                'attacker_ips', []))
+    if signin_summary:
+        print_signin_analysis(signin_summary)
+
     allowlist = []
     for value in (args.allowlist or []):
         allowlist.extend(
@@ -1729,7 +1776,9 @@ def main():
         )
     with timed("scenario analysis"):
         scenario, scenario_reason, initial_verdict = run_scenario_analysis(
-            records, internal_domains, anchors, audit_summary, allowlist=allowlist
+            records, internal_domains, anchors, audit_summary,
+            allowlist=allowlist, signin_summary=signin_summary,
+            signin_window_minutes=getattr(args, 'signin_window_minutes', 20),
         )
     if audit_summary:
         # The message-id index is a join structure, not a finding: on a real
@@ -1741,6 +1790,16 @@ def main():
         _idx.pop("by_message_id", None)
         _audit_for_report["message_index"] = _idx
         initial_verdict["audit_log"] = _audit_for_report
+    if signin_summary:
+        # Same treatment as the audit summary: the parsed datetimes are
+        # working values for the merge and are not JSON-serialisable, so
+        # only the ISO strings alongside them go into the report.
+        _signin_for_report = dict(signin_summary)
+        _signin_for_report.pop("_earliest_token_dt", None)
+        _signin_for_report["token_events"] = [
+            {k: v for k, v in t.items() if not k.startswith("_")}
+            for t in signin_summary.get("token_events", [])]
+        initial_verdict["signin_log"] = _signin_for_report
     print("Scenario profile:  " + term.c(scenario, "magenta", "bold")
           + f" ({scenario_reason})")
     # State the period searched. A verdict of "no entry point found" means
@@ -1920,6 +1979,8 @@ def main():
     print_rule_replay(initial_verdict)
 
     print_attacker_ip_activity(audit_summary)
+
+    print_signin_lures(initial_verdict)
 
     print_initial_compromise(initial_verdict)
 

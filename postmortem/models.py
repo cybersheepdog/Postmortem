@@ -195,6 +195,13 @@ class EmailRecord:
     # The audit log records this message as SENT from the mailbox by the
     # attacker: confirmed authorship, not inferred from its wording.
     attacker_authored: bool = False
+    # Recorded in the Entra sign-in log as the lure that preceded a
+    # device code token issuance: the initial access vector, established
+    # by two records rather than by anything the message says.
+    signin_confirmed: bool = False
+    # Arrived inside the token window but carries no device-code content.
+    signin_lure_candidate: bool = False
+    signin_events: list[dict] = field(default_factory=list)
     # Structured provenance for the initial-email verdict, parallel to
     # `provenance` for the main score: same shape, same make_finding().
     scenario_findings: list[dict] = field(default_factory=list)

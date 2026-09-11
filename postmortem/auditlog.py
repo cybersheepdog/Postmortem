@@ -522,11 +522,20 @@ def coverage_warnings(audit_summary, corpus_first=None, corpus_last=None,
     return out
 
 
-def analyze_audit_log(path):
+def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None):
     """Parse a UAL export and derive anchors + confirmed attacker events.
 
     Returns a summary dict with `derived` anchors and human-readable findings,
     or raises on an unreadable file.
+
+    `extra_attacker_ips` and `anchor_dt` let another source contribute to
+    the two facts everything downstream depends on. They are parameters
+    rather than a later patch because the message index, the IP profile and
+    the operation attribution are all built from those two values inside
+    this function; merging afterwards would leave each of them stale.
+
+    Both default to empty, so every existing caller behaves exactly as
+    before.
     """
     events = [_normalize(r) for r in _iter_records(path)]
     events = [e for e in events if e["operation"]]
@@ -565,6 +574,20 @@ def analyze_audit_log(path):
             if e["timestamp"]:
                 action_times.append(e["timestamp"])
 
+    # Addresses another source established as the attacker's -- today the
+    # Entra sign-in log, where a device code group with the victim in one
+    # country and the polling client in another names an address without
+    # needing a rule to have been created. Seeded here, before anything
+    # below reads the set, so attribution is computed once from the union.
+    #
+    # This matters more than it looks: without it the attacker set is
+    # populated only by malicious rule events, so an intruder who read and
+    # exfiltrated but never made a rule leaves it empty -- and every
+    # attribution downstream silently reports nothing.
+    for _extra in (extra_attacker_ips or ()):
+        if _extra:
+            attacker_ips.add(str(_extra))
+
     # Any sign-in from an attacker IP is an attacker session -- and so is
     # every other operation from it. Stopping at UserLoggedIn meant an
     # attacker could create a rule, read a hundred messages and delete a dozen
@@ -588,6 +611,13 @@ def analyze_audit_log(path):
     deletions = sum(1 for e in events if e["op_lower"] in _DELETE_OPS)
 
     compromise_dt = min(action_times) if action_times else None
+    # An externally supplied anchor only ever moves the compromise EARLIER.
+    # Token issuance precedes the first action taken with that token, so
+    # the sign-in log's T0 is the truer one; taking the minimum also means
+    # a later or bogus anchor can never shrink the investigated window.
+    if anchor_dt is not None:
+        compromise_dt = (anchor_dt if compromise_dt is None
+                         else min(compromise_dt, anchor_dt))
     derived = {
         "compromise_date": compromise_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if compromise_dt else "",
         "attacker_ips": sorted(attacker_ips),

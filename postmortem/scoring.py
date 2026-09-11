@@ -1571,6 +1571,129 @@ def _iso_after(stamp, dt):
         return False
 
 
+# E-signin ------------------------------------------------------------------
+
+def _as_utc(dt):
+    """Normalize to aware UTC. Arrival times come from headers and may be
+    naive; sign-in times are always aware. Comparing the two raises."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def signin_lure_window(records, signin_summary, window_minutes=20):
+    """Messages that arrived shortly before a device code token was issued.
+
+    A device code expires in about fifteen minutes, so the lure and the
+    token issuance are minutes apart. That window is narrow enough to be
+    evidence on its own: content alone says a message mentions a device
+    login URL, while content inside the window says it is the one that was
+    used. Neither record could establish that separately -- the sign-in log
+    has no message and the corpus has no authentication.
+
+    A confirmed lure carries no weight and promotes through
+    `signin_confirmed`, matching how audit events are handled: it is an
+    observed fact, and the baseline modifiers that scale heuristics would
+    otherwise suppress it for arriving from an aligned, familiar sender --
+    which is exactly what a second-hop BEC lure does.
+    """
+    empty = {"available": False, "window_minutes": window_minutes,
+             "tokens": 0, "confirmed": [], "in_window_only": [],
+             "tokens_without_lure": [], "note": ""}
+    if not signin_summary:
+        return empty
+    tokens = [t for t in signin_summary.get("token_events", []) if t.get("_dt")]
+    if not tokens:
+        return dict(empty, note=(
+            "No device code token issuance was established, so there is no "
+            "window to search."))
+
+    span = timedelta(minutes=max(1, int(window_minutes)))
+    arrivals = []
+    for r in records:
+        dt = _as_utc(message_arrival_dt(r))
+        if dt is not None:
+            arrivals.append((dt, r))
+    arrivals.sort(key=lambda x: x[0])
+
+    confirmed, candidates, barren = [], [], []
+    seen_confirmed = set()
+    seen_candidate = set()
+
+    for tok in tokens:
+        t_dt = _as_utc(tok["_dt"])
+        matched_here = False
+        for dt, r in arrivals:
+            if not (t_dt - span <= dt <= t_dt):
+                continue
+            entry = {
+                "path": r.path,
+                "subject": getattr(r, "subject", "") or "",
+                "sender": getattr(r, "sender_email", "") or "",
+                "arrival": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "token_time": t_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "delta_seconds": int((t_dt - dt).total_seconds()),
+                "user": tok.get("user", ""),
+                "attacker_ip": tok.get("ip", ""),
+                "resource": tok.get("resource", ""),
+            }
+            lure = device_code_lure(r)
+            if lure:
+                url, code = lure
+                entry["url"] = url
+                entry["code"] = code
+                r.signin_confirmed = True
+                r.signin_events.append(entry)
+                matched_here = True
+                if r.path not in seen_confirmed:
+                    seen_confirmed.add(r.path)
+                    confirmed.append(entry)
+                    detail = "code %s, " % code if code else ""
+                    signal = ("Device code lure: this message carries %s and a "
+                              "token was issued for %s %d second(s) later "
+                              "from %s"
+                              % (url, tok.get("user", "the account"),
+                                 entry["delta_seconds"], tok.get("ip", "?")))
+                    r.indicators = list(dict.fromkeys(
+                        list(r.indicators) + [signal]))
+                    # provenance, not scenario_findings: score_initial_email
+                    # runs after this and rebuilds scenario_findings from
+                    # scratch, which would discard the finding. This is also
+                    # where attach_audit_events puts its recorded facts.
+                    r.provenance = list(r.provenance) + [make_finding(
+                        signal,
+                        category="audit", source="entra:signin_log",
+                        matched="%sissued %s" % (detail, entry["token_time"]),
+                        weight=0, severity="high")]
+            else:
+                r.signin_lure_candidate = True
+                if r.path not in seen_candidate:
+                    seen_candidate.add(r.path)
+                    candidates.append(entry)
+        if not matched_here:
+            barren.append({"time": tok["time"], "user": tok.get("user", ""),
+                           "ip": tok.get("ip", ""),
+                           "resource": tok.get("resource", "")})
+
+    if confirmed:
+        note = ("The lure is in the corpus and is tied to the token by time, "
+                "not by wording alone.")
+    elif barren:
+        note = ("A token was issued but no message in the corpus carries a "
+                "device login URL in the window before it. The lure was most "
+                "likely delivered outside email -- Teams chat is the common "
+                "channel -- and that data should be requested.")
+    else:
+        note = ""
+
+    return {"available": True, "window_minutes": window_minutes,
+            "tokens": len(tokens), "confirmed": confirmed,
+            "in_window_only": candidates, "tokens_without_lure": barren,
+            "note": note}
+
+
 # E4 ------------------------------------------------------------------------
 
 def exposure_scope(records, audit_summary):
@@ -1771,6 +1894,13 @@ def assign_tiers(records, scenario, anchors: Anchors):
         # Tier 1 on its own, only lift one that would otherwise be ignored.
         if getattr(r, "audit_attacker_read", False) and r.tier == 3:
             r.tier = 2
+
+        # The lure that produced a device code token is the initial access
+        # vector, and it is established by two independent records rather
+        # than by anything the message says -- so like a confirmed audit
+        # event it is a floor, never a ceiling.
+        if getattr(r, "signin_confirmed", False):
+            r.tier = 1
 
         counts[r.tier] += 1
     return counts
@@ -2100,7 +2230,8 @@ def reconstruct_attack_narrative(records, scenario, anchors, initial_verdict,
 
 
 def run_scenario_analysis(records, internal_domains, anchors: Anchors,
-                          audit_summary=None, allowlist=None):
+                          audit_summary=None, allowlist=None,
+                          signin_summary=None, signin_window_minutes=20):
     """Full scenario/anchor pipeline. Returns (scenario, reason, verdict)."""
     for r in records:
         r.origin_ip = extract_origin_ip(r.authentication_results or {})
@@ -2153,6 +2284,10 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     authorship = attacker_authorship(records, audit_summary, anchors)
     exposure = exposure_scope(records, audit_summary)
     rule_replay = replay_rules(records, audit_summary)
+    # Must also run before tiering: a confirmed lure is Tier 1 on the
+    # strength of the token, not of its wording.
+    signin_lures = signin_lure_window(
+        records, signin_summary, signin_window_minutes)
 
     for r in records:
         score_initial_email(r, scenario, anchors)
@@ -2164,6 +2299,7 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     verdict["attacker_authorship"] = authorship
     verdict["exposure_scope"] = exposure
     verdict["rule_replay"] = rule_replay
+    verdict["signin_lures"] = signin_lures
     verdict["victim_address"] = victim_address
     verdict["attack_narrative"] = reconstruct_attack_narrative(
         records, scenario, anchors, verdict, audit_summary
