@@ -1668,6 +1668,122 @@ def test_package_shared_singletons():
 
 
 # --------------------------------------------------------------------------
+# device code flow phishing
+# --------------------------------------------------------------------------
+def _dcf_record(body, subject="Device setup", urls=None,
+                sender_email="helpdesk@acme.com", sender_domain="acme.com"):
+    r = make_record(sender_email=sender_email, sender_domain=sender_domain)
+    r.subject = subject
+    r.body = body
+    r.urls = urls if urls is not None else []
+    r.attachments = []
+    r.authentication_results = {}
+    return r
+
+
+def _dcf_findings(record, internal=("acme.com",), contacts=()):
+    calculate_score(record, set(internal), set(contacts))
+    return [i for i in record.indicators
+            if "device-login" in i.lower() or "device code flow" in i.lower()]
+
+
+def test_device_code_lure_with_labelled_code_is_named_and_weighted():
+    # The defining shape: Microsoft's own device-login URL plus a user code.
+    # Every other defence passes by construction -- the link is genuinely
+    # Microsoft's, there is no attachment, and the sender is often an already
+    # compromised internal account -- so this pairing has to carry the weight
+    # on its own.
+    r = _dcf_record(
+        "As part of our rollout you need to enrol this device.\n"
+        "1. Go to https://microsoft.com/devicelogin\n"
+        "2. Enter code G7QF-9K2M\n"
+        "3. Sign in with your work account\n",
+        subject="IT: enrol your device for the new security policy")
+    found = _dcf_findings(r)
+    assert found, "device-code lure was not detected"
+    assert "G7QF-9K2M" in found[0]
+    assert "deviceCodeFlow" in found[0], "finding must point at the Entra confirmation"
+
+    # A message with the URL and a code must outrank the same message without
+    # one; the pairing is the signal, not the URL.
+    plain = _dcf_record("Please visit https://microsoft.com/devicelogin when you can.")
+    calculate_score(plain, {"acme.com"}, set())
+    assert r.score > plain.score
+
+
+def test_device_code_lure_recognises_the_oauth_deviceauth_url():
+    # The other common spelling: the tenant-scoped OAuth endpoint rather than
+    # the short microsoft.com/devicelogin form.
+    r = _dcf_record(
+        "Please open\n"
+        "https://login.microsoftonline.com/common/oauth2/deviceauth\n"
+        "and enter the code HJ8KD2N4 to finish setup.\n",
+        subject="Complete your Teams device setup")
+    found = _dcf_findings(r)
+    assert found, "oauth2/deviceauth URL was not recognised"
+    assert "HJ8KD2N4" in found[0]
+
+    # aka.ms is the third form attackers use.
+    r2 = _dcf_record("Open https://aka.ms/devicelogin and enter BQ7X-T4RM.")
+    assert _dcf_findings(r2)
+
+
+def test_device_login_url_without_a_code_is_flagged_but_lower():
+    # Attackers sometimes read the code out over the phone. The URL alone in
+    # inbound mail is still worth an analyst's eye, but it is not the same
+    # finding and must not carry the same weight.
+    r = _dcf_record(
+        "Open https://aka.ms/devicelogin and follow the instructions "
+        "I gave you on the phone.\n")
+    found = _dcf_findings(r)
+    assert found
+    assert "no user code" in found[0]
+
+    coded = _dcf_record(
+        "Open https://aka.ms/devicelogin and enter code G7QF-9K2M.\n")
+    calculate_score(coded, {"acme.com"}, set())
+    assert coded.score > r.score
+
+
+def test_ordinary_mail_with_a_code_is_not_a_device_code_lure():
+    # The code pattern is only ever consulted once a device-login URL is
+    # present, so everyday messages that happen to contain a short uppercase
+    # code must stay silent.
+    notice = _dcf_record(
+        "The all hands is Thursday at 10am.\n"
+        "Building access code 4471 at the main door.\n",
+        subject="Reminder: quarterly all hands")
+    assert not _dcf_findings(notice)
+
+    booking = _dcf_record(
+        "Your booking is confirmed. Reference code XR42QM8B.\n"
+        "Manage it at https://travel.example/bookings\n",
+        subject="Booking confirmed",
+        urls=["https://travel.example/bookings"])
+    assert not _dcf_findings(booking)
+
+    # A genuine Microsoft notification that names no device-login URL is not
+    # a lure either.
+    intune = _dcf_record(
+        "Your device has been enrolled in Intune. No further action is needed.\n"
+        "Manage your devices at https://portal.office.com/devices\n",
+        subject="Your device enrollment is complete",
+        sender_email="noreply@microsoft.com", sender_domain="microsoft.com",
+        urls=["https://portal.office.com/devices"])
+    assert not _dcf_findings(intune)
+
+
+def test_device_code_lure_is_found_in_the_url_list_not_only_the_body():
+    # HTML mail hides the href behind anchor text, so the extracted URL list
+    # has to be searched as well as the visible text.
+    r = _dcf_record(
+        "Click here to enrol. Your code is G7QF-9K2M.\n",
+        subject="Device enrolment",
+        urls=["https://microsoft.com/devicelogin"])
+    assert _dcf_findings(r)
+
+
+# --------------------------------------------------------------------------
 # minimal fallback runner
 # --------------------------------------------------------------------------
 if __name__ == "__main__":

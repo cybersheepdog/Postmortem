@@ -1645,6 +1645,61 @@ ATTACHMENT_PATTERNS = (
 )
 
 
+# --------------------------------------------------------------------------
+# Device code flow phishing
+# --------------------------------------------------------------------------
+# The OAuth device authorization grant, abused as an MFA bypass: the attacker
+# starts a device code flow against a first-party Microsoft client, then talks
+# the victim into entering the resulting user code at a genuine Microsoft URL.
+# The victim authenticates for real -- MFA included -- and the tokens land with
+# the attacker. No password is ever learned, so a password reset does not evict
+# them; only revoking refresh tokens does.
+#
+# Every other defence here is defeated by construction. The only link in the
+# message is Microsoft's own, so URL reputation, look-alike detection and
+# domain age all pass cleanly; there is no attachment; and the lure is often
+# sent from an already-compromised internal account, so authentication passes
+# too. The URL and a user code appearing together is the signal.
+#
+# Confirmation lives in Entra ID sign-in logs, not in the mailbox: a successful
+# flow leaves two records sharing one correlation ID, with
+# OriginalTransferMethod "deviceCodeFlow" -- one interactive (the victim's
+# browser, MFA satisfied) and one not (the attacker polling, usually a
+# different user agent and IP). This detects the lure, not the outcome.
+_DEVICE_LOGIN_URL_RE = re.compile(
+    r"https?://(?:[a-z0-9.-]*\.)?(?:"
+    r"microsoft\.com/devicelogin"
+    r"|microsoftonline\.com/[^\s\"'<>]*device(?:auth|login|code)"
+    r"|aka\.ms/devicelogin"
+    r"|login\.live\.com/[^\s\"'<>]*device"
+    r")", re.I)
+
+# Microsoft user codes are short uppercase alphanumerics, shown with or without
+# a separator. Only ever evaluated when a device-login URL is already present,
+# so the pattern can stay loose without costing precision.
+_DEVICE_CODE_LABELLED_RE = re.compile(
+    r"\bcode\b[^A-Za-z0-9]{0,12}([A-Z0-9]{4}[\s-]?[A-Z0-9]{3,5})\b")
+_DEVICE_CODE_BARE_RE = re.compile(r"\b(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,9}\b")
+
+
+def device_code_lure(record):
+    """Return (url, code) when a message looks like a device-code lure.
+
+    `code` is "" when the URL appears without one -- attackers sometimes send
+    the code by another channel, and the URL alone is still worth naming.
+    """
+    text = f"{getattr(record, 'subject', '') or ''}\n{scoring_text(record)}"
+    urls = list(getattr(record, "urls", []) or [])
+    hit = _DEVICE_LOGIN_URL_RE.search("\n".join(urls + [text]))
+    if not hit:
+        return None
+    labelled = _DEVICE_CODE_LABELLED_RE.search(text)
+    if labelled:
+        return hit.group(0), labelled.group(1).strip()
+    bare = _DEVICE_CODE_BARE_RE.search(text)
+    return hit.group(0), (bare.group(0) if bare else "")
+
+
 # Individually addressable URL traits, so each can carry its own weight and
 # name its own reason rather than being pooled into a single count.
 _SCREEN_URL_CREDENTIALS_RE = re.compile(r"https?://[^/\s]*:[^/@\s]*@", re.I)
@@ -2103,6 +2158,22 @@ def calculate_score(
         add("Subject contains a high-interest BEC/phishing term", 2,
             category="language", source="subject",
             matched=subject_hit.group(0))
+
+    # ------------------------------------------------------------------
+    # Device code flow phishing
+    # ------------------------------------------------------------------
+    lure = device_code_lure(record)
+    if lure:
+        url, code = lure
+        if code:
+            add(f"Device code flow lure: Microsoft device-login URL with user "
+                f"code {code} - MFA bypass, confirm in Entra sign-in logs "
+                "(OriginalTransferMethod=deviceCodeFlow)", 14,
+                category="url", source="body", matched=f"{url} + {code}")
+        else:
+            add("Microsoft device-login URL in inbound mail (no user code "
+                "found) - possible device code flow lure", 5,
+                category="url", source="body", matched=url)
 
     # ------------------------------------------------------------------
     # Body-region findings
