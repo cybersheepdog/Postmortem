@@ -14,13 +14,16 @@ from typing import Optional
 
 from postmortem.bodytext import scoring_text
 from postmortem.config import (
-    CONFIG, PHISHING_TERMS, COMMON_FREE_EMAIL, RISKY_EXTENSIONS,
+    CONFIG, PHISHING_TERMS, COMMON_FREE_EMAIL,
+    EXECUTABLE_EXTENSIONS, MACRO_EXTENSIONS, ARCHIVE_EXTENSIONS,
+    WEB_DOC_EXTENSIONS,
 )
 from postmortem.models import EmailRecord, AttackTimelineEvent, Anchors
 from postmortem.utils import (
     parse_date, date_sort_key, normalize_email, normalize_subject,
     domain_of, clean_text, registered_domain_approx, normalize_message_id,
 )
+from functools import lru_cache
 from postmortem.urls import IP_URL_RE
 from pathlib import Path
 
@@ -281,10 +284,24 @@ _BANK_CHANGE_TERMS = (
 )
 
 _URGENCY_TERMS = (
-    "urgent", "immediately", "as soon as possible", "asap", "today",
+    "urgent", "immediately", "as soon as possible", "asap",
     "right away", "confidential", "do not call", "do not tell", "don't tell",
     "keep this between",
 )
+
+# "today" on its own is not urgency -- "the payment went out today" is the
+# most ordinary sentence in an accounts mailbox, and paired with the equally
+# ordinary "payment" it was worth +5. It counts only inside a deadline
+# construction, where it actually pressures the reader.
+_DEADLINE_TODAY_RE = re.compile(
+    r"(?i)\b(?:"
+    r"by (?:the )?(?:close of business|cob|end of (?:the )?day|eod|noon|\d{1,2}\s*(?:am|pm))?\s*today"
+    r"|today or (?:the|your|this)\b"
+    r"|before (?:the )?(?:close of business|cob|end of (?:the )?day|eod)"
+    r"|must be (?:done|completed|paid|sent|actioned) today"
+    r"|no later than today"
+    r"|today[, ]+otherwise\b"
+    r")")
 
 _LOGIN_PATH_HINTS = (
     "login", "signin", "sign-in", "verify", "auth", "account", "secure",
@@ -2508,11 +2525,235 @@ def identify_known_contacts(
     return contacts
  
  
+
+# B7 ------------------------------------------------------------------------
+# Every term test used to be ``phrase in text``. "login" matched inside
+# unrelated words, "payment" matched "prepayment" and "payment terms", and
+# nothing separated "reset your password" as an instruction from the same
+# words quoted in a security-awareness bulletin. Boundaries fix the first
+# problem; a small negative-context list fixes the second.
+
+@lru_cache(maxsize=4096)
+def _term_regex(phrase: str):
+    """Word-boundary matcher for one phrase, compiled once and cached.
+
+    ``\b`` is wrong at a non-word edge, so the boundary is asserted only where
+    the phrase actually begins or ends with a word character -- otherwise a
+    term like "don't tell" or "$" would never match.
+    """
+    body = r"\s+".join(re.escape(part) for part in phrase.split())
+    left = r"\b" if phrase[:1].isalnum() else ""
+    right = r"\b" if phrase[-1:].isalnum() else ""
+    return re.compile(left + body + right, re.I)
+
+
+def term_present(phrase: str, text: str) -> bool:
+    """True when `phrase` appears in `text` as whole words."""
+    if not phrase or not text:
+        return False
+    return bool(_term_regex(phrase).search(text))
+
+
+# Contexts in which the high-noise terms are being discussed rather than used.
+# Deliberately short: each entry is a phrase observed to produce false
+# positives in bulk, not a general attempt at understanding.
+_NEGATIVE_CONTEXT = (
+    "security awareness", "phishing simulation", "simulated phish",
+    "test phish", "do not click any links", "this is a test",
+    "report suspicious", "if you receive an email asking",
+    "we will never ask", "never ask you for your password",
+    "how to spot", "example of a phishing", "training module",
+    "security bulletin", "awareness training",
+)
+
+_NEGATIVE_CONTEXT_RE = re.compile(
+    "|".join(re.escape(p) for p in _NEGATIVE_CONTEXT), re.I)
+
+# The terms whose noise the negative context is meant to suppress. A payment
+# instruction is still a payment instruction inside a newsletter, so the
+# suppression is limited to the credential-phishing vocabulary.
+_CONTEXT_SENSITIVE_TERMS = frozenset({
+    "verify your account", "verify your identity", "confirm your identity",
+    "confirm your account", "reset your password", "account suspended",
+    "account locked", "click here", "login", "log in", "sign in", "signin",
+    "password", "credentials", "unusual activity", "suspicious activity",
+    "verify", "authenticate",
+})
+
+
+def discussing_not_doing(text: str) -> bool:
+    """True when the text reads as being *about* phishing rather than being it."""
+    return bool(text) and bool(_NEGATIVE_CONTEXT_RE.search(text))
+
+
+
+# C1 / C3 --------------------------------------------------------------------
+
+def _auth_state(record):
+    """How much the message's own authentication says about its origin.
+
+    Returns one of "aligned", "failed", "absent". SPF, DKIM and DMARC were
+    parsed and fed the scenario path, but calculate_score ignored them, so a
+    DMARC-passing message from a domain seen thousands of times scored exactly
+    like a spoofed one. Authentication is the strongest available evidence
+    that a message really is from the domain it claims; used only as an
+    aggravating factor it does half its job.
+    """
+    a = record.authentication_results or {}
+    if a.get("dmarc_fail") or (a.get("spf_fail") and a.get("dkim_fail")):
+        return "failed"
+    if a.get("dmarc_pass") or (a.get("spf_pass") and a.get("dkim_pass")):
+        return "aligned"
+    if a.get("spf_pass") or a.get("dkim_pass"):
+        return "partial"
+    return "absent"
+
+
+def corpus_baseline(records):
+    """One pass over the corpus, to model what normal looks like *here*.
+
+    Fixed weights score every message in isolation. The corpus is the better
+    model: how often this sender domain appears, when it was first seen, and
+    whether its authentication has ever held. A vendor of three years asking
+    about an invoice and a stranger asking the same thing score alike without
+    it, and that distinction is the whole game in BEC.
+    """
+    domain_counts = Counter()
+    domain_first = {}
+    domain_last = {}
+    auth_seen = Counter()
+    auth_pass = Counter()
+    pair_counts = Counter()
+
+    for r in records:
+        dom = getattr(r, "sender_domain", "")
+        if not dom:
+            continue
+        domain_counts[dom] += 1
+        when = message_arrival_dt(r)
+        if when:
+            if dom not in domain_first or when < domain_first[dom]:
+                domain_first[dom] = when
+            if dom not in domain_last or when > domain_last[dom]:
+                domain_last[dom] = when
+        state = _auth_state(r)
+        if state in ("aligned", "partial", "failed"):
+            auth_seen[dom] += 1
+            if state in ("aligned", "partial"):
+                auth_pass[dom] += 1
+        sender = (getattr(r, "sender_email", "") or "").lower()
+        for rcpt in (getattr(r, "recipients", None) or []):
+            if sender and rcpt:
+                pair_counts[(sender, str(rcpt).lower())] += 1
+
+    total = max(1, len(records))
+    return {
+        "domain_counts": domain_counts,
+        "domain_first": domain_first,
+        "domain_last": domain_last,
+        "auth_seen": auth_seen,
+        "auth_pass": auth_pass,
+        "pair_counts": pair_counts,
+        "message_count": total,
+        # A domain is "trusted-by-history" when it is both well established in
+        # this corpus and has never given us reason to doubt its origin.
+        "established": {
+            d for d, c in domain_counts.items()
+            if c >= CONFIG.get("baseline_established_min", 5)
+        },
+    }
+
+
+def _familiarity(record, baseline):
+    """Where this sender sits against the corpus: 'established', 'known', 'new'."""
+    if not baseline:
+        return "unknown"
+    dom = getattr(record, "sender_domain", "")
+    if not dom:
+        return "unknown"
+    count = baseline["domain_counts"].get(dom, 0)
+    if dom in baseline["established"]:
+        return "established"
+    if count > 1:
+        return "known"
+    return "new"
+
+
+def apply_baseline_modifiers(record, score, baseline, add):
+    """Turn rarity and authentication into modifiers on a real signal.
+
+    B6's flat +4 for "external and unfamiliar" described the median external
+    email rather than a suspicious one. Rarity is not evidence by itself; it
+    is what makes other evidence matter more. So this scales an existing score
+    and never creates one -- a message with nothing against it stays at zero
+    however new its sender is.
+    """
+    if not baseline or score <= 0:
+        return score
+
+    familiarity = _familiarity(record, baseline)
+    state = _auth_state(record)
+    dom = getattr(record, "sender_domain", "")
+    delta = 0
+
+    # C1: a clean alignment from a domain this corpus knows well is the
+    # strongest evidence available that the message is what it claims.
+    if state == "aligned" and familiarity == "established":
+        delta -= min(score // 2, CONFIG.get("auth_suppression_cap", 8))
+        add("Authentication aligned for an established sender domain "
+            f"({dom}) - suppressed", delta,
+            category="auth", source="authentication_results",
+            matched=f"{dom}: {baseline['domain_counts'].get(dom, 0)} message(s), "
+                    "DMARC/SPF+DKIM aligned")
+        return max(0, score + delta)
+
+    # A hard alignment failure is the mirror image and carries real weight.
+    if state == "failed":
+        seen = baseline["auth_seen"].get(dom, 0)
+        passed = baseline["auth_pass"].get(dom, 0)
+        if seen >= CONFIG.get("baseline_enforce_min", 3) and passed / max(1, seen) >= 0.5:
+            add(f"Authentication failed for {dom}, which normally authenticates",
+                6, category="auth", source="authentication_results",
+                matched=f"{passed}/{seen} previous message(s) passed")
+            delta += 6
+        else:
+            add(f"Authentication failed for {dom}", 3,
+                category="auth", source="authentication_results",
+                matched=f"{passed}/{seen} previous message(s) passed")
+            delta += 3
+
+    # C3: rare-and-new amplifies whatever is already there.
+    if familiarity == "new":
+        bump = min(max(1, score // 3), CONFIG.get("novelty_bump_cap", 6))
+        add("First and only message from this sender domain in the corpus",
+            bump, category="sender", source="corpus:baseline",
+            matched=f"{dom}: 1 of {baseline['message_count']} message(s)")
+        delta += bump
+    elif familiarity == "established" and state != "failed":
+        # Long-standing correspondent with nothing wrong at the transport
+        # layer: real, but a smaller discount than a clean alignment.
+        cut = min(score // 4, CONFIG.get("familiarity_discount_cap", 4))
+        if cut:
+            add(f"Long-established sender domain ({dom}) - down-weighted", -cut,
+                category="sender", source="corpus:baseline",
+                matched=f"{baseline['domain_counts'].get(dom, 0)} message(s) in corpus")
+            delta -= cut
+
+    return max(0, score + delta)
+
+
 def calculate_score(
     record: EmailRecord,
     internal_domains: set[str],
     known_contacts: set[str],
+    baseline: dict = None,
 ):
+    """Score one message.
+
+    `baseline` is the corpus model from corpus_baseline(). It is optional so
+    every existing caller keeps working unchanged; without it the baseline
+    modifiers (C1/C3) simply do not apply and scoring is as it was.
+    """
  
     score = 0
 
@@ -2551,7 +2792,11 @@ def calculate_score(
         and internal_domains
         and sender_domain not in internal_domains
     ):
-        add(f"External sender: {sender_domain}", 2,
+        # B6: the median external email is external and unfamiliar. Both used
+        # to cost +4 between them, which described normal mail rather than
+        # suspicious mail. They are context now; C3 turns rarity into a
+        # multiplier on real signals instead.
+        add(f"External sender: {sender_domain}", 0,
             category="sender", source="header:From", matched=sender_domain)
 
     if sender_domain in COMMON_FREE_EMAIL:
@@ -2562,16 +2807,25 @@ def calculate_score(
         sender
         and sender not in known_contacts
     ):
-        add("Sender is not otherwise observed in the email corpus", 2,
+        add("Sender is not otherwise observed in the email corpus", 0,
             category="sender", source="corpus:sender_history", matched=sender)
 
     # ------------------------------------------------------------------
     # Phishing language
     # ------------------------------------------------------------------
 
+    # B7: whole words, and a term that is being *discussed* rather than used
+    # does not count. A security-awareness bulletin quoting "reset your
+    # password" is not a phishing message.
+    about_phishing = discussing_not_doing(text)
     for phrase, points in PHISHING_TERMS.items():
 
-        if phrase in text:
+        if term_present(phrase, text):
+            if about_phishing and phrase in _CONTEXT_SENSITIVE_TERMS:
+                add(f"Contains phrase: {phrase!r} (in security-awareness "
+                    "context, not scored)", 0,
+                    category="language", source="body", matched=phrase)
+                continue
             add(f"Contains phrase: {phrase!r}", points,
                 category="language", source="subject+body", matched=phrase)
 
@@ -2579,8 +2833,12 @@ def calculate_score(
     # URLs
     # ------------------------------------------------------------------
 
+    # B4: the URL-analysis risk score is the single URL signal. Presence and
+    # domain count are reported for context at zero weight -- one set of links
+    # used to be charged three times over, so a newsletter with eight tracking
+    # domains scored like a threat.
     if record.urls:
-        add(f"Contains {len(record.urls)} URL(s)", 2,
+        add(f"Contains {len(record.urls)} URL(s)", 0,
             category="url", source="body",
             matched=", ".join(record.urls[:3]))
 
@@ -2590,7 +2848,7 @@ def calculate_score(
         # entry -- a score the analyst could not decompose, in a tool whose
         # output is evidence.
         count = len(record.url_domains)
-        add(f"Links to {count} distinct URL domain(s)", count,
+        add(f"Links to {count} distinct URL domain(s)", 0,
             category="url", source="body",
             matched=", ".join(sorted(record.url_domains)[:5]))
 
@@ -2614,21 +2872,52 @@ def calculate_score(
     # Attachments
     # ------------------------------------------------------------------
 
+    # B5: having an attachment is not a finding. On a corpus averaging 1.7MB
+    # per message almost everything has one, and the flat bonus taxed the
+    # entire mailbox. Presence is context; the extension is the signal.
     if record.attachments:
-        add(f"Contains {len(record.attachments)} attachment(s)", 2,
+        add(f"Contains {len(record.attachments)} attachment(s)", 0,
             category="attachment", source="attachment",
             matched=", ".join(record.attachments[:3]))
 
+        archive_flags = {
+            str(f).lower()
+            for d in (record.attachment_details or []) if isinstance(d, dict)
+            for f in (d.get("flags") or [])
+        }
+        archive_suspicious = any(
+            k in flag for flag in archive_flags
+            for k in ("executable", "script", "macro", "lnk", "double extension",
+                      "password", "encrypted")
+        )
+
         for filename in record.attachments:
-
-            extension = (
-                Path(filename)
-                .suffix
-                .lower()
-            )
-
-            if extension in RISKY_EXTENSIONS:
-                add(f"Potentially risky attachment type: {filename}", 4,
+            extension = Path(filename).suffix.lower()
+            if extension in EXECUTABLE_EXTENSIONS:
+                # No legitimate business use in mail. These are the ones the
+                # old flat list buried among archives and web pages.
+                add(f"Executable/script attachment: {filename}", 8,
+                    category="attachment", source="attachment",
+                    matched=filename)
+            elif extension in MACRO_EXTENSIONS:
+                add(f"Macro-enabled document attachment: {filename}", 4,
+                    category="attachment", source="attachment",
+                    matched=filename)
+            elif extension in ARCHIVE_EXTENSIONS:
+                # An archive is only as suspicious as what the peek found in
+                # it. A zipped quarterly report is not evidence of anything.
+                if archive_suspicious:
+                    add(f"Archive attachment containing a risky item: {filename}",
+                        5, category="attachment", source="attachment",
+                        matched=filename)
+                else:
+                    add(f"Archive attachment: {filename}", 0,
+                        category="attachment", source="attachment",
+                        matched=filename)
+            elif extension in WEB_DOC_EXTENSIONS:
+                # .htm/.html mail attachments are a real credential-harvest
+                # vector, but far weaker than an executable.
+                add(f"Web-page attachment: {filename}", 2,
                     category="attachment", source="attachment",
                     matched=filename)
 
@@ -2637,7 +2926,7 @@ def calculate_score(
     # ------------------------------------------------------------------
 
     has_payment_language = any(
-        term in text
+        term_present(term, text)
         for term in (
             "wire transfer",
             "bank account",
@@ -2650,19 +2939,25 @@ def calculate_score(
         )
     )
 
-    has_urgency = any(
-        term in text
-        for term in (
-            "urgent",
-            "immediately",
-            "as soon as possible",
-            "action required",
-            "today",
+    # B2: a second urgency list lived here, still carrying bare "today", so
+    # removing it from _URGENCY_TERMS alone would not have reached the
+    # payment+urgency combination that charged +5 for "the payment went out
+    # today". Both lists now agree, and "today" counts only inside a deadline.
+    has_urgency = (
+        _DEADLINE_TODAY_RE.search(text) is not None
+        or any(
+            term_present(term, text)
+            for term in (
+                "urgent",
+                "immediately",
+                "as soon as possible",
+                "action required",
+            )
         )
     )
 
     has_secrecy = any(
-        term in text
+        term_present(term, text)
         for term in (
             "confidential",
             "do not call",
@@ -2740,6 +3035,10 @@ def calculate_score(
             f"message(s) from this sender within {record.burst_hours:.0f}h",
             6, category="reputation", source="corpus:block_repetition",
             matched=f"{record.burst_copies} copies / {record.burst_hours:.0f}h")
+
+    # C1/C3 last: these scale what the message-level signals found rather than
+    # adding evidence of their own, so they need the finished score.
+    score = apply_baseline_modifiers(record, score, baseline, add)
 
     record.score = score
 

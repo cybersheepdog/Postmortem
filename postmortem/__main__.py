@@ -159,7 +159,7 @@ class AnalysisCache:
 # ============================================================================
  
 from postmortem.scoring import (  # noqa: E402
-    calculate_score, candidate_score, identify_internal_domains,
+    calculate_score, candidate_score, identify_internal_domains, corpus_baseline,
     identify_known_contacts, calculate_thread_ids, analyze_temporal_signals,
     detect_possible_impersonation, build_attack_timeline,
     earliest_malicious_precursor_verdict,
@@ -984,6 +984,16 @@ def main():
              "Offline; needs the 'maxminddb' reader.",
     )
     enrich.add_argument(
+        "--diagnostic",
+        nargs="?",
+        const="postmortem_diagnostic.txt",
+        default=None,
+        help="write a SANITIZED diagnostic report about this run (signal "
+             "frequencies, score distribution, timings) containing no "
+             "addresses, domains, hostnames, file names, paths, subjects, "
+             "message ids or IPs -- safe to share for tuning the tool",
+    )
+    enrich.add_argument(
         "--expected-countries",
         metavar="CC[,CC...]",
         help="ISO country codes the org normally sends/receives from (e.g. "
@@ -1463,12 +1473,18 @@ def main():
     # ------------------------------------------------------------------
  
     with timed("scoring"):
+        # One pass to model what normal looks like in THIS corpus, then score
+        # deviations from it. Without this every message is judged against
+        # fixed weights in isolation, and a vendor of three years asking about
+        # an invoice scores like a stranger asking the same thing.
+        baseline = corpus_baseline(records)
         for record in records:
- 
+
             calculate_score(
                 record,
                 internal_domains,
                 known_contacts,
+                baseline,
             )
  
     # ------------------------------------------------------------------
@@ -1917,6 +1933,26 @@ def main():
     )
 
     print_run_manifest(manifest)
+
+    if getattr(args, "diagnostic", None):
+        # Built from counts and templated signal shapes only, then scanned for
+        # identifier patterns before it is allowed to touch the disk. See
+        # postmortem/diagnostic.py for what that means in detail.
+        from postmortem import diagnostic as _diag
+        from postmortem.config import CONFIG as _diag_cfg
+        try:
+            _doc = _diag.build(
+                records, verdict=initial_verdict, audit_summary=audit_summary,
+                manifest=manifest, campaigns=campaigns,
+                timings=manifest.get("phase_timings_seconds"), config=_diag_cfg)
+            _written = _diag.write(_doc, args.diagnostic)
+        except ValueError as exc:
+            print(f"[!] Diagnostic NOT written: {exc}", file=sys.stderr)
+        else:
+            print()
+            print("Sanitized diagnostic written to: " + ", ".join(_written))
+            print("  No addresses, domains, hostnames, file names, paths,")
+            print("  subjects, message ids or IPs. Read it before sending it.")
 
     if args.output:
 

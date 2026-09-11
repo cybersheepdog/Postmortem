@@ -19,6 +19,13 @@ CONFIG = {
     "baseline_domain_min": 3,       # msgs for a domain to be "frequent"
     "baseline_sender_min": 3,       # msgs for a sender to be "frequent"
     "baseline_established_min": 5,  # msgs for a domain to be "established"
+    # C1/C3 modifier bounds. Each is a ceiling on how far the corpus baseline
+    # may move a message-level score, so a familiar sender can never be
+    # discounted into invisibility and a new one can never be convicted on
+    # novelty alone.
+    "auth_suppression_cap": 8,      # max discount for aligned + established
+    "familiarity_discount_cap": 4,  # max discount for established alone
+    "novelty_bump_cap": 6,          # max uplift for a first-and-only sender
     "baseline_enforce_min": 3,      # auth observations to judge enforcement
     # Weights folded into the general priority score (annotate_forensic_signals).
     "priority_weights": {
@@ -171,6 +178,22 @@ BUSINESS_TERMS = {
 }
  
  
+# B5 split the flat risky list into families that carry very different
+# weight. RISKY_EXTENSIONS is kept as their union so anything still reading it
+# behaves as before.
+EXECUTABLE_EXTENSIONS = {
+    ".hta", ".js", ".jse", ".vbs", ".vbe", ".wsf", ".lnk", ".scr", ".exe",
+    ".com", ".pif", ".cpl", ".msi", ".jar", ".ps1", ".bat", ".cmd",
+}
+# Mountable containers: used to smuggle an executable past mark-of-the-web.
+EXECUTABLE_EXTENSIONS |= {".iso", ".img", ".vhd"}
+
+MACRO_EXTENSIONS = {".docm", ".xlsm", ".xlsb", ".pptm", ".dotm", ".xltm"}
+
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".gz", ".tar", ".cab", ".ace"}
+
+WEB_DOC_EXTENSIONS = {".html", ".htm", ".shtml", ".mht", ".mhtml"}
+
 RISKY_EXTENSIONS = {
     ".html",
     ".htm",
@@ -190,3 +213,5 @@ RISKY_EXTENSIONS = {
     ".docm",
     ".xlsb",
 }
+RISKY_EXTENSIONS |= (EXECUTABLE_EXTENSIONS | MACRO_EXTENSIONS
+                     | ARCHIVE_EXTENSIONS | WEB_DOC_EXTENSIONS)

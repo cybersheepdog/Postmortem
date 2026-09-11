@@ -257,11 +257,19 @@ def test_evidence_provenance_per_finding():
         assert ind in prov_by_signal, f"indicator without provenance: {ind}"
 
     # The external-sender finding is sourced to the From header and carries the
-    # concrete matched value and its score weight.
+    # concrete matched value. Its weight is 0 since B6: being external is the
+    # median external email, not evidence. It is still reported as context,
+    # with full provenance -- a zero-weight finding is a fact about the
+    # message, not an absent one.
     ext = prov_by_signal["External sender: contoso-secure.com"]
     assert ext["source"] == "header:From"
     assert ext["matched"] == "contoso-secure.com"
-    assert ext["weight"] == 2
+    assert ext["weight"] == 0
+
+    # Something that IS evidence still carries its weight through provenance.
+    scored = [p for p in r.provenance if p["weight"] > 0]
+    assert scored, "expected at least one weighted finding"
+    assert sum(p["weight"] for p in scored) >= r.score
 
     # Anchor findings from the scenario pass are attributed to the investigator
     # anchor (which is where a UAL-derived anchor also lands).
@@ -2864,6 +2872,271 @@ def test_audit_ips_are_geolocated_and_flagged(tmp_path):
 
     assert annotate_audit_geoip(summary, NoResolver(), ["US"]) == {
         "resolved": 0, "unexpected": 0}
+
+
+# --------------------------------------------------------------------------
+# B2/B4/B5/B6/B7 and C1/C3: what stops scoring, and what starts
+# --------------------------------------------------------------------------
+def _msg(**kw):
+    r = make_record(sender_email=kw.get("sender_email", "a@ext.example"),
+                    sender_domain=kw.get("sender_domain", "ext.example"),
+                    subject=kw.get("subject", "Hello"),
+                    path=kw.get("path", "/m/x.eml"),
+                    date=kw.get("date", "Mon, 12 Jan 2026 09:00:00 -0500"))
+    r.body = kw.get("body", "Regular message.")
+    r.urls = kw.get("urls", [])
+    r.url_domains = kw.get("url_domains", [])
+    r.url_analysis = kw.get("url_analysis", [])
+    r.attachments = kw.get("attachments", [])
+    r.attachment_details = kw.get("attachment_details", [])
+    r.authentication_results = kw.get("auth", {})
+    return r
+
+
+def _score(record, baseline=None):
+    calculate_score(record, {"acme.com"}, set(), baseline)
+    return record.score
+
+
+def test_today_alone_is_not_urgency(tmp_path):
+    # "the payment went out today" is the most ordinary sentence in an
+    # accounts mailbox, and used to be worth the payment+urgency combination.
+    from postmortem.scoring import _DEADLINE_TODAY_RE
+
+    ordinary = _msg(subject="Re: invoice",
+                    body="Just confirming the payment went out today.")
+    assert not any("urgency" in i.lower() for i in
+                   (_score(ordinary), ordinary)[1].indicators)
+
+    # A deadline construction still counts -- that is real pressure.
+    for phrase in ("this must be paid by close of business today",
+                   "wire the funds today or the account closes",
+                   "no later than today please"):
+        assert _DEADLINE_TODAY_RE.search(phrase), phrase
+    for phrase in ("the payment went out today", "I saw him today"):
+        assert not _DEADLINE_TODAY_RE.search(phrase), phrase
+
+
+def test_links_are_counted_once(tmp_path):
+    # A newsletter with eight tracking domains used to be charged for URL
+    # presence, for each distinct domain, and again for URL analysis.
+    news = _msg(subject="Weekly roundup", body="Read more on our site.",
+                urls=["https://t%d.example/x" % i for i in range(8)],
+                url_domains=["t%d.example" % i for i in range(8)],
+                url_analysis=[{"url": "https://t%d.example/x" % i,
+                               "risk_score": 0} for i in range(8)])
+    assert _score(news) == 0
+
+    # Presence and domain count are still reported, at zero weight: they are
+    # facts about the message, just not evidence.
+    prov = {p["signal"]: p for p in news.provenance}
+    assert any("URL(s)" in s for s in prov)
+    assert all(p["weight"] == 0 for s, p in prov.items() if "URL" in s)
+
+    # A genuinely risky URL still scores, through the analysis path alone.
+    risky = _msg(subject="Password reset",
+                 body="Confirm your account at https://evil.example/owa/login",
+                 urls=["https://evil.example/owa/login"],
+                 url_domains=["evil.example"],
+                 url_analysis=[{"url": "https://evil.example/owa/login",
+                                "risk_score": 12, "flags": []}])
+    assert _score(risky) > _score(news)
+
+
+def test_attachments_are_weighted_by_what_they_are(tmp_path):
+    # A zipped quarterly report used to cost +6 before anyone looked at it.
+    zipped = _msg(subject="Q3 report", body="Attached.",
+                  attachments=["Q3-report.zip"],
+                  attachment_details=[{"flags": []}])
+    assert _score(zipped) == 0
+
+    # An archive whose peek found something is a different matter.
+    loaded = _msg(subject="Q3 report", body="Attached.",
+                  attachments=["Q3-report.zip"],
+                  attachment_details=[{"flags": ["archive contains executable"]}])
+    assert _score(loaded) > 0
+
+    # And a script attachment has no legitimate use in mail at all.
+    script = _msg(subject="Invoice", body="See attached.",
+                  attachments=["invoice.js"], attachment_details=[{"flags": []}])
+    assert _score(script) >= 8
+    assert _score(script) > _score(loaded)
+
+
+def test_being_an_ordinary_correspondent_is_free(tmp_path):
+    # External + unfamiliar described the median external email and cost +4.
+    ordinary = _msg(subject="Meeting Thursday", body="Does 2pm work?")
+    assert _score(ordinary) == 0
+    prov = {p["signal"]: p for p in ordinary.provenance}
+    ext = [p for s, p in prov.items() if s.startswith("External sender")]
+    assert ext and ext[0]["weight"] == 0
+
+
+def test_terms_match_on_word_boundaries(tmp_path):
+    from postmortem.scoring import term_present
+
+    assert term_present("login", "Please login here")
+    assert not term_present("login", "see the weblogin handler")
+    assert not term_present("payment", "prepayment terms apply")
+    assert term_present("payment", "the payment is due")
+    assert term_present("wire transfer", "a wire  transfer was sent")
+
+    prose = _msg(subject="Integration notes",
+                 body="The weblogin handler reads prepayment terms.")
+    assert _score(prose) == 0
+
+
+def test_a_bulletin_about_phishing_is_not_phishing(tmp_path):
+    from postmortem.scoring import discussing_not_doing
+
+    assert discussing_not_doing("This is a security awareness test")
+    assert not discussing_not_doing("Please verify your account")
+
+    bulletin = _msg(sender_domain="acme.com", sender_email="security@acme.com",
+                    subject="How to spot a phish",
+                    body="A phishing email may say 'reset your password' or "
+                         "'verify your account'. This is a test. Report "
+                         "suspicious mail to the service desk.")
+    real = _msg(sender_domain="evil.example", sender_email="it@evil.example",
+                subject="Account notice",
+                body="Your account is locked. Reset your password and verify "
+                     "your account to restore access.")
+    assert _score(real) > _score(bulletin)
+
+    # The suppressed terms are still reported, so the finding is visible even
+    # though it does not score.
+    suppressed = [p for p in bulletin.provenance
+                  if "security-awareness context" in p["signal"]]
+    assert suppressed and all(p["weight"] == 0 for p in suppressed)
+
+
+def test_authentication_suppresses_and_aggravates(tmp_path):
+    from postmortem.scoring import corpus_baseline
+
+    # An established, authenticating sender.
+    corpus = [_msg(sender_domain="partner.example",
+                   sender_email="ap@partner.example",
+                   path="/c/%d.eml" % i, auth={"dmarc_pass": True})
+              for i in range(20)]
+    base = corpus_baseline(corpus)
+
+    lure = "Please verify your account and reset your password immediately."
+    trusted = _msg(sender_domain="partner.example",
+                   sender_email="ap@partner.example",
+                   subject="Account notice", body=lure,
+                   auth={"dmarc_pass": True})
+    spoofed = _msg(sender_domain="partner.example",
+                   sender_email="ap@partner.example",
+                   subject="Account notice", body=lure,
+                   auth={"dmarc_fail": True})
+
+    t = _score(trusted, base)
+    s = _score(spoofed, base)
+    assert s > t, "a spoofed message must outscore an aligned one"
+    assert any("Authentication aligned" in i for i in trusted.indicators)
+    assert any("Authentication failed" in i for i in spoofed.indicators)
+
+    # The suppressor cannot drive a real signal to nothing.
+    assert t > 0
+
+
+def test_rarity_amplifies_but_never_convicts(tmp_path):
+    from postmortem.scoring import corpus_baseline
+
+    corpus = [_msg(sender_domain="known.example", sender_email="a@known.example",
+                   path="/c/%d.eml" % i) for i in range(20)]
+    stranger = _msg(sender_domain="brand-new.example",
+                    sender_email="x@brand-new.example",
+                    subject="Invoice", body="Please verify your account.")
+    innocuous = _msg(sender_domain="also-new.example",
+                     sender_email="y@also-new.example",
+                     subject="Hello", body="Are you free Thursday?")
+    base = corpus_baseline(corpus + [stranger, innocuous])
+
+    # Rarity multiplies an existing signal...
+    assert _score(stranger, base) > _score(stranger)
+    # ...but creates nothing on its own. A new sender with nothing against it
+    # stays at zero, however unfamiliar.
+    assert _score(innocuous, base) == 0
+
+
+# --------------------------------------------------------------------------
+# The sanitized diagnostic
+# --------------------------------------------------------------------------
+def test_diagnostic_discards_every_identifier(tmp_path):
+    from postmortem import diagnostic
+
+    planted = [
+        "j.hollingsworth@globex-industries.com",
+        "globex-industries.com",
+        "203.0.113.77",
+        "C:\\Cases\\Globex\\export.pst",
+        "https://globex-secure-login.example/owa",
+        "<8812.abc@globex-industries.com>",
+        "MERCURY-DC01.globex.local",
+    ]
+    for value in planted:
+        out = diagnostic.template("Finding about %s here" % value)
+        assert value not in out, (value, out)
+        assert not diagnostic.scan_for_identifiers(out), (value, out)
+
+    # The tool's own vocabulary survives -- without it every phrase finding
+    # collapses into one line and the report loses its whole point.
+    kept = diagnostic.template("Contains phrase: 'wire transfer'")
+    assert "wire transfer" in kept
+
+    # A client value in the same position does not.
+    dropped = diagnostic.template("Contains phrase: 'Project Nightingale'")
+    assert "Nightingale" not in dropped
+
+
+def test_diagnostic_refuses_to_write_a_leak(tmp_path):
+    from postmortem import diagnostic
+
+    doc = diagnostic.build([], verdict={}, manifest={})
+    # Force a leak past the templating to prove the final gate is real.
+    doc["note"] = "contact analyst@example.com for details"
+    try:
+        diagnostic.write(doc, str(tmp_path / "d.txt"))
+    except ValueError as exc:
+        assert "refusing to write" in str(exc)
+    else:
+        raise AssertionError("a leaked identifier was written to disk")
+    assert not (tmp_path / "d.txt").exists()
+
+
+def test_diagnostic_reports_useful_shape(tmp_path):
+    from postmortem import diagnostic
+
+    records = []
+    for i in range(10):
+        r = _msg(sender_domain="ext%d.example" % i,
+                 sender_email="a@ext%d.example" % i,
+                 path="/m/%d.eml" % i,
+                 subject="Verify your account",
+                 body="Please verify your account immediately.")
+        _score(r)
+        r.tier = 1 if i < 3 else 3
+        records.append(r)
+
+    doc = diagnostic.build(records, verdict={"verdict": "LIKELY_INITIAL_EMAIL"},
+                           manifest={"tool_version": "8.2"},
+                           timings={"scoring": 1.5})
+    assert doc["corpus"]["messages"] == 10
+    assert doc["tiers"]["1"] == 3
+
+    # Share of corpus counts messages, not fires: a signal firing twice on one
+    # message must not push its share past 100%.
+    assert doc["signals"], "expected signal statistics"
+    for s in doc["signals"]:
+        assert 0 < s["share_of_corpus"] <= 1.0, s
+        assert s["messages"] <= doc["corpus"]["messages"]
+        assert s["fires"] >= s["messages"]
+
+    # And it renders without leaking.
+    text = diagnostic.render(doc)
+    assert not diagnostic.scan_for_identifiers(text)
+    assert "[signals]" in text and "[timings_seconds]" in text
 
 
 # --------------------------------------------------------------------------
