@@ -1784,6 +1784,215 @@ def test_device_code_lure_is_found_in_the_url_list_not_only_the_body():
 
 
 # --------------------------------------------------------------------------
+# report quality: evidence, noise and volume
+#
+# Every test here came from reading a real 117,300-message run and asking why
+# a line in the report could not be checked or was not worth reading.
+# --------------------------------------------------------------------------
+def test_namespace_uris_are_not_counted_as_links():
+    # Word and Outlook emit xmlns declarations and DTD references into almost
+    # every HTML mail. They are identifiers, not destinations; counting them
+    # inflated URL totals, the IOC export and the "contains N URL(s)" signal.
+    from postmortem.urls import extract_urls, is_navigable
+
+    markup = (
+        '<html xmlns="http://www.w3.org/TR/REC-html40" '
+        'xmlns:m="http://schemas.microsoft.com/office/2004/12/omml" '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        'Please sign in at https://evil.example/login</html>'
+    )
+    assert extract_urls(markup) == ["https://evil.example/login"]
+
+    # The opt-out still reports everything, for a caller that wants to know
+    # what a document declared.
+    assert len(extract_urls(markup, navigable_only=False)) == 4
+
+    # Matching is on the hostname, not the registrable domain: the
+    # registrable domain of schemas.microsoft.com is microsoft.com, and
+    # filtering that would discard every genuine Microsoft link -- including
+    # the device-login endpoints this tool exists to flag.
+    assert not is_navigable("http://schemas.microsoft.com/office/2004/12/omml")
+    assert is_navigable("https://microsoft.com/devicelogin")
+    assert is_navigable("https://login.microsoftonline.com/common/oauth2/deviceauth")
+    assert is_navigable("https://outlook.office.com/mail")
+
+
+def test_base64_body_urls_ignore_encoded_attachments():
+    # An Office attachment decodes to OOXML whose every namespace looked like
+    # a URL the sender had hidden in the body -- worth +4 risk each, and the
+    # largest single source of candidate promotions on a real corpus.
+    import base64
+    from postmortem.parsing import decode_base64_urls
+
+    ooxml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        b'xmlns:m="http://schemas.microsoft.com/office/2004/12/omml">'
+        b'<w:body><w:p><w:t>Quarterly figures</w:t></w:p></w:body></w:document>'
+    )
+    blob = base64.b64encode(ooxml).decode()
+    wrapped = "\n".join(blob[i:i + 76] for i in range(0, len(blob), 76))
+    assert decode_base64_urls("Please see attached.\n\n" + wrapped) == []
+
+    # A genuinely obfuscated link in body text is still recovered, and
+    # recovered whole -- the old per-line match decoded from an arbitrary byte
+    # offset and returned truncated hosts like "http://schemas.microsoft".
+    hidden = base64.b64encode(
+        b"Click through to https://credential-harvest.example/owa/signin to continue"
+    ).decode()
+    found = decode_base64_urls("Details below.\n" + hidden + "\nThanks")
+    assert found == ["https://credential-harvest.example/owa/signin"]
+
+
+def test_evidence_graph_keeps_only_meaningful_edges():
+    # A chain linking every message to the next in date order restates the
+    # sort N-1 times; a chain linking every message from one sender domain
+    # links most of the corpus. Neither can distinguish anything.
+    from postmortem.scoring import build_evidence_graph
+
+    recs = []
+    for i in range(4):
+        r = make_record(sender_email="a@same.example", sender_domain="same.example",
+                        date="Mon, 1%d Jan 2025 09:00:00 -0500" % i,
+                        path="/m/%d.eml" % i)
+        r.url_analysis = []
+        r.attachment_details = []
+        recs.append(r)
+
+    graph = build_evidence_graph(recs)
+    assert len(graph["nodes"]) == 4
+    relations = {e["relation"] for e in graph["edges"]}
+    assert "temporal_sequence" not in relations
+    assert "sender_domain" not in relations
+    assert graph["edges"] == []
+
+    # A shared attachment hash still links them, because that means something.
+    for r in recs[:2]:
+        r.attachment_details = [{"sha256": "deadbeef", "filename": "inv.docx"}]
+    graph = build_evidence_graph(recs)
+    assert {e["relation"] for e in graph["edges"]} == {"attachment_sha256"}
+    assert len(graph["edges"]) == 1
+
+
+def test_initial_email_findings_carry_their_evidence():
+    # The report said "Display-name impersonation of a known contact" without
+    # naming either address, and "Link to a credential/login page" without the
+    # link. Both are unverifiable as written.
+    from postmortem.scoring import score_initial_email
+    from postmortem.models import Anchors
+
+    r = make_record(sender_email="dana.w@acrne-corp.example",
+                    sender_domain="acrne-corp.example")
+    r.sender_name = "Dana Whitfield"
+    r.subject = "Action required: verify your account"
+    r.body = ("Your password expires today. Verify your account at "
+              "https://acrne-corp.example/owa/login/verify?id=77")
+    r.urls = ["https://acrne-corp.example/owa/login/verify?id=77"]
+    r.url_analysis = [{"url": "https://acrne-corp.example/owa/login/verify?id=77",
+                       "path": "/owa/login/verify", "suspicious_score": 12,
+                       "registrable_domain": "acrne-corp.example"}]
+    r.attachments = []
+    r.attachment_details = []
+    r.authentication_results = {}
+    r.display_name_spoof = True
+    r.display_name_spoof_of = ["dana.whitfield@acme.com"]
+
+    score_initial_email(r, "ato", Anchors())
+    assert r.scenario_score > 0
+    by_signal = {f["signal"]: f for f in r.scenario_findings}
+
+    # Every reason must have a finding; none may be evidence-free filler.
+    assert set(r.scenario_reasons) <= set(by_signal)
+
+    spoof = by_signal["Display-name impersonation of a known contact"]
+    assert "dana.whitfield@acme.com" in spoof["matched"], "legitimate address missing"
+    assert "dana.w@acrne-corp.example" in spoof["matched"], "spoofing address missing"
+
+    link = by_signal["Link to a credential/login page"]
+    assert link["matched"] == "https://acrne-corp.example/owa/login/verify?id=77"
+
+    lure = by_signal["Credential-harvest lure language"]
+    assert "verify your account" in lure["matched"]
+
+
+def test_display_name_spoof_records_who_was_impersonated():
+    # The detection knew the legitimate address and threw it away for a bool,
+    # so the report could say a name was impersonated but never show the
+    # substitution. Driven through the real pipeline entry point.
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    def msg(addr, name, path, day):
+        r = make_record(sender_email=addr, sender_domain=addr.split("@")[1],
+                        path=path,
+                        date="Mon, 1%d Aug 2026 09:00:00 +0000" % day)
+        r.sender_name = name
+        r.subject = "Weekly numbers"
+        r.body = "Figures attached as usual."
+        r.urls = []
+        r.url_analysis = []
+        r.attachments = []
+        r.attachment_details = []
+        r.authentication_results = {}
+        return r
+
+    recs = [msg("dana.whitfield@acme.com", "Dana Whitfield", "/m/%d.eml" % i, i)
+            for i in range(3)]
+    imposter = msg("dana.w@acrne-corp.example", "Dana Whitfield", "/m/x.eml", 5)
+    imposter.subject = "Action required: verify your account"
+    imposter.body = "Verify your account to avoid interruption."
+    recs.append(imposter)
+
+    run_scenario_analysis(recs, {"acme.com"}, Anchors())
+
+    assert imposter.display_name_spoof is True
+    assert "dana.whitfield@acme.com" in imposter.display_name_spoof_of
+
+    # And the evidence reaches the finding, in both-addresses form.
+    spoof = [f for f in imposter.scenario_findings
+             if "Display-name impersonation" in f["signal"]]
+    assert spoof, "no display-name finding produced"
+    assert "dana.whitfield@acme.com" in spoof[0]["matched"]
+    assert "dana.w@acrne-corp.example" in spoof[0]["matched"]
+
+    # The genuine sender is not accused of impersonating themselves.
+    assert all(not r.display_name_spoof for r in recs[:3])
+
+
+def test_low_confidence_clusters_are_not_reported_but_are_kept():
+    # 3,506 "campaigns" on a real corpus, because any two messages over the
+    # similarity threshold became one. Gating what is *reported* must not
+    # change what is *computed* -- the per-message campaign columns and the
+    # JSON stay complete.
+    from postmortem.clustering import build_campaign_clusters
+
+    recs = []
+    for i in range(6):
+        r = make_record(sender_email="s%d@ext.example" % i,
+                        sender_domain="ext.example",
+                        subject="Invoice %d attached" % i,
+                        path="/m/%d.eml" % i)
+        r.body = "Please find the invoice attached and remit payment."
+        r.urls = []
+        r.url_domains = []
+        r.url_analysis = []
+        r.attachments = []
+        r.attachment_details = []
+        r.authentication_results = {}
+        recs.append(r)
+
+    campaigns = build_campaign_clusters(recs)
+    # Nothing here shares a URL domain or an attachment hash, so nothing is
+    # worth putting in front of an analyst.
+    assert all(c.reportable is False for c in campaigns), \
+        [c.campaign_id for c in campaigns if c.reportable]
+    # But the clusters still exist and members are still stamped.
+    assert build_campaign_clusters.last_suppressed == len(campaigns)
+    if campaigns:
+        assert any(r.campaign_id for r in recs)
+
+
+# --------------------------------------------------------------------------
 # minimal fallback runner
 # --------------------------------------------------------------------------
 if __name__ == "__main__":

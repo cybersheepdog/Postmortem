@@ -64,6 +64,14 @@ class CampaignInfo:
 
     confidence: str = "low"
 
+    # Whether this cluster is worth putting in front of an analyst. Clusters
+    # are still built and still stamped onto their member records when this is
+    # False -- the per-message campaign_id and campaign_score are unchanged --
+    # but the report does not list them. A pair of messages that share only a
+    # sender domain is not a campaign in any useful sense, and on a real
+    # corpus those are the overwhelming majority.
+    reportable: bool = True
+
 
 @dataclass
 class EmailRecord:
@@ -165,11 +173,20 @@ class EmailRecord:
     hidden_folder: str = ""
     thread_injection: bool = False
     display_name_spoof: bool = False
+    # The address(es) that normally use this display name. Without them the
+    # finding can say a name was impersonated but not show the substitution,
+    # which is the only form in which a reader can check it.
+    display_name_spoof_of: list[str] = field(default_factory=list)
     rule_target: bool = False
+    # Which of the malicious rule's keywords this message actually matched.
+    rule_target_keywords: list[str] = field(default_factory=list)
     attachment_threat: bool = False
     attachment_threat_note: str = ""
     anchor_matches: list[str] = field(default_factory=list)
     scenario_score: int = 0
+    # Structured provenance for the initial-email verdict, parallel to
+    # `provenance` for the main score: same shape, same make_finding().
+    scenario_findings: list[dict] = field(default_factory=list)
     scenario_reasons: list[str] = field(default_factory=list)
     tier: int = 3
 

@@ -25,7 +25,7 @@ from postmortem.utils import (
     normalize_email, domain_of, normalize_message_id, clean_text,
 )
 from postmortem.urls import (
-    extract_urls, extract_url_domains, analyze_url, HTML_LINK_RE,
+    extract_urls, extract_url_domains, analyze_url, HTML_LINK_RE, is_navigable
 )
 
 EMAIL_RE = re.compile(
@@ -272,21 +272,51 @@ _B64_BLOB_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{24,1024}={0,2}(?![A
 _DATA_URI_RE = re.compile(r"data:[^;\s,]+;base64,[A-Za-z0-9+/=\s]+", re.I)
 
 
+# Base64 in mail is wrapped, classically at 76 characters. Matching one line
+# at a time decodes from an arbitrary byte offset, which silently truncates
+# whatever spans the break -- the reason recovered URLs arrived looking like
+# "http://schemas.microsoft" and "http://www.w3.org/XM". Wrapped runs are
+# joined before decoding so the decode is correct.
+_B64_WRAPPED_RE = re.compile(
+    r"(?<![A-Za-z0-9+/=])(?:[A-Za-z0-9+/]{24,}\s*){1,}={0,2}(?![A-Za-z0-9+/=])")
+
+# Past this many base64 characters the blob is an encoded *attachment*, not a
+# link someone hid in a sentence. Attachments have their own inspection path
+# (hashing, type sniffing, YARA, QR); mining them here re-analyzed every Office
+# document's XML as though it were body text, which promoted the message to a
+# candidate and added risk for what amounts to a namespace declaration.
+_B64_MAX_CHARS = 4096
+
+# Decoded content that is markup or a container, not prose. An obfuscated link
+# arrives surrounded by text; OOXML, SVG, RTF and zip containers do not.
+_DECODED_MARKUP_RE = re.compile(
+    r"(?i)<\?xml|xmlns\s*[:=]|<w:|<office:|<svg\b|\{\\rtf|^PK\x03\x04|"
+    r"<!DOCTYPE|Content-Type:\s|<html\b")
+
+
 def decode_base64_urls(text: str) -> list[str]:
-    """Find base64-looking blobs in body text, decode them, and return any URLs
-    they contain. Inline ``data:...;base64,...`` images are excluded (they are
-    the main source of false positives)."""
+    """URLs hidden inside base64 blobs in body text.
+
+    Three things are excluded, each a measured source of false positives:
+    inline ``data:...;base64,...`` images; blobs long enough to be an encoded
+    attachment rather than an obfuscated link; and decoded content that turns
+    out to be markup, where every XML namespace would otherwise be reported as
+    a URL the sender put in the message.
+    """
     if not text:
         return []
     scrubbed = _DATA_URI_RE.sub(" ", text)
     found = []
-    for m in _B64_BLOB_RE.finditer(scrubbed):
-        blob = m.group(0)
-        if len(blob) % 4:
+    for m in _B64_WRAPPED_RE.finditer(scrubbed):
+        blob = re.sub(r"\s+", "", m.group(0))
+        if len(blob) < 24 or len(blob) > _B64_MAX_CHARS or len(blob) % 4:
             continue
         try:
-            decoded = base64.b64decode(blob, validate=True).decode("utf-8", "ignore")
+            raw = base64.b64decode(blob, validate=True)
         except ValueError:  # binascii.Error subclasses ValueError
+            continue
+        decoded = raw.decode("utf-8", "ignore")
+        if _DECODED_MARKUP_RE.search(decoded[:4096]):
             continue
         for url in extract_urls(decoded):
             if url not in found:
@@ -317,7 +347,7 @@ def extract_url_analysis(message, subject: str, body: str) -> tuple[list[str], l
         # both the href and its visible text, so a displayed-vs-actual hostname
         # mismatch (classic phishing) is surfaced.
         for href, visible in html_links(html_text):
-            if not href:
+            if not href or not is_navigable(href):
                 continue
             displayed = extract_urls(visible)
             if href not in discovered:

@@ -46,12 +46,60 @@ REDIRECT_PARAMETER_NAMES = {
 }
 
 
-def extract_urls(text: str) -> list[str]:
+# Hosts that appear in mail as machine-readable identifiers rather than as
+# links. XML namespace declarations, DTD references and schema URIs are
+# emitted by Word, Outlook and every OOXML producer; they are present in an
+# enormous share of ordinary business mail, no user ever navigates to one, and
+# counting them inflates URL totals, IOC exports and the "contains N URL(s)"
+# signal alike. Matched on the registrable domain, so subdomains are covered.
+NON_NAVIGABLE_HOSTS = frozenset({
+    "w3.org",               # xmlns, DTD references, SVG and XHTML namespaces
+    "schemas.microsoft.com",     # Office / VML / OMML namespaces
+    "schemas.openxmlformats.org",  # docx, xlsx, pptx part namespaces
+    "schemas.xmlsoap.org",  # SOAP envelopes
+    "openoffice.org",       # ODF namespaces
+    "oasis-open.org",       # ODF / DocBook namespaces
+    "purl.org",             # Dublin Core and friends
+    "ns.adobe.com",         # XMP metadata in embedded images
+    "iptc.org",             # XMP photo metadata
+    "whatwg.org",           # HTML spec references
+})
+
+
+def is_navigable(url: str) -> bool:
+    """False for schema/namespace URIs that are identifiers, not destinations.
+
+    Deliberately narrow: only hosts whose entire purpose is to name a schema.
+    A phishing link is never hosted on one of these, and a legitimate link to
+    one carries no investigative meaning either, so dropping them loses
+    nothing and removes a large and constant source of noise.
+    """
+    host = (urlparse(normalize_url(url)).hostname or "").lower().rstrip(".")
+    if not host:
+        return True
+    # Suffix match on the full hostname, not the registrable domain: the
+    # registrable domain of schemas.microsoft.com is microsoft.com, and
+    # filtering that would discard every genuine Microsoft link.
+    return not any(
+        host == h or host.endswith("." + h) for h in NON_NAVIGABLE_HOSTS
+    )
+
+
+def extract_urls(text: str, navigable_only: bool = True) -> list[str]:
+    """URLs appearing in `text`.
+
+    `navigable_only` drops schema and namespace URIs. Pass False when the
+    caller genuinely wants every URI-shaped string, such as when reporting on
+    what a document declared.
+    """
     urls = []
     for match in URL_RE.findall(text or ""):
         url = match.rstrip(".,;:!?)]}>\"'")
-        if url and url not in urls:
-            urls.append(url)
+        if not url or url in urls:
+            continue
+        if navigable_only and not is_navigable(url):
+            continue
+        urls.append(url)
     return urls
 
 

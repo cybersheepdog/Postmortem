@@ -122,8 +122,13 @@ def build_evidence_graph(records: list[EmailRecord]) -> dict[str, object]:
         for a in record.url_analysis:
             if a.get("registrable_domain"):
                 groups.setdefault(("url_domain", a["registrable_domain"]), []).append(node_id)
-        if record.sender_domain:
-            groups.setdefault(("sender_domain", record.sender_domain), []).append(node_id)
+        # Sender domain is deliberately NOT an edge. It chains every message a
+        # company ever sent into one path -- on a corpus with thousands of
+        # sender domains that is most of the graph, carrying the same
+        # "strong" weight as a shared attachment hash while saying only that
+        # two messages came from the same place. That grouping is already
+        # available from the sender column, top_flagged_domains and the entity
+        # graph, each of which shows it better.
  
     for (relation, indicator), ids in groups.items():
         ids = list(dict.fromkeys(ids))
@@ -136,15 +141,11 @@ def build_evidence_graph(records: list[EmailRecord]) -> dict[str, object]:
                 "strength": "strong",
             })
  
-    ordered = sorted(range(len(records)), key=lambda i: date_sort_key(records[i]))
-    for left, right in zip(ordered, ordered[1:]):
-        edges.append({
-            "source": f"email-{left:06d}",
-            "target": f"email-{right:06d}",
-            "relation": "temporal_sequence",
-            "indicator": "chronological order",
-            "strength": "contextual",
-        })
+    # No temporal_sequence edges. Chaining each message to the next in date
+    # order produced one edge per message -- 117,298 of them on a real corpus
+    # -- that restated the sort and could never distinguish anything: every
+    # corpus yields exactly this chain regardless of content. Chronology is
+    # the timeline's job, and the timeline does it with stages and sources.
     return {"nodes": nodes, "edges": edges}
  
  
@@ -797,7 +798,27 @@ def annotate_forensic_signals(
             if others and (
                 r.sender_domain not in {domain_of(a) for a in others}
             ):
-                r.display_name_spoof = True
+                # The test above is symmetric: two addresses sharing a display
+                # name each satisfy it, so the legitimate contact whose name
+                # was copied was being reported as an impersonator alongside
+                # the attacker. Impersonation has a direction -- one party is
+                # borrowing an identity the other already owns.
+                #
+                # The owner is the address with standing in this corpus: a
+                # frequent sender, or one on an internal domain. The borrower
+                # has neither. When no address has standing, nobody is
+                # impersonating "a known contact" and nothing fires.
+                owners = {
+                    a for a in others
+                    if a in frequent_senders or domain_of(a) in internal_domains
+                }
+                borrowing = (
+                    r.sender_email not in frequent_senders
+                    and r.sender_domain not in internal_domains
+                )
+                if owners and borrowing:
+                    r.display_name_spoof = True
+                    r.display_name_spoof_of = sorted(owners)[:3]
 
         # Header-hygiene / spoofing-alignment signals. Alignment is compared at
         # the registrable-domain level, so legitimate subdomain signing
@@ -869,6 +890,7 @@ def annotate_forensic_signals(
         # infrastructure anchors, so they get a lighter, separate boost.
         rule_hits = [kw for kw in anchors.rule_keywords if kw and kw in text]
         r.rule_target = bool(rule_hits)
+        r.rule_target_keywords = list(rule_hits)
 
         # Dangerous attachments (macros, HTML login forms, forwarded phish,
         # deceptive filenames) surfaced by offline attachment inspection.
@@ -945,7 +967,9 @@ def annotate_forensic_signals(
         if r.display_name_spoof:
             nf(f"Display name '{r.sender_name}' is used by a different address elsewhere",
                pw["display_name_spoof"], category="identity", source="header:From",
-               matched=r.sender_name)
+               matched=(f"'{r.sender_name}' normally "
+                        f"{', '.join(r.display_name_spoof_of) or 'another address'}, "
+                        f"here {r.sender_email}"))
         if r.deleted_or_moved:
             nf(f"Message was deleted/moved to a low-visibility folder ({r.hidden_folder})",
                (pw["deleted"] if r.hidden_folder in _FOLDER_DELETED else pw["moved"]),
@@ -1018,13 +1042,27 @@ def score_initial_email(record, scenario, anchors: Anchors):
 
     text = f"{record.subject}\n{scoring_text(record)}".lower()
     has_url = bool(record.urls)
-    cred_lure = any(t in text for t in _CREDENTIAL_LURES)
-    pay_lure = any(t in text for t in _PAYMENT_TERMS)
-    login_url = any(
-        (int(a.get("suspicious_score", 0) or 0) >= 10)
-        or any(h in str(a.get("path", "") or "").lower() for h in _LOGIN_PATH_HINTS)
-        for a in (record.url_analysis or [])
+
+    # Which phrases and which URL, not merely whether. A finding that cannot
+    # name its own evidence asks the analyst to take it on faith, and on a
+    # corpus this size that is the difference between a report and a list of
+    # assertions.
+    cred_hits = [t for t in _CREDENTIAL_LURES if t in text]
+    pay_hits = [t for t in _PAYMENT_TERMS if t in text]
+    cred_lure = bool(cred_hits)
+    pay_lure = bool(pay_hits)
+
+    login_url_hit = next(
+        (
+            a for a in (record.url_analysis or [])
+            if (int(a.get("suspicious_score", 0) or 0) >= 10)
+            or any(h in str(a.get("path", "") or "").lower()
+                   for h in _LOGIN_PATH_HINTS)
+        ),
+        None,
     )
+    login_url = login_url_hit is not None
+    login_url_value = str((login_url_hit or {}).get("url", "") or "")
 
     # Config-independent, attacker-controlled signals: these do not depend on
     # the sender configuring email authentication correctly, so they are the
@@ -1055,53 +1093,97 @@ def score_initial_email(record, scenario, anchors: Anchors):
 
     score = 0
     reasons = []
+    findings = []
+
+    def note(signal, points, *, category, source, matched=""):
+        """Score a reason, name it, and record what it matched on.
+
+        Mirrors `add()` in calculate_score. The initial-email path used to
+        append bare strings, so the one verdict an investigator reads most
+        closely was the one place with no evidence attached to it.
+        """
+        nonlocal score
+        score += points
+        reasons.append(signal)
+        findings.append(make_finding(
+            signal, category=category, source=source,
+            matched=matched, weight=points,
+        ))
+
+    auth_detail = ", ".join(
+        f"{k}={v}" for k, v in sorted((record.authentication_results or {}).items())
+        if isinstance(v, str) and v
+    )[:160]
 
     # Authentication by DEVIATION + corroboration, never absolute failure.
     if record.self_spoofing:
-        score += iw["self_spoofing"]
-        reasons.append("Self-spoofing: fails auth while claiming an authenticating domain")
+        note("Self-spoofing: fails auth while claiming an authenticating domain",
+             iw["self_spoofing"], category="auth", source="authentication_results",
+             matched=f"{record.sender_domain}: {auth_detail}" if auth_detail
+             else record.sender_domain)
     elif record.auth_anomaly and corroborated:
-        score += iw["auth_anomaly_corroborated"]
-        reasons.append("Auth failure deviates from sender norm, corroborated by another signal")
+        note("Auth failure deviates from sender norm, corroborated by another signal",
+             iw["auth_anomaly_corroborated"], category="auth",
+             source="authentication_results",
+             matched=f"{auth_detail} (corroborated by: {', '.join(independent)})")
     elif record.auth_anomaly:
-        score += iw["auth_anomaly"]
-        reasons.append("Auth failure deviates from sender norm (uncorroborated)")
+        note("Auth failure deviates from sender norm (uncorroborated)",
+             iw["auth_anomaly"], category="auth", source="authentication_results",
+             matched=auth_detail)
     # Chronic/misconfigured auth failure alone contributes nothing here.
 
     if record.lookalike_of:
-        score += iw["lookalike"]
-        reasons.append(f"Look-alike of {record.lookalike_of}")
+        note(f"Look-alike of {record.lookalike_of}", iw["lookalike"],
+             category="identity", source="header:From",
+             matched=f"{record.sender_domain} ~ {record.lookalike_of}")
     if record.reply_to_mismatch:
-        score += iw["reply_to_mismatch"]
-        reasons.append("Reply-To differs from sender domain")
+        note("Reply-To differs from sender domain", iw["reply_to_mismatch"],
+             category="identity", source="header:Reply-To",
+             matched=f"From {record.sender_email} -> Reply-To {record.reply_to}")
     if record.sending_ip_anomaly:
-        score += iw["sending_ip_anomaly"]
-        reasons.append("Unusual originating IP for this sender")
+        note("Unusual originating IP for this sender", iw["sending_ip_anomaly"],
+             category="identity", source="origin_ip",
+             matched=f"{record.sender_email} from {record.origin_ip}")
     if record.display_name_spoof:
-        score += iw["display_name_spoof"]
-        reasons.append("Display-name impersonation of a known contact")
+        # The whole point of the finding is the pair: the name the reader
+        # trusts, and the address actually behind it this time.
+        legit = ", ".join(record.display_name_spoof_of) or "a different address"
+        note("Display-name impersonation of a known contact",
+             iw["display_name_spoof"], category="identity", source="header:From",
+             matched=f"'{record.sender_name}' normally {legit}, "
+                     f"here {record.sender_email}")
     if record.thread_injection:
-        score += iw["thread_injection"]
-        reasons.append("Thread hijack: reply from a new domain in an existing thread")
+        note("Thread hijack: reply from a new domain in an existing thread",
+             iw["thread_injection"], category="thread", source="thread",
+             matched=f"{record.sender_domain} in thread {record.thread_id}")
     if record.deleted_or_moved:
-        score += (iw["deleted"] if record.hidden_folder in _FOLDER_DELETED else iw["moved"])
-        reasons.append(f"Concealed in a low-visibility folder ({record.hidden_folder})")
+        note(f"Concealed in a low-visibility folder ({record.hidden_folder})",
+             (iw["deleted"] if record.hidden_folder in _FOLDER_DELETED
+              else iw["moved"]),
+             category="concealment", source="mailbox_metadata",
+             matched=record.hidden_folder)
     if record.rule_target:
-        score += iw["rule_target"]
-        reasons.append("Matches a keyword the malicious mailbox rule acted on")
+        note("Matches a keyword the malicious mailbox rule acted on",
+             iw["rule_target"], category="anchor", source="investigator_anchor",
+             matched=", ".join(record.rule_target_keywords) or "(keyword)")
     if record.attachment_threat:
         # A credential-form attachment is an entry vector like a login link;
         # macros/deceptive names are weaker but still material.
-        score += iw["attachment_credential"] if attach_credential else iw["attachment_other"]
-        reasons.append(f"Dangerous attachment ({attach_notes[0]})")
+        note(f"Dangerous attachment ({attach_notes[0]})",
+             iw["attachment_credential"] if attach_credential
+             else iw["attachment_other"],
+             category="attachment", source="attachment",
+             matched=record.attachment_threat_note or attach_notes[0])
 
     if scenario == "ato":
         if cred_lure:
-            score += iw["cred_lure"]
-            reasons.append("Credential-harvest lure language")
+            note("Credential-harvest lure language", iw["cred_lure"],
+                 category="language", source="body",
+                 matched=", ".join(repr(t) for t in cred_hits[:4]))
         if has_url and (login_url or cred_lure or attach_credential):
-            score += iw["credential_link"]
-            reasons.append("Link to a credential/login page")
+            note("Link to a credential/login page", iw["credential_link"],
+                 category="url", source="body",
+                 matched=login_url_value or (record.urls[0] if record.urls else ""))
         elif has_url:
             score += iw["has_url"]
         # The compromise date is a filter (see the verdict pool), not a scorer:
@@ -1109,44 +1191,61 @@ def score_initial_email(record, scenario, anchors: Anchors):
         # that already carries a malicious signal, so it adds no points here.
         if anchors.compromise_date:
             if record.is_pre_compromise:
-                reasons.append("Received before the compromise timestamp")
+                note("Received before the compromise timestamp", 0,
+                     category="anchor", source="investigator_anchor",
+                     matched=f"{record.date} < {anchors.compromise_date}")
             else:
                 score -= iw["post_compromise_penalty"]  # attacker activity, not entry
-                reasons.append("Received after the compromise timestamp (post-compromise)")
+                note("Received after the compromise timestamp (post-compromise)", 0,
+                     category="anchor", source="investigator_anchor",
+                     matched=f"{record.date} > {anchors.compromise_date}")
     else:  # impersonation / VEC
         if pay_lure:
-            score += iw["pay_lure"]
-            reasons.append("Payment/banking instruction language")
-        if any(t in text for t in _BANK_CHANGE_TERMS):
-            score += iw["bank_change"]
-            reasons.append("Bank-detail change request")
-        if any(t in text for t in _URGENCY_TERMS):
-            score += iw["urgency"]
-            reasons.append("Urgency/secrecy pressure")
+            note("Payment/banking instruction language", iw["pay_lure"],
+                 category="language", source="body",
+                 matched=", ".join(repr(t) for t in pay_hits[:4]))
+        bank_hits = [t for t in _BANK_CHANGE_TERMS if t in text]
+        if bank_hits:
+            note("Bank-detail change request", iw["bank_change"],
+                 category="language", source="body",
+                 matched=", ".join(repr(t) for t in bank_hits[:4]))
+        urgency_hits = [t for t in _URGENCY_TERMS if t in text]
+        if urgency_hits:
+            note("Urgency/secrecy pressure", iw["urgency"],
+                 category="language", source="body",
+                 matched=", ".join(repr(t) for t in urgency_hits[:4]))
         if record.self_spoofing or record.auth_anomaly:
             score += iw["impersonation_extra"]
         if login_url:
             score += iw["impersonation_login_url"]
 
     for match in record.anchor_matches:
-        score += iw["anchor"]
-        reasons.append(f"Matches investigator anchor: {match}")
+        note(f"Matches investigator anchor: {match}", iw["anchor"],
+             category="anchor", source="investigator_anchor", matched=match)
 
     # Sender history (item 5): a long-established correspondent is unlikely to be
     # the entry point; a first-contact sender making a risky ask is more likely.
     # But never down-weight when the sender's own identity is being abused
-    # (self-spoofing, auth anomaly, or a look-alike domain) — that is the attack.
+    # (self-spoofing, auth anomaly, or a look-alike domain) - that is the attack.
     impersonating = record.self_spoofing or record.auth_anomaly or record.lookalike_of
     if (record.sender_established and not record.anchor_matches
             and not impersonating and score > 0):
-        score -= min(score, iw["established_downweight"])
+        removed = min(score, iw["established_downweight"])
+        score -= removed
         reasons.append("Established long-term correspondent (down-weighted)")
+        findings.append(make_finding(
+            "Established long-term correspondent (down-weighted)",
+            category="sender", source="corpus:sender_history",
+            matched=f"{record.sender_email} (-{removed})", weight=-removed))
     elif record.sender_first_contact and (cred_lure or pay_lure):
-        score += iw["first_contact_ask"]
-        reasons.append("First-contact sender making a credential/payment request")
+        note("First-contact sender making a credential/payment request",
+             iw["first_contact_ask"], category="sender",
+             source="corpus:sender_history",
+             matched=f"{record.sender_email}, first seen in this message")
 
     record.scenario_score = max(0, score)
     record.scenario_reasons = list(dict.fromkeys(reasons))
+    record.scenario_findings = _dedupe_provenance(findings)
     return record.scenario_score
 
 
@@ -1246,6 +1345,10 @@ def anchored_initial_email_verdict(records, scenario, anchors: Anchors, scenario
             "priority_score": r.score,
             "stage": classify_attack_stage(r),
             "reasons": r.scenario_reasons,
+            # Same reasons, each with the value it matched on. `reasons` stays
+            # for anything already reading it; `findings` is what a reader who
+            # wants to check the conclusion needs.
+            "findings": list(r.scenario_findings or []),
             "anchor_matches": r.anchor_matches,
         }
 

@@ -102,6 +102,10 @@ def annotate_records(records, checker, threshold_days, tiers=(1, 2)):
     from postmortem.utils import registered_domain_approx
 
     flagged = 0
+    # domain -> (age_days, messages) so the caller can name what it found.
+    # Reporting a bare count told an analyst that something was there without
+    # telling them what, which is the one thing the finding exists to say.
+    hits = {}
     seen = {}
     for r in records:
         if r.tier not in tiers or not r.sender_domain:
@@ -129,4 +133,9 @@ def annotate_records(records, checker, threshold_days, tiers=(1, 2)):
             r.score += 8
             r.tier = 1
             flagged += 1
+            prior = hits.get(dom)
+            hits[dom] = (days if prior is None else min(prior[0], days),
+                         (prior[1] if prior else 0) + 1)
+    annotate_records.last_hits = dict(
+        sorted(hits.items(), key=lambda kv: kv[1][0]))
     return flagged

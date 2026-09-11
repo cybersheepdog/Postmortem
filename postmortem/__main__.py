@@ -1653,10 +1653,20 @@ def main():
             records,
             threshold=args.campaign_threshold,
         )
+    _reportable = [c for c in campaigns if getattr(c, "reportable", True)]
+    _suppressed = getattr(build_campaign_clusters, "last_suppressed", 0)
     print(
-        f"Identified {len(campaigns)} "
-        f"multi-message campaign(s)."
+        f"Identified {len(_reportable)} reportable campaign(s) "
+        f"of {len(campaigns)} cluster(s)."
     )
+    if _suppressed:
+        # Never silently: a suppressed cluster is a judgement call, and the
+        # analyst is told how many were made so they can widen if they want.
+        print(
+            f"  {_suppressed} low-confidence cluster(s) not listed "
+            f"(no shared URL domain or attachment hash). "
+            f"Full set is in the JSON report."
+        )
 
     # ------------------------------------------------------------------
     # Scenario / anchor analysis: identify the initial malicious email
@@ -1712,8 +1722,14 @@ def main():
             checker = DomainAgeChecker(
                 cache_path=scan_root / ".postmortem_domain_cache.json")
             n = annotate_records(records, checker, args.check_domain_age)
-        print(f"Domain-age (RDAP): {n} newly-registered sender domain(s) "
-              f"(< {args.check_domain_age}d)")
+        hits = getattr(annotate_records, "last_hits", {}) or {}
+        # `n` counts flagged *messages*; the domain count is what the label
+        # claimed to be reporting. Both are stated, and the domains named.
+        print(f"Domain-age (RDAP): {len(hits)} newly-registered sender "
+              f"domain(s) across {n} message(s) (< {args.check_domain_age}d)")
+        for dom, (days, msgs) in hits.items():
+            print(f"    {dom}  registered {days}d before first contact "
+                  f"({msgs} message(s))")
         enriched = enriched or bool(n)
     # YARA and QR share one decode of each suspect's attachments, so running
     # both costs one sweep rather than two. Either can be enabled alone.

@@ -288,8 +288,10 @@ def build_campaign_clusters(
     """
  
     if not records:
+        build_campaign_clusters.last_suppressed = 0
         return []
- 
+
+    suppressed = 0
     count = len(records)
  
     parent = list(range(count))
@@ -558,7 +560,18 @@ def build_campaign_clusters(
             ),
             confidence=confidence,
         )
- 
+
+        # Two independent bars, both of which a genuine campaign clears
+        # easily. Confidence must be better than "low", and the cluster must
+        # share a *strong* indicator -- a URL domain or an attachment hash --
+        # rather than resting on sender similarity alone.
+        campaign.reportable = bool(
+            confidence != "low"
+            and (url_domains or attachment_sha256)
+        )
+        if not campaign.reportable:
+            suppressed += 1
+
         campaigns.append(
             campaign
         )
@@ -601,6 +614,7 @@ def build_campaign_clusters(
                 strongest
             )
  
+    build_campaign_clusters.last_suppressed = suppressed
     return sorted(
         campaigns,
         key=lambda c: (
