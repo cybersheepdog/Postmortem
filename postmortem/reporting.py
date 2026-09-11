@@ -915,6 +915,93 @@ def print_mes_manifest(mes: dict):
             print(f"        {n}")
 
 
+
+def print_directory(dir_summary: dict):
+    """Tenant facts, and configuration nothing accounts for.
+
+    Two different things share this section because they come from the same
+    export and answer adjacent questions: who really works here (which
+    replaces two inferences the scorer would otherwise make), and what the
+    mailbox is configured to do that the audit log never saw being set up.
+    """
+    d = dir_summary or {}
+    if not d.get("available"):
+        return
+    print()
+    _hdr("TENANT DIRECTORY AND MAILBOX CONFIGURATION")
+
+    info = d.get("directory") or {}
+    if info.get("users"):
+        print(f"  Directory accounts:      {info['users']} "
+              f"({info.get('enabled', 0)} enabled)")
+        print(f"  Addresses indexed:       {info.get('addresses_indexed', 0)} "
+              f"across {info.get('distinct_names', 0)} distinct display name(s)")
+        doms = info.get("accepted_domains") or []
+        if doms:
+            print(f"  Tenant domains:          {', '.join(doms[:8])}"
+                  + (f"  (+{len(doms) - 8} more)" if len(doms) > 8 else ""))
+            print("  " + _wrap_indent(
+                "These replace the internal domains inferred from traffic. A "
+                "colleague who rarely emails this mailbox is now internal by "
+                "fact rather than external by omission.", 2))
+
+    drift = d.get("drift") or {}
+    if not drift.get("available"):
+        return
+
+    print()
+    print(f"  Inbox rules seen:        {drift.get('rules_seen', 0)}"
+          f"    delegations: {drift.get('permissions_seen', 0)}"
+          f"    transport rules: {drift.get('transport_rules_seen', 0)}")
+
+    unexplained = drift.get("unexplained_rules") or []
+    transport = drift.get("unexplained_transport_rules") or []
+    delegations = [x for x in (drift.get("delegations") or []) if x["external"]]
+
+    if not (unexplained or transport or delegations):
+        print()
+        print("  Nothing in the current configuration is unaccounted for.")
+        return
+
+    total = len(unexplained) + len(transport) + len(delegations)
+    print()
+    print(term.c(f"  {total} configuration item(s) exist now but were never "
+                 "recorded being created:", "yellow", "bold"))
+
+    for rule in unexplained:
+        print()
+        label = f"  RULE      {rule['name']}"
+        if rule.get("mailbox"):
+            label += f"  [{rule['mailbox']}]"
+        print(term.c(label, "red" if rule.get("external_forwards") else "yellow"))
+        if rule.get("external_forwards"):
+            print(term.c("      forwards outside the tenant: "
+                         + ", ".join(rule["external_forwards"]), "red"))
+        elif rule.get("forwards"):
+            print("      forwards to " + ", ".join(rule["forwards"]))
+        if rule.get("move_to"):
+            print(f"      moves to '{rule['move_to']}'")
+        if rule.get("delete"):
+            print("      deletes matching mail")
+        if rule.get("keywords"):
+            print("      keywords: " + ", ".join(rule["keywords"][:8]))
+
+    for t in transport:
+        print()
+        print(term.c(f"  TRANSPORT {t['name']}  (tenant-wide)", "red"))
+        if t.get("redirects_to"):
+            print(term.c("      redirects/copies to: "
+                         + ", ".join(t["redirects_to"]), "red"))
+
+    for dele in delegations:
+        print()
+        print(term.c(f"  DELEGATE  {dele['trustee']} -> {dele['mailbox']}", "red"))
+        print(f"      rights: {dele['rights']}")
+
+    print()
+    print("  " + _wrap_indent(drift.get("note", ""), 2))
+
+
 def print_summary(
     records: list[EmailRecord],
     timeline: list[AttackTimelineEvent],
@@ -1540,7 +1627,8 @@ def _command_line() -> str:
 def build_run_manifest(args, records, scenario, anchors, initial_verdict,
                        campaigns, iocs, generated_utc, elapsed_seconds,
                        phase_timings=None, host=None, entry_point_window=None,
-                       audit_summary=None, completeness=None):
+                       audit_summary=None, completeness=None,
+                       signin_summary=None, mes_bundle=None):
     """Reproducibility / chain-of-custody metadata recorded in every report."""
     digest, basis = corpus_fingerprint(records)
     tier_counts = Counter(r.tier for r in records)
@@ -1562,6 +1650,12 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
         # gaps belong in the chain-of-custody record alongside the corpus
         # hash -- otherwise a reader cannot tell what the run could not see.
         "audit_log": _audit_provenance(args, audit_summary),
+        # The same argument as the audit log, for the identity-side
+        # evidence: a conclusion about whether the attacker still has
+        # access is bounded by which of these were actually collected,
+        # and a reader cannot tell that from the findings alone.
+        "evidence_sources": _evidence_provenance(
+            args, signin_summary, mes_bundle),
         # A completeness statement about the evidence, recorded beside the
         # corpus hash. The hash says what was analysed; this says what was
         # missing from it and could not be.
@@ -1631,6 +1725,46 @@ def _completeness_block(c):
         # tell exactly which items this analysis never saw.
         "absent_items": c.get("absent", []),
     }
+
+
+
+def _evidence_provenance(args, signin_summary, mes_bundle):
+    """Which identity-side sources were supplied, and what each contained.
+
+    Recorded whether or not they were supplied: "no OAuth grant export" is a
+    fact about the investigation that a later reader needs, and its absence
+    from the manifest would read as if the question had been answered.
+    """
+    out = {
+        "signin_logs": {
+            "supplied": bool(signin_summary),
+            "path": str(getattr(args, "signin_logs", "") or ""),
+        },
+        "collection": {
+            "path": str(getattr(args, "mes_dir", "") or ""),
+            "supplied": bool(mes_bundle),
+        },
+    }
+    if signin_summary:
+        cov = dict(signin_summary.get("coverage") or {})
+        out["signin_logs"].update({
+            "records": signin_summary.get("records", 0),
+            "coverage": cov,
+            "device_code_records": signin_summary.get("device_code_records", 0),
+            "attacker_ips_contributed": signin_summary.get("attacker_ips", []),
+            "earliest_token": signin_summary.get("earliest_token", ""),
+            "warnings": signin_summary.get("warnings", []),
+        })
+    if mes_bundle:
+        out["collection"].update({
+            "files_seen": mes_bundle.get("files_seen", 0),
+            "sources": [
+                {k: m[k] for k in ("kind", "files", "rows", "consumed")}
+                for m in (mes_bundle.get("manifest") or [])
+            ],
+            "unrecognised": mes_bundle.get("unrecognised_count", 0),
+        })
+    return out
 
 
 def _audit_provenance(args, audit_summary):
@@ -1944,10 +2078,11 @@ def generate_html_interactive(records, campaigns, output, timeline, precursor_ve
         return dt or datetime.max.replace(tzinfo=timezone.utc)
 
     sub_events = sorted(
-        # Audit events carry no message path, so the record filter would drop
-        # all of them; they are always kept.
+        # Recorded-fact events carry no message path, so the record filter
+        # would drop all of them; they are always kept.
         (e for e in timeline
-         if getattr(e, "source", "message") == "audit" or e.path in keep_paths),
+         if getattr(e, "source", "message") in ("audit", "persistence")
+         or e.path in keep_paths),
         key=event_sort_key,
     )
 
@@ -1978,7 +2113,7 @@ h1{margin:0 0 6px;font-size:28px}h2{margin:28px 0 12px;font-size:20px}.muted{col
 .top{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.badge{border-radius:999px;padding:3px 8px;background:#eef2f6;font-size:10px;font-weight:700}.precursor{background:#fee4e2;color:var(--danger)}.meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px}.pivots{display:flex;gap:6px;flex-wrap:wrap;margin:9px 0}.small{font-size:12px}
 .inspect{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px;margin-top:12px}.inspect section{border:1px solid #eaecf0;border-radius:9px;padding:10px}.evidence{border:1px solid #eaecf0;border-radius:8px;padding:9px;margin:7px 0;overflow-wrap:anywhere}.evidence code{font-size:11px}.indicator{margin:0;padding-left:18px;font-size:12px}.risk{font-size:11px;font-weight:700;color:var(--warn)}.auth-bad{color:var(--danger);font-weight:700}.auth-ok{color:#027a48}
 .graph{display:grid;gap:7px}.edge{display:grid;grid-template-columns:1fr auto 1fr 2fr;gap:8px;align-items:center;background:#fff;border:1px solid var(--line);border-radius:8px;padding:9px;font:11px ui-monospace,monospace}.edge.strong{border-left:4px solid var(--warn)}.edge.contextual{border-left:4px solid #98a2b3}.edge-label{color:var(--muted)}
-.table-wrap{overflow:auto;background:#fff;border:1px solid var(--line);border-radius:12px}table{border-collapse:collapse;width:100%;min-width:1250px}th,td{padding:9px;border-bottom:1px solid #eaecf0;text-align:left;vertical-align:top}th{background:#17212b;color:#fff;position:sticky;top:57px}pre{white-space:pre-wrap;max-width:500px}.empty{text-align:center;padding:28px;color:var(--muted)}
+.table-wrap{overflow:auto;background:#fff;border:1px solid var(--line);border-radius:12px}table{border-collapse:collapse;width:100%;min-width:1250px}th,td{padding:9px;border-bottom:1px solid #eaecf0;text-align:left;vertical-align:top}th{background:#17212b;color:#fff;position:sticky;top:57px}pre{white-space:pre-wrap;max-width:500px}.empty{text-align:center;padding:28px;color:var(--muted)}.remed{background:#fff;border:1px solid var(--line);border-left:4px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0;font-size:13px;line-height:1.5}.remed.hit{border-left-color:#d13438}.remed code{display:block;background:#f6f8fa;border-radius:4px;padding:6px 8px;margin-top:6px;font:11px ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}.remed .warn{color:#d13438;display:block;margin-top:6px}
 th.sortable{cursor:pointer;user-select:none}th.sortable::after{content:" \2195";opacity:.45;font-size:10px}details>summary{cursor:pointer;color:var(--muted)}#execSummary li{margin:2px 0}#execSummary .badge{margin:2px 3px 0 0;display:inline-block}
 #network svg{width:100%;height:520px;display:block}#network .nlabel{font:10px system-ui,sans-serif;fill:#334;pointer-events:none}#network circle{cursor:pointer;stroke:#fff;stroke-width:1.5}#network line{stroke:#c4ccd6}#netLegend .badge{margin-right:8px}
 @media(max-width:800px){.wrap{padding:14px}#search{min-width:180px}.edge{grid-template-columns:1fr}}
@@ -1988,6 +2123,7 @@ th.sortable{cursor:pointer;user-select:none}th.sortable::after{content:" \2195";
 <h2>Executive Summary</h2><div id="execSummary" class="panel"></div>
 <div class="controls"><input id="search" placeholder="Search sender, subject, campaign, URL, SHA-256, or file..." oninput="render()"><select id="stage" onchange="render()"><option value="">All stages</option><option>initial_contact</option><option>social_engineering</option><option>suspicious_link</option><option>credential_harvest</option><option>attachment_delivery</option><option>delivery_or_credential_harvest</option><option>payment_request</option></select><label><input id="onlyPrecursor" type="checkbox" onchange="render()"> Precursors only</label><button onclick="clearFilters()">Clear</button></div>
 <h2>Initial Compromise (scenario-anchored)</h2><div id="initial" class="verdict"></div>
+<h2>Remediation Required</h2><div id="remediation" class="verdict"></div>
 <h2>Attack Narrative (reconstructed)</h2><div id="narrative" class="verdict"></div>
 <h2>Earliest Malicious Precursor</h2><div id="verdict" class="verdict"></div>
 <h2>Attack Timeline</h2><div id="timeline" class="timeline"></div>
@@ -2007,13 +2143,14 @@ const DATA=__DATA__;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const js=s=>JSON.stringify(String(s??''));
 function rec(path){return DATA.records.find(r=>r.path===path)||{path};}
-function render(){dashboard();execSummary();initialPanel();narrativePanel();verdict();timeline();graph();networkGraph();topDomains();campaigns();candidates();toggleEdges();}
+function render(){dashboard();execSummary();initialPanel();remediationPanel();narrativePanel();verdict();timeline();graph();networkGraph();topDomains();campaigns();candidates();toggleEdges();}
 function topDomains(){const el=document.getElementById('topDomains');if(!el)return;const rows=DATA.top_domains||[];if(!rows.length){el.innerHTML='<div class="empty">No flagged domains.</div>';return;}el.innerHTML=`<table><thead><tr><th class="sortable">Domain</th><th class="sortable">Messages</th><th class="sortable">Highest tier</th><th class="sortable">Total score</th><th>Senders</th></tr></thead><tbody>${rows.map(r=>`<tr><td data-pivot="${esc(r.domain)}" style="cursor:pointer"><b>${esc(r.domain)}</b></td><td data-sort-value="${r.messages}">${r.messages}</td><td data-sort-value="${r.highest_tier}"><span class="badge${r.highest_tier===1?' precursor':''}">T${r.highest_tier}</span></td><td data-sort-value="${r.total_score}">${r.total_score}</td><td class="small">${(r.senders||[]).map(esc).join(', ')}${r.sender_count>(r.senders||[]).length?` (+${r.sender_count-(r.senders||[]).length})`:''}</td></tr>`).join('')}</tbody></table>`;el.querySelectorAll('td[data-pivot]').forEach(c=>c.addEventListener('click',()=>pivot(c.getAttribute('data-pivot'))));makeSortable(el.querySelector('table'));}
 const NET_COLORS={sender:'#175cd3',domain:'#b54708',hash:'#6941c6',campaign:'#027a48',asn:'#b42318',country:'#475467'};
 function networkGraph(){const el=document.getElementById('network');if(!el)return;const g=DATA.network||{nodes:[],links:[]};const nodes=(g.nodes||[]).map(n=>Object.assign({},n));const rawlinks=g.links||[];if(!nodes.length){el.innerHTML='<div class="empty">No entity relationships to graph.</div>';document.getElementById('netLegend').innerHTML='';return;}const W=1100,H=520,idx={};nodes.forEach((n,i)=>{idx[n.id]=i;const a=2*Math.PI*i/nodes.length;n.x=W/2+Math.cos(a)*Math.min(W,H)*0.35;n.y=H/2+Math.sin(a)*Math.min(W,H)*0.35;});const L=rawlinks.map(e=>({s:idx[e.source],t:idx[e.target]})).filter(e=>e.s!=null&&e.t!=null);const k=Math.sqrt((W*H)/nodes.length)*0.5;let temp=W/8;for(let it=0;it<200;it++){for(const n of nodes){n.dx=0;n.dy=0;}for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){let dx=nodes[i].x-nodes[j].x,dy=nodes[i].y-nodes[j].y,d=Math.hypot(dx,dy)||0.01;const f=k*k/d,ux=dx/d,uy=dy/d;nodes[i].dx+=ux*f;nodes[i].dy+=uy*f;nodes[j].dx-=ux*f;nodes[j].dy-=uy*f;}for(const e of L){let dx=nodes[e.s].x-nodes[e.t].x,dy=nodes[e.s].y-nodes[e.t].y,d=Math.hypot(dx,dy)||0.01;const f=d*d/k,ux=dx/d,uy=dy/d;nodes[e.s].dx-=ux*f;nodes[e.s].dy-=uy*f;nodes[e.t].dx+=ux*f;nodes[e.t].dy+=uy*f;}for(const n of nodes){let d=Math.hypot(n.dx,n.dy)||0.01;n.x+=(n.dx/d)*Math.min(d,temp);n.y+=(n.dy/d)*Math.min(d,temp);n.x-=(n.x-W/2)*0.012;n.y-=(n.y-H/2)*0.012;n.x=Math.max(18,Math.min(W-18,n.x));n.y=Math.max(18,Math.min(H-18,n.y));}temp*=0.97;}const maxw=Math.max(1,...nodes.map(n=>n.weight||1));const out=[`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">`];for(const e of L){out.push(`<line x1="${nodes[e.s].x.toFixed(1)}" y1="${nodes[e.s].y.toFixed(1)}" x2="${nodes[e.t].x.toFixed(1)}" y2="${nodes[e.t].y.toFixed(1)}"/>`);}for(const n of nodes){const r=4+6*Math.sqrt((n.weight||1)/maxw),c=NET_COLORS[n.type]||'#98a2b3';out.push(`<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${c}" data-pivot="${esc(n.label)}"><title>${esc(n.type)}: ${esc(n.label)} (${n.weight})</title></circle>`);if((n.weight||1)>=2||nodes.length<=40)out.push(`<text class="nlabel" x="${(n.x+r+2).toFixed(1)}" y="${(n.y+3).toFixed(1)}">${esc(String(n.label).slice(0,28))}</text>`);}out.push('</svg>');el.innerHTML=out.join('');el.querySelectorAll('circle[data-pivot]').forEach(c=>c.addEventListener('click',()=>pivot(c.getAttribute('data-pivot'))));const types=[...new Set(nodes.map(n=>n.type))];document.getElementById('netLegend').innerHTML=types.map(t=>`<span class="badge" style="background:${NET_COLORS[t]||'#98a2b3'};color:#fff">${esc(t)}</span>`).join('');}
 function execSummary(){const R=DATA.records||[],total=DATA.total_records||R.length;const t1=R.filter(r=>r.tier===1).length,t2=R.filter(r=>r.tier===2).length;const iv=DATA.initial||{},pv=DATA.precursor||{};const mc={},mn={};R.forEach(r=>(r.mitre||[]).forEach(t=>{mc[t.id]=(mc[t.id]||0)+1;mn[t.id]=t.name;}));const mids=Object.keys(mc).sort((a,b)=>mc[b]-mc[a]);const camps=(DATA.campaigns||[]).slice().sort((a,b)=>b.campaign_score-a.campaign_score).slice(0,3);const top=R.slice().sort((a,b)=>(a.tier-b.tier)||(b.score-a.score)).filter(r=>r.tier<=2).slice(0,5);let body=`<p><b>${total}</b> message(s) analyzed — <b>${t1}</b> Tier-1 prime suspect(s), <b>${t2}</b> Tier-2. Scenario profile: <b>${esc(iv.scenario||'n/a')}</b>.</p>`;if(iv.initial_email){const e=iv.initial_email;body+=`<p><b>Likely initial email:</b> <button class="small" onclick="focusPath(${js(e.path)})">${esc(e.subject||'(no subject)')}</button> — ${esc(e.sender||'')} (${esc(e.timestamp||'')}), confidence ${esc(iv.confidence||'low')}.</p>`;}else if(pv.verdict){body+=`<p><b>Earliest precursor:</b> ${esc(pv.verdict)} (confidence ${esc(pv.confidence||'low')}).</p>`;}if(top.length){body+=`<b>Highest-risk messages</b><ul class="indicator">${top.map(r=>`<li><button class="small" onclick="focusPath(${js(r.path)})">[T${r.tier} · score ${r.score}] ${esc(r.sender)} — ${esc(r.subject||'(no subject)')}</button></li>`).join('')}</ul>`;}if(camps.length){body+=`<b>Top campaigns</b><ul class="indicator">${camps.map(c=>`<li>${esc(c.campaign_id)} — ${c.message_count} msg(s), score ${c.campaign_score}${(c.sender_domains||[]).length?' · '+esc((c.sender_domains||[]).slice(0,3).join(', ')):''}</li>`).join('')}</ul>`;}if(mids.length){body+=`<b>ATT&CK techniques observed</b><div class="top" style="margin-top:6px">${mids.map(id=>`<span class="badge" title="${esc(mn[id])}">${esc(id)} ${esc(mn[id])} ×${mc[id]}</span>`).join('')}</div>`;}document.getElementById('execSummary').innerHTML=body;}
 function makeSortable(table){if(!table||!table.tHead)return;const ths=table.tHead.rows[0].cells;[...ths].forEach((th,idx)=>{if(!th.classList.contains('sortable'))return;th.onclick=()=>{const tb=table.tBodies[0];if(!tb)return;const rows=[...tb.rows];const dir=th.dataset.dir==='asc'?'desc':'asc';th.dataset.dir=dir;const val=tr=>{const c=tr.cells[idx];const dv=c&&c.dataset?c.dataset.sortValue:null;const t=dv!=null?dv:(c?c.textContent:'');return{n:parseFloat(t),t:String(t)};};rows.sort((a,b)=>{const A=val(a),B=val(b);let r=(!isNaN(A.n)&&!isNaN(B.n))?A.n-B.n:A.t.localeCompare(B.t);return dir==='asc'?r:-r;});rows.forEach(r=>tb.appendChild(r));};});}
 function narrativePanel(){const n=(DATA.initial||{}).attack_narrative||{};const el=document.getElementById('narrative');if(!el)return;if(!(n.phases||[]).length){el.innerHTML='<span class="muted">No narrative reconstructed.</span>';return;}let body=`<p>${esc(n.summary||'')}</p>`;body+=(n.phases||[]).map((p,i)=>`<div class="event"><div class="card"><div class="top"><span class="badge">Phase ${i+1}</span><b>${esc(p.title||'')}</b>${p.timestamp?`<span class="badge">${esc(p.timestamp)}</span>`:''}<span class="badge">confidence ${esc(p.confidence||'low')}</span></div><p class="small">${esc(p.description||'')}</p>${(p.messages||[]).map(m=>`<div class="small"><button class="small" onclick="focusPath(${js(m.path)})">${esc(m.timestamp||'')} · ${esc(m.sender||'')} · ${esc(m.subject||'(no subject)')}</button></div>`).join('')}</div></div>`).join('');if((n.timeline||[]).length){body+=`<b>Chronological key events (UTC)</b><div class="graph">${(n.timeline||[]).map(e=>`<div class="edge contextual"><span>${esc(e.timestamp_utc||'')}</span><span class="edge-label">${esc(e.phase||'')}</span><span>${esc(e.subject||'')}</span></div>`).join('')}</div>`;}body+=`<p class="small muted">Note: ${esc(n.disclaimer||'')}</p>`;el.innerHTML=body;}
+function remediationPanel(){const el=document.getElementById('remediation');if(!el)return;const v=DATA.initial||{};const acts=v.remediation||[];const p=v.persistence||{};if(!acts.length){const w=(p.warnings||[]);el.innerHTML=w.length?`<div class="verdict-title">NOT ASSESSED</div>`+w.map(x=>`<p class="small">${esc(x)}</p>`).join(''):'<div class="empty">No persistence mechanism was identified. '+'Supply --mes-dir to assess whether the attacker retains access: an '+'OAuth consent grant leaves no trace in mail or sign-in data.</div>';return;}const both=acts.filter(a=>a.survives_password_reset==='survives'&&a.survives_token_revocation==='survives').length;let body=`<div class="verdict-title">${acts.length} ACTION(S) REQUIRED`+(both?` \u00b7 ${both} NOT fixed by a password reset or token revocation`:'')+`</div>`;body+='<p class="small muted">Ordered by what survives the response most '+'clients have already made.</p>';body+=acts.map(a=>`<div class="remed ${a.by_attacker?'hit':''}">`+`<b>${a.priority}. ${esc(String(a.kind).replace(/_/g,' '))}:</b> ${esc(a.target||'')}`+(a.when?`<br><span class="small muted">${esc(a.when)}`+(a.attribution?` \u2014 ${esc(a.attribution)}`:'')+`</span>`:'')+(a.detail?`<br><span class="small">${esc(a.detail)}</span>`:'')+(a.grants?`<br><span class="small">${esc(a.grants)}</span>`:'')+`<br><code class="small">${esc(a.action||'')}</code>`+(a.not_fixed_by?`<span class="warn small">${esc(a.not_fixed_by)}</span>`:'')+`</div>`).join('');el.innerHTML=body;}
 function initialPanel(){const v=DATA.initial||{};const e=v.initial_email;const el=document.getElementById('initial');if(!el)return;let body=`<div class="verdict-title">${esc(v.verdict||'NO INITIAL EMAIL IDENTIFIED')} · ${esc(v.scenario||'')} · confidence ${esc(v.confidence||'low')}</div><p class="small muted">${esc(v.scenario_reason||'')}</p>`;if(e){body+=`<p><b>Initial email:</b> <button class="small" onclick="focusPath(${js(e.path)})">${esc(e.subject||'(no subject)')}</button><br><b>Timestamp:</b> ${esc(e.timestamp||'')}<br><b>Sender:</b> ${esc(e.sender||'')}<br><b>Stage:</b> ${esc(e.stage||'')}<br><b>Initial-email score:</b> ${Number(e.initial_score||0)} (priority ${Number(e.priority_score||0)})</p>`;if((e.anchor_matches||[]).length)body+=`<p class="risk">Anchor matches: ${(e.anchor_matches||[]).map(esc).join(', ')}</p>`;const FV={};(e.findings||[]).forEach(f=>{FV[f.signal]=f;});body+=`<b>Why</b><ul class="indicator">${(e.reasons||[]).map(x=>{const f=FV[x]||{};const ev=f.matched?`<div class="small muted">evidence: <code>${esc(String(f.matched))}</code>${f.source?` &middot; ${esc(f.source)}`:''}${f.weight?` &middot; ${f.weight>0?'+':''}${f.weight}`:''}</div>`:'';return `<li>${esc(x)}${ev}</li>`;}).join('')||'<li>&mdash;</li>'}</ul>`;}body+=`<b>Ranked candidates</b>${(v.shortlist||[]).map(x=>`<div class="small"><button class="small" onclick="focusPath(${js(x.path)})">[${Number(x.initial_score||0)}] ${esc(x.timestamp||'')} · ${esc(x.sender||'')} · ${esc(x.subject||'(no subject)')}</button></div>`).join('')||'<span class="muted">None</span>'}`;el.innerHTML=body;}
 function dashboard(){const t1=DATA.records.filter(r=>r.tier===1).length;document.getElementById('dashboard').innerHTML=[['Emails shown',(DATA.shown_records||DATA.records.length)+' / '+(DATA.total_records||DATA.records.length)],['Tier 1 prime suspects',t1],['Campaigns',DATA.campaigns.length],['Timeline events',DATA.events.length],['Precursor confidence',DATA.precursor.confidence||'low']].map(x=>`<div class="metric"><div class="metric-label">${esc(x[0])}</div><div class="metric-value">${esc(x[1])}</div></div>`).join('');}
 function verdict(){const p=DATA.precursor||{};document.getElementById('verdict').innerHTML=`<div class="verdict-title">${esc(p.verdict||'UNKNOWN')} · confidence ${esc(p.confidence||'low')}</div><p><b>Message:</b> <button class="small" onclick="focusPath(${js(p.message_path)})">${esc(p.message_path||'None identified')}</button><br><b>Timestamp:</b> ${esc(p.timestamp||'')}<br><b>Stage:</b> ${esc(p.stage||'')}<br><b>Reason:</b> ${esc(p.reason||'')}</p><b>Evidence</b><ul class="indicator">${(p.evidence||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>No explicit evidence.</li>'}</ul><b>Supporting later activity</b>${(p.follow_on_messages||[]).map(x=>`<button class="small" onclick="focusPath(${js(x.path)})">${esc(x.timestamp)} · ${esc(x.stage)} · ${esc(x.subject||'(no subject)')}</button> `).join('')||'<span class="muted"> None</span>'}`;}

@@ -735,6 +735,7 @@ def annotate_forensic_signals(
     records, internal_domains, frequent_domains, lookalike_map,
     sender_ip_counts, frequent_senders, anchors, baselines, victim_domains,
     victim_address, thread_participants, contact_names, allowlist=None,
+    directory=None,
 ):
     """Wire the parsed-but-unused signals (auth, Reply-To, look-alike domain,
     sending-IP anomaly) into the record's indicators/score, and record which
@@ -836,6 +837,19 @@ def annotate_forensic_signals(
                 if owners and borrowing:
                     r.display_name_spoof = True
                     r.display_name_spoof_of = sorted(owners)[:3]
+
+        # The corpus can only say a display name resembles someone who
+        # sends here often. A directory export says whose name it is,
+        # what their address actually is, and that this message did not
+        # come from it -- which is the correct-versus-observed evidence
+        # the finding needs in order to be checkable by a reader.
+        if directory:
+            _imp = directory.impersonation_of(r.sender_name, r.sender_email)
+            if _imp:
+                r.display_name_spoof = True
+                r.directory_impersonation = _imp
+                if _imp["real_address"]:
+                    r.display_name_spoof_of = [_imp["real_address"]]
 
         # Header-hygiene / spoofing-alignment signals. Alignment is compared at
         # the registrable-domain level, so legitimate subdomain signing
@@ -1164,7 +1178,16 @@ def score_initial_email(record, scenario, anchors: Anchors):
     if record.display_name_spoof:
         # The whole point of the finding is the pair: the name the reader
         # trusts, and the address actually behind it this time.
-        legit = ", ".join(record.display_name_spoof_of) or "a different address"
+        _di = getattr(record, "directory_impersonation", None) or {}
+        if _di.get("real_address"):
+            # Directory-backed: name the person, their real address and
+            # the address this actually came from, so a reader can check
+            # the finding instead of taking it on trust.
+            legit = _di["real_address"]
+            if _di.get("title"):
+                legit += " (%s)" % _di["title"]
+        else:
+            legit = ", ".join(record.display_name_spoof_of) or "a different address"
         note("Display-name impersonation of a known contact",
              iw["display_name_spoof"], category="identity", source="header:From",
              matched=f"'{record.sender_name}' normally {legit}, "
@@ -1696,7 +1719,7 @@ def signin_lure_window(records, signin_summary, window_minutes=20):
 
 # E4 ------------------------------------------------------------------------
 
-def exposure_scope(records, audit_summary):
+def exposure_scope(records, audit_summary, audit_coverage=None):
     """Which messages an attacker session actually read.
 
     Microsoft added MailItemsAccessed specifically to scope a post-compromise
@@ -1720,13 +1743,48 @@ def exposure_scope(records, audit_summary):
     # reported "no message was accessed", which is the precise false negative
     # this function exists to prevent.
     if not has_operation:
+        # Two very different situations hide inside that absence, and a
+        # mailbox audit-status export tells them apart: auditing was off,
+        # so nothing could have been recorded; or auditing was on and
+        # recording reads, in which case the silence means something.
+        # Without the export the honest answer stays UNKNOWN.
+        cov = audit_coverage or {}
+        if cov.get("mailbox_matched"):
+            if not cov.get("audit_enabled"):
+                return {
+                    "available": False, "audit_status_known": True,
+                    "reason": ("Mailbox auditing was DISABLED for this "
+                               "mailbox, so no read activity could have "
+                               "been recorded whatever the licensing. The "
+                               "exposure scope cannot be established from "
+                               "the audit log at all."),
+                }
+            if not cov.get("records_mail_access"):
+                return {
+                    "available": False, "audit_status_known": True,
+                    "reason": ("Mailbox auditing was enabled but "
+                               "MailItemsAccessed is not in the audited "
+                               "action set for this mailbox, so reads were "
+                               "never going to be recorded."),
+                }
+            return {
+                "available": False, "audit_status_known": True,
+                "meaningful_silence": True,
+                "reason": ("Mailbox auditing was ENABLED and "
+                           "MailItemsAccessed is in the audited action set, "
+                           "yet no read event appears in this export. The "
+                           "absence is therefore evidence rather than a "
+                           "licensing gap -- within the window and scope "
+                           "this export covers, no message was read."),
+            }
         return {
-            "available": False,
+            "available": False, "audit_status_known": False,
             "reason": ("MailItemsAccessed does not appear in this export. It "
                        "requires E5/G5 or Microsoft 365 E5 Compliance "
                        "licensing; without it the mailbox may still have been "
                        "read and the log simply would not record it. Treat "
-                       "the exposure scope as UNKNOWN, not as none."),
+                       "the exposure scope as UNKNOWN, not as none. Supply "
+                       "Get-MailboxAuditStatus to settle which it is."),
         }
 
     by_id = {}
@@ -2247,7 +2305,8 @@ def reconstruct_attack_narrative(records, scenario, anchors, initial_verdict,
 
 def run_scenario_analysis(records, internal_domains, anchors: Anchors,
                           audit_summary=None, allowlist=None,
-                          signin_summary=None, signin_window_minutes=20):
+                          signin_summary=None, signin_window_minutes=20,
+                          directory=None, audit_coverage=None):
     """Full scenario/anchor pipeline. Returns (scenario, reason, verdict)."""
     for r in records:
         r.origin_ip = extract_origin_ip(r.authentication_results or {})
@@ -2256,6 +2315,11 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
 
     # Domains the victim's own org uses (for self-spoofing detection): explicit
     # --victim-domain anchors, otherwise inferred from the internal domains.
+    # A domain the tenant declares is fact; one inferred from who appears
+    # on both sides of enough messages is a guess that misses any domain
+    # the mailbox rarely corresponds with.
+    if directory and directory.accepted_domains:
+        internal_domains = set(internal_domains) | directory.accepted_domains
     victim_domains = set(anchors.victim_domains) or set(internal_domains)
     # An explicitly-declared victim domain is trusted to authenticate even if
     # the corpus did not happen to record a passing message for it.
@@ -2288,7 +2352,7 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
         records, internal_domains, frequent_domains, lookalike_map,
         sender_ip_counts, frequent_senders, anchors, baselines, victim_domains,
         victim_address, thread_participants, contact_names,
-        allowlist=allowlist,
+        allowlist=allowlist, directory=directory,
     )
     # Recorded attacker actions against specific messages, joined on
     # InternetMessageId. Must run before tiering: a confirmed message is Tier 1
@@ -2298,7 +2362,7 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     # is a claim about the completeness of the evidence, not about a message.
     completeness = deletion_completeness(records, audit_summary)
     authorship = attacker_authorship(records, audit_summary, anchors)
-    exposure = exposure_scope(records, audit_summary)
+    exposure = exposure_scope(records, audit_summary, audit_coverage)
     rule_replay = replay_rules(records, audit_summary)
     # Must also run before tiering: a confirmed lure is Tier 1 on the
     # strength of the token, not of its wording.

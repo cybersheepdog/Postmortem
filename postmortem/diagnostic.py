@@ -78,6 +78,23 @@ def _own_vocabulary():
     except Exception:
         pass
     try:
+        # Graph permission scopes and the persistence kinds are fixed
+        # vocabulary -- Microsoft's and ours. Which scopes an attacker
+        # asked for is the most useful thing the diagnostic can carry
+        # about a consent grant, and it says nothing about the client.
+        # Registered explicitly rather than left to chance: today none
+        # of them happens to end in a public suffix, and a scope added
+        # later might.
+        from postmortem.persistence import (
+            _MAIL_SCOPES, _HIGH_RISK_SCOPES, _DURABILITY_SCOPES,
+            _REMEDIATION)
+        safe |= {s.lower() for s in _MAIL_SCOPES}
+        safe |= {s.lower() for s in _HIGH_RISK_SCOPES}
+        safe |= {s.lower() for s in _DURABILITY_SCOPES}
+        safe |= {k.lower() for k in _REMEDIATION}
+    except Exception:
+        pass
+    try:
         from postmortem import scoring
         for name in ("_URGENCY_TERMS", "_PAYMENT_TERMS", "_CREDENTIAL_LURES",
                      "_BANK_CHANGE_TERMS", "_LOGIN_PATH_HINTS"):
@@ -168,7 +185,8 @@ def _quantiles(values):
 
 
 def build(records, verdict=None, audit_summary=None, manifest=None,
-          campaigns=None, timings=None, config=None):
+          campaigns=None, timings=None, config=None,
+          signin_summary=None, persistence=None):
     """Assemble the diagnostic. Reads counts and templates, never values."""
     verdict = verdict or {}
     records = list(records or [])
@@ -331,6 +349,64 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
                 if isinstance(v, (int, float, bool)) or
                 (isinstance(v, str) and len(v) < 120 and not scan_for_identifiers(v))
             }
+
+    if signin_summary:
+        cov = signin_summary.get("coverage") or {}
+        lures = (verdict or {}).get("signin_lures") or {}
+        doc["signin_log"] = {
+            "records": signin_summary.get("records", 0),
+            "files": signin_summary.get("files", 0),
+            "blind": bool(cov.get("blind")),
+            "have_transfer": cov.get("have_transfer", 0),
+            "have_protocol": cov.get("have_protocol", 0),
+            "accounts": cov.get("accounts", 0),
+            "device_code_records": signin_summary.get("device_code_records", 0),
+            # Which field answered, not what it said: Microsoft's vocabulary.
+            "detected_by": signin_summary.get("detected_by", {}),
+            "attack_groups": signin_summary.get("attack_groups", 0),
+            "single_groups": len(signin_summary.get("single_groups") or []),
+            "unattributed_groups": len(
+                signin_summary.get("unattributed_groups") or []),
+            "attacker_ips": len(signin_summary.get("attacker_ips") or []),
+            # How often the victim-IP veto fired. If this is ever large the
+            # leg classification is wrong, and it is the one failure here
+            # that would poison every downstream attribution.
+            "vetoed_ips": len(signin_summary.get("vetoed_ips") or []),
+            "tokens_issued": signin_summary.get("tokens_issued", 0),
+            "lure_window_minutes": lures.get("window_minutes", 0),
+            "lures_confirmed": len(lures.get("confirmed") or []),
+            "in_window_no_lure": len(lures.get("in_window_only") or []),
+            "tokens_without_lure": len(lures.get("tokens_without_lure") or []),
+        }
+
+    if persistence:
+        findings = persistence.get("findings") or []
+        scopes = Counter()
+        for f in findings:
+            for s in (f.get("mail_scopes") or []):
+                scopes[s] += 1
+            for s in (f.get("high_risk_scopes") or []):
+                scopes[s] += 1
+        doc["persistence"] = {
+            "sources": persistence.get("sources", {}),
+            "findings": len(findings),
+            "attacker_attributed": persistence.get("confirmed_count", 0),
+            "survives_both": persistence.get("survives_both_count", 0),
+            # Kind names are ours; scope names are Microsoft's. Both are the
+            # whole point of the section -- which mechanisms actually turn up
+            # in real cases is what decides where the next work goes.
+            "by_kind": persistence.get("counts", {}),
+            "scopes_requested": scopes.most_common(25),
+            "unreadable_scopes": sum(
+                1 for f in findings
+                if f.get("kind") == "oauth_consent"
+                and not f.get("scopes_readable")),
+            "risk_detections": Counter(
+                str(d.get("detection", "")) for d in
+                (persistence.get("risk_detections") or [])).most_common(15),
+            "warnings": len(persistence.get("warnings") or []),
+        }
+
     return doc
 
 
@@ -393,10 +469,32 @@ def render(doc):
     for bucket, n in doc["campaigns"]["size_histogram"]:
         w("  size %-17s %s" % (bucket, n))
     w("")
-    if doc.get("audit_log"):
-        w("[audit_log]")
-        for k, v in doc["audit_log"].items():
-            w("  %-22s %s" % (k, v))
+    # One loop for every evidence-source section: adding a source should not
+    # mean remembering to teach the renderer about it as well.
+    for _section in ("audit_log", "signin_log", "persistence"):
+        if not doc.get(_section):
+            continue
+        w("[%s]" % _section)
+        for k, v in doc[_section].items():
+            if isinstance(v, dict):
+                w("  %-22s %s" % (k, ", ".join(
+                    "%s=%s" % (kk, vv) for kk, vv in sorted(v.items())) or "-"))
+            elif isinstance(v, list):
+                # Counter.most_common() gives (name, count) pairs, but several
+                # of these sections carry flat lists too -- coverage_warnings
+                # is a list of severity strings. Unpacking blind raised, and
+                # because the whole diagnostic is written in one try/except
+                # the result was no diagnostic at all whenever an audit log
+                # produced a coverage warning.
+                parts = []
+                for item in v[:12]:
+                    if (isinstance(item, (list, tuple)) and len(item) == 2):
+                        parts.append("%s=%s" % (item[0], item[1]))
+                    else:
+                        parts.append(str(item))
+                w("  %-22s %s" % (k, ", ".join(parts) or "-"))
+            else:
+                w("  %-22s %s" % (k, v))
         w("")
     w("[timings_seconds]")
     for label, secs in doc["timings_seconds"]:

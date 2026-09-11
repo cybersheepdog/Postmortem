@@ -58,14 +58,23 @@ _RECOGNISERS = [
      (r"messagetrace", r"-mtl", r"\bmtl\b"),
      ("recipientaddress", "senderaddress", "messagetraceid")),
     ("mailbox_rules",
-     (r"inboxrule", r"mailboxrule", r"transportrule"),
+     (r"inboxrule", r"mailboxrule"),
      ("ruleidentity", "rulename", "forwardto", "redirectto")),
+    ("transport_rules",
+     (r"transportrule",),
+     ("redirectmessageto", "blindcopyto", "state")),
     ("mailbox_permissions",
      (r"mailboxpermission", r"delegat", r"recipientpermission"),
      ("accessrights", "trustee", "identity")),
     ("users",
-     (r"\busers\b", r"getusers", r"accounts"),
-     ("userprincipalname", "accountenabled", "usertype")),
+     (r"\busers\b", r"getusers", r"accounts", r"adminusers"),
+     ("userprincipalname", "accountenabled", "usertype", "displayname")),
+    ("accepted_domains",
+     (r"accepteddomain", r"\bdomains?\b", r"tenantdomain"),
+     ("domainname", "domaintype", "default")),
+    ("mailbox_audit_status",
+     (r"mailboxauditstatus", r"auditstatus", r"auditconfig"),
+     ("auditenabled", "auditowner", "auditdelegate", "auditlogagelimit")),
 ]
 
 _EXTENSIONS = (".csv", ".json", ".jsonl", ".ndjson")
@@ -74,7 +83,10 @@ _EXTENSIONS = (".csv", ".json", ".jsonl", ".ndjson")
 # report can say what was collected but not yet used, which is more honest
 # than silence and tells the analyst what a later version will pick up.
 CONSUMED = {"entra_audit", "oauth_permissions", "mfa", "devices",
-            "role_activity", "risk_detections"}
+            "role_activity", "risk_detections",
+            "users", "accepted_domains", "mailbox_rules",
+            "transport_rules", "mailbox_permissions",
+            "mailbox_audit_status"}
 
 # Recognised here but parsed by the module that owns the format, so the
 # manifest can say "routed" rather than implying it went unread.
@@ -165,6 +177,7 @@ def collect(root, overrides=None):
     tree holds three others that also look like directory audits.
     """
     from postmortem import persistence as P
+    from postmortem import directory as D
 
     by_kind, unrecognised, seen = ({}, [], 0)
     if root:
@@ -181,6 +194,12 @@ def collect(root, overrides=None):
         "devices": P.parse_devices,
         "role_activity": P.parse_role_activity,
         "risk_detections": P.parse_risk_detections,
+        "users": D.parse_users,
+        "accepted_domains": D.parse_accepted_domains,
+        "mailbox_rules": D.parse_mailbox_rules,
+        "transport_rules": D.parse_transport_rules,
+        "mailbox_permissions": D.parse_mailbox_permissions,
+        "mailbox_audit_status": D.parse_mailbox_audit_status,
     }
 
     sources = {}
@@ -194,7 +213,12 @@ def collect(root, overrides=None):
             if kind in parsers:
                 parsed = parsers[kind](rows)
                 parsed_total += len(parsed)
-                sources.setdefault(kind, []).extend(parsed)
+                # Audit status is keyed by mailbox, not a list: several
+                # files merge into one map rather than concatenating.
+                if isinstance(parsed, dict):
+                    sources.setdefault(kind, {}).update(parsed)
+                else:
+                    sources.setdefault(kind, []).extend(parsed)
         manifest.append({
             "kind": kind, "files": len(paths), "rows": rows_total,
             "findings": parsed_total if kind in parsers else None,

@@ -3950,3 +3950,312 @@ def test_persistence_reaches_the_timeline_and_serialises(tmp_path):
 
     # And the timeline is inert without persistence, as every existing run is.
     assert build_attack_timeline([], None, None) == []
+
+
+
+# --------------------------------------------------------------------------
+# Tenant directory and mailbox configuration
+#
+# Everything the tool knows about the client's own organisation is otherwise
+# inferred from the corpus: internal domains from who appears on both sides of
+# enough messages, known contacts from who sends often enough to look
+# established. Both inferences are load-bearing and both fail the same way --
+# a colleague who rarely emails this mailbox never becomes familiar, so their
+# name being copied is invisible.
+# --------------------------------------------------------------------------
+
+def _dir_users():
+    from postmortem.directory import parse_users
+    return parse_users([
+        {"userprincipalname": "jane.doe@acme.com", "displayname": "Jane Doe",
+         "jobtitle": "Chief Financial Officer", "department": "Finance",
+         "accountenabled": "True",
+         "proxyaddresses": "smtp:j.doe@acme.com;smtp:jane@acme.com"},
+        {"userprincipalname": "ap@acme.com", "displayname": "Accounts Payable",
+         "jobtitle": "AP Clerk", "accountenabled": "True"},
+    ])
+
+
+def test_the_directory_names_who_was_impersonated(tmp_path):
+    # The finding the corpus cannot make. Jane emails this mailbox twice a
+    # year, so she is not a "frequent sender" and the display-name check has
+    # nothing to compare against -- yet her name on an outside address is the
+    # entire attack.
+    from postmortem.directory import Directory
+
+    d = Directory(_dir_users(), ["acme.com"])
+    imp = d.impersonation_of("Jane Doe", "j.doe@acrne-corp.example")
+    assert imp is not None
+    assert imp["real_address"] == "jane.doe@acme.com"
+    assert imp["title"] == "Chief Financial Officer"
+    assert imp["observed_address"] == "j.doe@acrne-corp.example"
+
+    # It really being her is not impersonation -- including on an alias, which
+    # the corpus would have treated as a different person entirely.
+    assert d.impersonation_of("Jane Doe", "jane.doe@acme.com") is None
+    assert d.impersonation_of("Jane Doe", "jane@acme.com") is None
+    # A name nobody in the directory has says nothing either way.
+    assert d.impersonation_of("Bob Stranger", "bob@ext.example") is None
+
+
+def test_display_names_match_the_way_a_human_reads_them(tmp_path):
+    # An attacker copies what the recipient sees, not what the directory
+    # stores, so punctuation, case and word order must not defeat the match.
+    from postmortem.directory import Directory
+
+    d = Directory(_dir_users(), ["acme.com"])
+    for spelling in ("Jane Doe", "jane doe", "JANE DOE", "Doe, Jane",
+                     "Jane  Doe", "Jane Doe."):
+        assert d.impersonation_of(spelling, "x@ext.example"), spelling
+    assert d.impersonation_of("Janet Doe", "x@ext.example") is None
+
+
+def test_accepted_domains_replace_the_inferred_ones(tmp_path):
+    from postmortem.directory import parse_accepted_domains, Directory
+
+    doms = parse_accepted_domains([
+        {"domainname": "acme.com", "domaintype": "Authoritative"},
+        {"domainname": "ACME-CORP.COM", "domaintype": "Authoritative"},
+        {"domainname": "", "domaintype": "x"},
+    ])
+    assert doms == ["acme-corp.com", "acme.com"]
+
+    # A domain the tenant's own accounts sign in under counts even when the
+    # accepted-domain export was not collected.
+    d = Directory(_dir_users(), [])
+    assert d.is_internal_domain("acme.com")
+    assert not d.is_internal_domain("acrne-corp.example")
+
+
+def test_ordinary_mail_management_is_not_persistence(tmp_path):
+    # Every tenant has rules filing mail into Archive. Reporting each of them
+    # as suspected persistence is how an action list stops being read.
+    from postmortem.directory import parse_mailbox_rules
+
+    rules = parse_mailbox_rules([
+        {"rulename": "Archive old", "mailbox": "ap@acme.com",
+         "movetofolder": "Archive"},
+        {"rulename": "Newsletters", "mailbox": "ap@acme.com",
+         "movetofolder": "Junk"},
+        # ... but a folder with no ordinary use does count,
+        {"rulename": ".", "mailbox": "ap@acme.com", "movetofolder": "RSS Feeds"},
+        # ... as does one that files AND selects on concealment keywords,
+        {"rulename": "x", "mailbox": "ap@acme.com", "movetofolder": "Archive",
+         "subjectcontainswords": "invoice,wire"},
+        # ... and forwarding or deleting is concealment by itself.
+        {"rulename": "f", "mailbox": "ap@acme.com",
+         "forwardto": "exfil@attacker.example"},
+        {"rulename": "d", "mailbox": "ap@acme.com", "deletemessage": "True"},
+    ])
+    conceals = [r["name"] for r in rules if r["conceals"]]
+    assert conceals == [".", "x", "f", "d"], conceals
+
+
+def test_configuration_the_audit_log_never_saw_created(tmp_path):
+    # The audit log can only report what happened while it was watching. A
+    # rule that predates its window is invisible there, and its silence reads
+    # exactly like the rule's absence.
+    from postmortem.directory import (parse_mailbox_rules,
+                                      parse_mailbox_permissions,
+                                      config_drift, Directory)
+
+    sources = {
+        "mailbox_rules": parse_mailbox_rules([
+            {"rulename": "recorded", "mailbox": "ap@acme.com",
+             "forwardto": "known@attacker.example"},
+            {"rulename": "unrecorded", "mailbox": "ap@acme.com",
+             "forwardto": "exfil@attacker.example"},
+        ]),
+        "mailbox_permissions": parse_mailbox_permissions([
+            {"identity": "ap@acme.com", "user": "jane.doe@acme.com",
+             "accessrights": "FullAccess"},
+            {"identity": "ap@acme.com",
+             "user": "consultant@external-partner.example",
+             "accessrights": "FullAccess"},
+            # Self and machine principals are noise, never findings.
+            {"identity": "ap@acme.com", "user": "NT AUTHORITY\\\\SELF",
+             "accessrights": "FullAccess"},
+        ]),
+    }
+    audit = {"malicious_rules": [
+        {"time": "2026-08-26T10:00:00Z", "user": "ap@acme.com",
+         "client_ip": "45.147.230.88", "forwards": ["known@attacker.example"],
+         "keywords": [], "move_to": ""}]}
+
+    drift = config_drift(sources, audit, Directory(_dir_users(), ["acme.com"]))
+    assert drift["available"] is True
+    # The rule the audit log explains is not reported again here.
+    assert [r["name"] for r in drift["unexplained_rules"]] == ["unrecorded"]
+    assert drift["external_forwarders"] == 1
+
+    # Delegation to a colleague is normal; to an outside address is not.
+    assert drift["external_delegates"] == 1
+    ext = [d for d in drift["delegations"] if d["external"]]
+    assert ext[0]["trustee"] == "consultant@external-partner.example"
+    assert all("nt authority" not in d["trustee"] for d in drift["delegations"])
+
+    # And it is offered as unexplained, never as proven.
+    assert "not proof" in drift["note"]
+
+
+def test_drift_becomes_remediation_without_claiming_attribution(tmp_path):
+    from postmortem.directory import parse_mailbox_rules, config_drift, Directory
+    from postmortem.persistence import remediation_plan
+
+    sources = {"mailbox_rules": parse_mailbox_rules([
+        {"rulename": "hidden", "mailbox": "ap@acme.com",
+         "forwardto": "exfil@attacker.example"}])}
+    drift = config_drift(sources, None, Directory(_dir_users(), ["acme.com"]))
+
+    plan = remediation_plan(None, None, drift)
+    assert len(plan) == 1
+    a = plan[0]
+    assert a["kind"] == "inbox_rule"
+    # Unattributed: it predates the window rather than being tied to anyone.
+    assert a["by_attacker"] is False
+    assert "not recorded in the audit log window" in a["attribution"]
+    assert a["survives_password_reset"] == "survives"
+    assert "exfil@attacker.example" in a["grants"]
+
+
+def test_attacker_attributed_actions_outrank_unexplained_ones(tmp_path):
+    from postmortem.directory import parse_mailbox_rules, config_drift, Directory
+    from postmortem.persistence import remediation_plan
+
+    drift = config_drift(
+        {"mailbox_rules": parse_mailbox_rules([
+            {"rulename": "old", "mailbox": "ap@acme.com",
+             "forwardto": "legacy@partner.example"}])},
+        None, Directory(_dir_users(), ["acme.com"]))
+    audit = {"forwarding_rules": [
+        {"time": "2026-08-26T10:00:00Z", "user": "ap@acme.com",
+         "client_ip": "45.147.230.88", "forwards": ["exfil@attacker.example"]}]}
+
+    plan = remediation_plan(None, audit, drift)
+    assert plan[0]["by_attacker"] is True
+    assert plan[0]["kind"] == "forwarding"
+    assert plan[-1]["by_attacker"] is False
+
+
+# ---- E4: the audit-status export settles what UNKNOWN was hiding ---------
+def test_disabled_auditing_is_a_different_answer_from_unknown(tmp_path):
+    from postmortem.directory import parse_mailbox_audit_status, audit_coverage_for
+    from postmortem.scoring import exposure_scope
+
+    status = parse_mailbox_audit_status([
+        {"identity": "ap@acme.com", "auditenabled": "False",
+         "auditowner": "", "auditlogagelimit": "90"}])
+    cov = audit_coverage_for(status, "ap@acme.com")
+    assert cov["mailbox_matched"] is True
+    assert cov["audit_enabled"] is False
+
+    summary = {"message_index": {"by_message_id": {}},
+               "coverage": {"operations": [("HardDelete", 1)]}}
+    out = exposure_scope([], summary, cov)
+    assert out["available"] is False
+    assert out["audit_status_known"] is True
+    assert "DISABLED" in out["reason"]
+    assert "licensing" in out["reason"]
+
+
+def test_enabled_auditing_makes_silence_meaningful(tmp_path):
+    from postmortem.directory import parse_mailbox_audit_status, audit_coverage_for
+    from postmortem.scoring import exposure_scope
+
+    status = parse_mailbox_audit_status([
+        {"identity": "ap@acme.com", "auditenabled": "True",
+         "auditowner": "MailItemsAccessed, HardDelete, Update"}])
+    cov = audit_coverage_for(status, "ap@acme.com")
+    assert cov["records_mail_access"] is True
+
+    out = exposure_scope([], {"message_index": {"by_message_id": {}},
+                              "coverage": {"operations": [("HardDelete", 1)]}},
+                         cov)
+    assert out["meaningful_silence"] is True
+    assert "evidence rather than a licensing gap" in out["reason"]
+
+    # Enabled, but not recording reads: a third answer again.
+    partial = audit_coverage_for(parse_mailbox_audit_status([
+        {"identity": "ap@acme.com", "auditenabled": "True",
+         "auditowner": "HardDelete, Update"}]), "ap@acme.com")
+    out2 = exposure_scope([], {"message_index": {"by_message_id": {}},
+                               "coverage": {"operations": [("HardDelete", 1)]}},
+                          partial)
+    assert out2.get("meaningful_silence") is not True
+    assert "not in the audited action set" in out2["reason"]
+
+
+def test_without_the_status_export_the_answer_stays_unknown(tmp_path):
+    # The honest default must survive: no status export means the old answer.
+    from postmortem.scoring import exposure_scope
+
+    out = exposure_scope([], {"message_index": {"by_message_id": {}},
+                              "coverage": {"operations": [("HardDelete", 1)]}})
+    assert out["available"] is False
+    assert out["audit_status_known"] is False
+    assert "UNKNOWN" in out["reason"]
+    assert "Get-MailboxAuditStatus" in out["reason"]
+
+
+def test_status_for_the_wrong_mailbox_claims_nothing(tmp_path):
+    from postmortem.directory import parse_mailbox_audit_status, audit_coverage_for
+
+    status = parse_mailbox_audit_status([
+        {"identity": "someone@other.example", "auditenabled": "True"},
+        {"identity": "another@other.example", "auditenabled": "True"},
+    ])
+    cov = audit_coverage_for(status, "ap@acme.com")
+    assert cov["mailbox_matched"] is False
+    assert "none matches" in cov["note"]
+    assert audit_coverage_for({}, "ap@acme.com") == {}
+
+
+def test_directory_sources_are_discovered_and_routed(tmp_path):
+    from postmortem.mes import identify, collect
+
+    u = tmp_path / "Users.csv"
+    u.write_text("UserPrincipalName,DisplayName,AccountEnabled\n"
+                 "jane.doe@acme.com,Jane Doe,True\n", encoding="utf-8")
+    assert identify(str(u)) == "users"
+
+    s = tmp_path / "MailboxAuditStatus.csv"
+    s.write_text("Identity,AuditEnabled,AuditOwner\nap@acme.com,False,\n",
+                 encoding="utf-8")
+    assert identify(str(s)) == "mailbox_audit_status"
+
+    # Inbox rules and transport rules are different things and used to share
+    # one recogniser, which sent tenant-wide rules to the mailbox parser.
+    i = tmp_path / "InboxRules.csv"
+    i.write_text("RuleName,Mailbox,ForwardTo\nx,a@b.com,c@d.com\n", encoding="utf-8")
+    t = tmp_path / "TransportRules.csv"
+    t.write_text("Name,State,RedirectMessageTo\ny,Enabled,c@d.com\n", encoding="utf-8")
+    assert identify(str(i)) == "mailbox_rules"
+    assert identify(str(t)) == "transport_rules"
+
+    bundle = collect(str(tmp_path))
+    # Audit status is keyed by mailbox: it must merge as a map, not a list.
+    assert isinstance(bundle["sources"]["mailbox_audit_status"], dict)
+    assert "ap@acme.com" in bundle["sources"]["mailbox_audit_status"]
+    assert len(bundle["sources"]["users"]) == 1
+
+
+def test_no_directory_changes_nothing(tmp_path):
+    # Every existing run must behave exactly as before.
+    from postmortem.directory import build_directory, config_drift
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    empty = build_directory({})
+    assert not empty
+    assert empty.impersonation_of("Jane Doe", "x@y.example") is None
+    assert config_drift({})["available"] is False
+
+    r = make_record(sender_email="a@ext.example", sender_domain="ext.example",
+                    path="/m/1.eml")
+    r.body = "Hello."
+    r.urls = []; r.url_analysis = []; r.attachments = []
+    r.attachment_details = []; r.authentication_results = {}
+    _s, _rsn, verdict = run_scenario_analysis([r], {"acme.com"}, Anchors(),
+                                              None, directory=None)
+    assert verdict["exposure_scope"] == {} or not verdict["exposure_scope"].get(
+        "available")

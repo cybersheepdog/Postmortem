@@ -762,7 +762,7 @@ def analyze_persistence(sources, attacker_ips=(), compromise_dt=None,
     }
 
 
-def remediation_plan(persistence, audit_summary=None):
+def remediation_plan(persistence, audit_summary=None, drift=None):
     """One ordered action list, from every source that found persistence.
 
     Malicious rules and SMTP forwarding come from the audit log rather than
@@ -842,6 +842,43 @@ def remediation_plan(persistence, audit_summary=None):
             "survives_password_reset": "survives",
             "survives_token_revocation": "survives",
         })
+
+    # Configuration that exists now but was never recorded being created.
+    # It carries by_attacker=False deliberately: it predates the window
+    # rather than being attributed, and most tenants have some of it.
+    if drift:
+        from postmortem.directory import drift_remediation
+        actions.extend(drift_remediation(drift))
+
+    # One action per mechanism. The findings list deliberately shows a consent
+    # twice -- the audit log says it was granted, the grant export says it is
+    # still there, and both are worth reading. As ACTIONS they are one thing:
+    # a client told to revoke the same application twice loses confidence in
+    # the whole list, and the duplicate lacking the real identifiers is the
+    # one they would try first.
+    merged = {}
+    for a in actions:
+        key = (a["kind"], str(a["target"]).strip().lower())
+        prior = merged.get(key)
+        if prior is None:
+            merged[key] = a
+            continue
+        # Keep whichever carries the resolved command, then take the strongest
+        # attribution and the earliest time across both.
+        best, other = ((a, prior) if ("<id>" in prior["action"]
+                                      and "<id>" not in a["action"])
+                       else (prior, a))
+        best["by_attacker"] = prior["by_attacker"] or a["by_attacker"]
+        for field in ("when", "attribution", "detail"):
+            if not best.get(field) and other.get(field):
+                best[field] = other[field]
+        if (best.get("when") and other.get("when")
+                and other["when"] < best["when"]):
+            best["when"] = other["when"]
+            best["attribution"] = (other.get("attribution")
+                                   or best.get("attribution"))
+        merged[key] = best
+    actions = list(merged.values())
 
     actions.sort(key=lambda a: (
         not a["by_attacker"],

@@ -131,6 +131,10 @@ from postmortem.mes import collect as collect_mes
 from postmortem.persistence import (
     analyze_persistence, remediation_plan, strip_private,
 )
+from postmortem.directory import (
+    build_directory, config_drift, audit_coverage_for,
+    summarize as summarize_directory,
+)
 from postmortem.mailbox_ingest import (  # noqa: E402
     find_containers, ingest_all,
 )
@@ -526,6 +530,7 @@ from postmortem.reporting import (  # noqa: E402
     print_audit_join, print_deletion_completeness,
     print_signin_analysis, print_signin_lures,
     print_persistence, print_remediation, print_mes_manifest,
+    print_directory,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -943,6 +948,42 @@ def main():
         type=Path,
         metavar="DIR",
         help="Microsoft-Extractor-Suite output directory. Every recognised artefact under it is ingested without a separate flag: directory audit, OAuth grants, MFA methods, devices, role activity and risk detections. The individual flags below still override what is found here.",
+    )
+    anchor_group.add_argument(
+        "--directory-users",
+        type=Path,
+        metavar="FILE",
+        help="Tenant account export (Get-Users / Get-AdminUsers). Replaces the internal domains and known contacts inferred from the corpus with tenant fact, so display-name impersonation can state the real address rather than \"resembles a known contact\".",
+    )
+    anchor_group.add_argument(
+        "--accepted-domains",
+        type=Path,
+        metavar="FILE",
+        help="The tenant's accepted domains (Get-AcceptedDomain).",
+    )
+    anchor_group.add_argument(
+        "--mailbox-rules",
+        type=Path,
+        metavar="FILE",
+        help="Inbox rules as they exist now (Get-MailboxRules). A rule present but never recorded being created predates the audit window.",
+    )
+    anchor_group.add_argument(
+        "--mailbox-permissions",
+        type=Path,
+        metavar="FILE",
+        help="Delegated mailbox access (Get-MailboxPermissions).",
+    )
+    anchor_group.add_argument(
+        "--transport-rules",
+        type=Path,
+        metavar="FILE",
+        help="Tenant-wide mail flow rules (Get-TransportRules).",
+    )
+    anchor_group.add_argument(
+        "--mailbox-audit-status",
+        type=Path,
+        metavar="FILE",
+        help="Per-mailbox audit configuration (Get-MailboxAuditStatus). Settles whether an absent MailItemsAccessed means auditing was off or means nothing was read.",
     )
     anchor_group.add_argument(
         "--entra-audit",
@@ -1773,6 +1814,12 @@ def main():
         "devices": getattr(args, "devices", None),
         "role_activity": getattr(args, "role_activity", None),
         "risk_detections": getattr(args, "risk_detections", None),
+        "users": getattr(args, "directory_users", None),
+        "accepted_domains": getattr(args, "accepted_domains", None),
+        "mailbox_rules": getattr(args, "mailbox_rules", None),
+        "mailbox_permissions": getattr(args, "mailbox_permissions", None),
+        "transport_rules": getattr(args, "transport_rules", None),
+        "mailbox_audit_status": getattr(args, "mailbox_audit_status", None),
     }
     _mes_overrides = {k: v for k, v in _mes_overrides.items() if v}
     if getattr(args, "mes_dir", None) or _mes_overrides:
@@ -1856,10 +1903,37 @@ def main():
         _victims = set((signin_summary or {}).get('affected_users', []))
         if getattr(args, 'victim_domain', None):
             _victims |= {str(v) for v in (args.victim_domain or [])}
+        # Only the identity-side sources: handing it the directory exports
+        # too would inflate its source counts and make its "what is missing"
+        # warnings reason about files it never looks at.
+        _persist_src = {
+            k: v for k, v in mes_bundle['sources'].items()
+            if k in ('entra_audit', 'oauth_permissions', 'mfa', 'devices',
+                     'role_activity', 'risk_detections')}
         persistence = analyze_persistence(
-            mes_bundle['sources'], attacker_ips=_atk,
+            _persist_src, attacker_ips=_atk,
             compromise_dt=_anchor, victim_users=_victims)
         print_persistence(persistence)
+
+    directory = None
+    dir_summary = None
+    drift = None
+    audit_coverage = None
+    if mes_bundle and mes_bundle.get('sources'):
+        _src = mes_bundle['sources']
+        directory = build_directory(_src)
+        drift = config_drift(_src, audit_summary, directory)
+        audit_coverage = audit_coverage_for(
+            _src.get('mailbox_audit_status'),
+            (anchors.victim_domains[0] if anchors.victim_domains else None))
+        dir_summary = summarize_directory(
+            {k: v for k, v in _src.items()
+             if k in ('users', 'accepted_domains', 'mailbox_rules',
+                      'mailbox_permissions', 'transport_rules',
+                      'mailbox_audit_status')},
+            directory, drift, _src.get('mailbox_audit_status'))
+        if dir_summary.get('available'):
+            print_directory(dir_summary)
 
     allowlist = []
     for value in (args.allowlist or []):
@@ -1872,6 +1946,7 @@ def main():
             records, internal_domains, anchors, audit_summary,
             allowlist=allowlist, signin_summary=signin_summary,
             signin_window_minutes=getattr(args, 'signin_window_minutes', 20),
+            directory=directory, audit_coverage=audit_coverage,
         )
     if audit_summary:
         # The message-id index is a join structure, not a finding: on a real
@@ -2024,6 +2099,7 @@ def main():
         elapsed_seconds=time.monotonic() - run_started,
         phase_timings=list(PHASE_TIMINGS),
         host=resources.describe_host(),
+        signin_summary=signin_summary, mes_bundle=mes_bundle,
         entry_point_window=(
             {"start": _win_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
              "end": _win_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -2078,11 +2154,13 @@ def main():
     # Last section before the verdict: it is the page the client acts on,
     # and it consolidates rules and forwarding from the audit log with the
     # identity-side mechanisms so remediation is one list, not four.
-    if persistence or audit_summary:
-        remediation = remediation_plan(persistence, audit_summary)
+    if persistence or audit_summary or drift:
+        remediation = remediation_plan(persistence, audit_summary, drift)
         print_remediation(remediation)
         if persistence:
             initial_verdict['persistence'] = strip_private(persistence)
+        if dir_summary:
+            initial_verdict['directory'] = dir_summary
         initial_verdict['remediation'] = remediation
 
     print_initial_compromise(initial_verdict)
@@ -2108,7 +2186,8 @@ def main():
             _doc = _diag.build(
                 records, verdict=initial_verdict, audit_summary=audit_summary,
                 manifest=manifest, campaigns=campaigns,
-                timings=manifest.get("phase_timings_seconds"), config=_diag_cfg)
+                timings=manifest.get("phase_timings_seconds"), config=_diag_cfg,
+                signin_summary=signin_summary, persistence=persistence)
             _written = _diag.write(_doc, args.diagnostic)
         except ValueError as exc:
             print(f"[!] Diagnostic NOT written: {exc}", file=sys.stderr)

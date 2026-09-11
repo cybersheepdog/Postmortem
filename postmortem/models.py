@@ -177,6 +177,10 @@ class EmailRecord:
     # finding can say a name was impersonated but not show the substitution,
     # which is the only form in which a reader can check it.
     display_name_spoof_of: list[str] = field(default_factory=list)
+    # Who the display name really belongs to, from a directory export:
+    # the correct address and title against the observed one. The corpus
+    # alone can only say the name resembles a frequent sender.
+    directory_impersonation: dict = field(default_factory=dict)
     rule_target: bool = False
     # Which of the malicious rule's keywords this message actually matched.
     rule_target_keywords: list[str] = field(default_factory=list)
