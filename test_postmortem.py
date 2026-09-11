@@ -536,6 +536,82 @@ def test_old_outbound_payment_mail_is_not_fraud_evidence():
 
 
 # --------------------------------------------------------------------------
+# tiering and verdicts are bounded to the incident
+# --------------------------------------------------------------------------
+def _aged_corpus():
+    """A long-lived mailbox: years of signal-bearing mail, one real phish."""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    compromise = datetime(2026, 8, 25, 15, 54, tzinfo=timezone.utc)
+    records = []
+    for i in range(60):
+        r = make_record(mid="old%d" % i, sender_email="p%d@vendor.example" % (i % 10),
+                        sender_domain="vendor.example")
+        r.date = format_datetime(datetime(2012, 1, 1, tzinfo=timezone.utc)
+                                 + timedelta(days=i * 60))
+        r.subject = "Please verify your account"
+        r.body = "Confirm the payment and sign in: http://vendor.example/login"
+        r.is_inbound = True
+        r.scenario_score = 6
+        records.append(r)
+    phish = make_record(mid="phish", sender_email="x@evil.example",
+                        sender_domain="evil.example")
+    phish.date = format_datetime(compromise - timedelta(days=11))
+    phish.subject = "Action required: mailbox over quota"
+    phish.body = "Verify your identity and reset your password: http://evil.example/verify"
+    phish.is_inbound = True
+    phish.scenario_score = 20
+    records.append(phish)
+    return records, phish, Anchors(compromise_date=compromise, lookback_days=90)
+
+
+def test_tier_two_is_bounded_to_the_incident():
+    # Regression: Tier 2 was "inbound with any signal", unbounded. On a
+    # fourteen-year mailbox that was over half the corpus -- not a review
+    # queue, and it dragged the attachment scan and IOC extraction with it.
+    from postmortem.scoring import assign_tiers
+
+    records, phish, anchors = _aged_corpus()
+    counts = assign_tiers(records, "ato", anchors)
+    assert phish.tier == 1
+    assert counts[2] == 0, "years-old mail must not be a secondary suspect"
+    assert counts[3] == 60
+
+    # With no compromise date there is no window, so nothing is excluded.
+    open_anchors = Anchors()
+    counts = assign_tiers(records, "ato", open_anchors)
+    assert counts[2] > 0
+
+    # An investigator anchor always wins, however old the message.
+    ancient = records[0]
+    ancient.anchor_matches = ["attacker address bad@evil.example"]
+    assign_tiers(records, "ato", anchors)
+    assert ancient.tier == 1
+
+
+def test_initial_email_is_chosen_from_the_window():
+    from postmortem.scoring import anchored_initial_email_verdict
+    records, phish, anchors = _aged_corpus()
+    verdict = anchored_initial_email_verdict(records, "ato", anchors, "test")
+    assert verdict["verdict"] == "LIKELY_INITIAL_EMAIL"
+    assert verdict["initial_email"]["path"] == phish.path
+    assert "searched" in verdict["reason"]
+
+
+def test_nothing_in_window_is_reported_as_nothing():
+    # A wrong answer stated confidently is worse than no answer: the old code
+    # fell back to the whole corpus and returned a 2014 message at high
+    # confidence.
+    from postmortem.scoring import anchored_initial_email_verdict
+    records, phish, anchors = _aged_corpus()
+    records.remove(phish)
+    verdict = anchored_initial_email_verdict(records, "ato", anchors, "test")
+    assert verdict["verdict"] == "NO_INITIAL_EMAIL_IDENTIFIED"
+    assert "searched" in verdict["reason"]
+    assert verdict["initial_email"] is None
+
+
+# --------------------------------------------------------------------------
 # process pools: spawn-safety
 # --------------------------------------------------------------------------
 def test_pool_workers_are_importable_by_module_path():

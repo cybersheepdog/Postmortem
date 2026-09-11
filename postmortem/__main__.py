@@ -1795,7 +1795,7 @@ def main():
     # chronology rather than a message timeline and a separate UAL summary.
     with timed("timeline + precursor verdict"):
         timeline = build_attack_timeline(records, audit_summary)
-        precursor_verdict = earliest_malicious_precursor_verdict(records)
+        precursor_verdict = earliest_malicious_precursor_verdict(records, anchors)
 
     manifest = build_run_manifest(
         args, records, scenario, anchors, initial_verdict, campaigns, iocs,

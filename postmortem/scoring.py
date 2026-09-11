@@ -1178,6 +1178,19 @@ def in_lookback(record, anchors: Anchors) -> bool:
     return start <= dt <= end
 
 
+def relevant_to_incident(record, anchors: Anchors) -> bool:
+    """True when a message could bear on *this* incident at all.
+
+    That is: in the run-up to the compromise, or after it. On a mailbox
+    spanning years, everything older is ordinary history -- it may carry
+    phishing language, because real mailboxes receive phishing for years
+    without being taken over, but it is not evidence about this takeover.
+    """
+    if not anchors.compromise_date:
+        return True
+    return in_lookback(record, anchors) or after_compromise(record, anchors)
+
+
 def after_compromise(record, anchors: Anchors) -> bool:
     """True when a message post-dates the known compromise."""
     if not anchors.compromise_date:
@@ -1203,11 +1216,18 @@ def assign_tiers(records, scenario, anchors: Anchors):
             # the run-up to it.
             window_ok = in_lookback(r, anchors)
 
+        # Tier 2 is bounded too. Unbounded it collected every inbound message
+        # with any signal across the whole mailbox -- on a fourteen-year
+        # corpus that was more than half of it, which is not a review queue
+        # and drags the attachment scan and IOC extraction along with it.
+        # Anchor matches are investigator ground truth and are never excluded.
+        relevant = bool(r.anchor_matches) or relevant_to_incident(r, anchors)
+
         if r.is_inbound and r.anchor_matches:
             r.tier = 1
         elif r.is_inbound and window_ok and r.scenario_score >= _initial_strong_floor():
             r.tier = 1
-        elif r.is_inbound and r.scenario_score > 0:
+        elif r.is_inbound and relevant and r.scenario_score > 0:
             r.tier = 2
         else:
             r.tier = 3
@@ -1231,8 +1251,19 @@ def anchored_initial_email_verdict(records, scenario, anchors: Anchors, scenario
 
     scored = [r for r in records if r.scenario_score > 0]
 
+    window_note = ""
     if scenario == "ato" and anchors.compromise_date:
-        pool = [r for r in scored if r.is_pre_compromise] or scored
+        # Not "before the compromise" -- on a long-lived mailbox that is almost
+        # the entire corpus. The entry point is in the run-up to it.
+        pool = [r for r in scored if in_lookback(r, anchors)]
+        start, end = investigation_window(anchors)
+        window_note = (f", searched {start:%Y-%m-%d} to {end:%Y-%m-%d} "
+                       f"({anchors.lookback_days}d before the compromise)")
+        if not pool:
+            # Deliberately NOT falling back to the whole corpus. "Nothing in
+            # the window" is a finding; a message from years earlier presented
+            # as the entry point is a wrong answer dressed as an answer.
+            pool = []
     else:
         pool = scored
 
@@ -1246,7 +1277,8 @@ def anchored_initial_email_verdict(records, scenario, anchors: Anchors, scenario
         base.update({
             "verdict": "NO_INITIAL_EMAIL_IDENTIFIED",
             "confidence": "low",
-            "reason": "No message accumulated enough scenario-specific signal to be a defensible initial email.",
+            "reason": ("No message accumulated enough scenario-specific signal "
+                       "to be a defensible initial email." + window_note),
             "initial_email": None,
             "shortlist": [],
         })
@@ -1276,6 +1308,7 @@ def anchored_initial_email_verdict(records, scenario, anchors: Anchors, scenario
         "reason": (
             "Highest-ranked message under the "
             f"{scenario} profile"
+            + window_note
             + (" and confirmed against an investigator anchor" if anchored else "")
             + "; an investigative lead, not proof of attacker control."
         ),
@@ -2422,10 +2455,13 @@ def earliest_malicious_precursor_verdict(records: list[EmailRecord],
     # "Earliest" has to mean earliest *in the investigation window*. Over a
     # whole corpus it means the oldest message the mailbox contains, which on
     # a long-lived account is unrelated to the incident.
+    window_note = ""
     if anchors is not None and anchors.compromise_date:
-        scoped = [r for r in records if in_lookback(r, anchors)]
-        if scoped:
-            records = scoped
+        records = [r for r in records if in_lookback(r, anchors)]
+        start, end = investigation_window(anchors)
+        window_note = (f" Searched {start:%Y-%m-%d} to {end:%Y-%m-%d} "
+                       f"({anchors.lookback_days}d before the compromise); "
+                       "widen with --lookback-days.")
     ordered = sorted(records, key=date_sort_key)
     candidates = []
     for i, r in enumerate(ordered):
@@ -2436,7 +2472,7 @@ def earliest_malicious_precursor_verdict(records: list[EmailRecord],
             evidence = [x for x in r.indicators if any(k in x.lower() for k in ("precursor", "phishing", "login", "url"))]
             candidates.append((r, later, evidence))
     if not candidates:
-        return {"verdict": "NO_EARLIEST_MALICIOUS_PRECURSOR_IDENTIFIED", "confidence": "low", "message_path": "", "timestamp": "", "reason": "No earlier message met the heuristic precursor criteria and was followed by a materially suspicious event in the searched window.", "follow_on_messages": []}
+        return {"verdict": "NO_EARLIEST_MALICIOUS_PRECURSOR_IDENTIFIED", "confidence": "low", "message_path": "", "timestamp": "", "reason": "No message met the heuristic precursor criteria and was followed by a materially suspicious event." + window_note, "follow_on_messages": []}
     candidates.sort(key=lambda x: (date_sort_key(x[0]), -x[0].score))
     r, later, evidence = candidates[0]
     confidence = "high" if r.score >= 18 and any(x.score >= 20 for x in later) else "medium"
