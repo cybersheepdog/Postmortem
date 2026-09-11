@@ -168,13 +168,24 @@ def _build_rules(plan):
     return None
 
 
+# Why the QR decoder is unavailable, when it is. Distinguishing "not
+# installed" from "installed but cannot load its native library" matters:
+# pyzbar on Windows needs the Visual C++ runtime, and without it the import
+# raises even though pip reports the package as present. Reporting the real
+# error saves the analyst reinstalling a package that is already there.
+QR_UNAVAILABLE_REASON = ""
+
+
 def _build_decoder():
-    """Return a QR decode callable, or None when pyzbar/Pillow are missing."""
+    """Return a QR decode callable, or None with the reason recorded."""
+    global QR_UNAVAILABLE_REASON
     try:
         from pyzbar.pyzbar import decode as zbar_decode
         from PIL import Image
-    except Exception:
+    except Exception as exc:
+        QR_UNAVAILABLE_REASON = f"{type(exc).__name__}: {exc}"
         return None
+    QR_UNAVAILABLE_REASON = ""
 
     import io
 
@@ -333,8 +344,15 @@ def run_passes(records, rules_path=None, want_qr=False, tiers=(1, 2),
     qr_hits = 0
 
     if want_qr and _build_decoder() is None:
-        print("[!] --scan-qr given but pyzbar/Pillow are not installed; "
-              "skipping QR scan.", file=sys.stderr)
+        reason = QR_UNAVAILABLE_REASON or "pyzbar/Pillow could not be imported"
+        print(f"[!] --scan-qr given but the QR decoder is unavailable: {reason}",
+              file=sys.stderr)
+        if "shared library" in reason.lower() or "dll" in reason.lower():
+            print("[!] pyzbar is installed but its native zbar library did not "
+                  "load. On Windows this is usually the missing Visual C++ "
+                  "Redistributable (vcredist x64); on Linux, libzbar0.",
+                  file=sys.stderr)
+        print(f"[!] Interpreter: {sys.executable}", file=sys.stderr)
         want_qr = False
 
     if not yara_plan and not want_qr:

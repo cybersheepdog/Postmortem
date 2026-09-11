@@ -960,7 +960,7 @@ def _command_line() -> str:
 
 def build_run_manifest(args, records, scenario, anchors, initial_verdict,
                        campaigns, iocs, generated_utc, elapsed_seconds,
-                       phase_timings=None, host=None):
+                       phase_timings=None, host=None, entry_point_window=None):
     """Reproducibility / chain-of-custody metadata recorded in every report."""
     digest, basis = corpus_fingerprint(records)
     tier_counts = Counter(r.tier for r in records)
@@ -973,6 +973,10 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
         # one of these, so both belong in the manifest.
         "phase_timings_seconds": timings,
         "host": host or "",
+        # The period the entry point was searched in. "No entry point found"
+        # means something different depending on how far back the search
+        # reached, so the window is part of the record.
+        "entry_point_window": entry_point_window or {},
         "tool": "postmortem",
         "tool_version": TOOL_VERSION,
         "parser_version": V7_PARSER_VERSION,

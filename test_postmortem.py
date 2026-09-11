@@ -463,6 +463,79 @@ def test_yara_and_qr_graceful_without_deps(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# investigation window: bounding "earliest" against the compromise date
+# --------------------------------------------------------------------------
+def test_investigation_window_bounds_the_entry_point_search():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    from postmortem.scoring import (
+        investigation_window, in_lookback, after_compromise)
+
+    compromise = datetime(2026, 8, 25, 15, 54, tzinfo=timezone.utc)
+    anchors = Anchors(compromise_date=compromise, lookback_days=90)
+
+    start, end = investigation_window(anchors)
+    assert (end - start).days == 90
+
+    def at(when):
+        r = make_record()
+        r.date = format_datetime(when)
+        return r
+
+    ancient = at(datetime(2012, 4, 13, tzinfo=timezone.utc))
+    recent = at(compromise - timedelta(days=9))
+    later = at(compromise + timedelta(hours=2))
+
+    # The failure this guards: on a fourteen-year mailbox everything is
+    # "before the compromise", so an unbounded search always returns the
+    # oldest message rather than the entry point.
+    assert in_lookback(ancient, anchors) is False
+    assert in_lookback(recent, anchors) is True
+    assert in_lookback(later, anchors) is False
+    assert after_compromise(later, anchors) is True
+    assert after_compromise(recent, anchors) is False
+
+    # With no compromise date, nothing is excluded.
+    open_anchors = Anchors()
+    assert investigation_window(open_anchors) == (None, None)
+    assert in_lookback(ancient, open_anchors) is True
+
+
+def test_old_outbound_payment_mail_is_not_fraud_evidence():
+    # Reproduces the reported symptom: a 2014 outbound email mentioning a
+    # payment was surfaced as "fraudulent instruction" for a 2026 compromise,
+    # because the outbound branch of the fraud test ignored the date.
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    from postmortem.scoring import run_scenario_analysis
+
+    compromise = datetime(2026, 8, 25, 15, 54, tzinfo=timezone.utc)
+    anchors = Anchors(compromise_date=compromise, lookback_days=90)
+
+    def outbound(mid, when):
+        r = make_record(mid=mid, sender_email="staff@acme.com",
+                        sender_domain="acme.com")
+        r.recipients = ["ap@partner.example"]
+        r.date = format_datetime(when)
+        r.subject = "Invoice"
+        r.body = "Please change bank details for the next wire transfer."
+        r.is_inbound = False
+        return r
+
+    old = outbound("old", datetime(2014, 8, 20, tzinfo=timezone.utc))
+    new = outbound("new", compromise + timedelta(hours=2))
+
+    _scenario, _reason, _verdict = run_scenario_analysis(
+        [old, new], {"acme.com"}, anchors, {})
+    fraud_paths = {
+        e["path"] for e in (_verdict.get("narrative", {}) or {}).get("timeline", [])
+        if e.get("phase") == "fraud"
+    }
+    assert old.path not in fraud_paths, (
+        "a 2014 message must not be fraud evidence for a 2026 compromise")
+
+
+# --------------------------------------------------------------------------
 # process pools: spawn-safety
 # --------------------------------------------------------------------------
 def test_pool_workers_are_importable_by_module_path():

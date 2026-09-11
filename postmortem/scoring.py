@@ -330,6 +330,7 @@ def build_anchors(args) -> Anchors:
         attacker_addresses=[normalize_email(a) for a in flatten(getattr(args, "attacker_address", None))],
         rule_keywords=[k.lower() for k in flatten(getattr(args, "rule_keyword", None))],
         victim_domains=[d.lower() for d in flatten(getattr(args, "victim_domain", None))],
+        lookback_days=int(getattr(args, "lookback_days", 90) or 90),
         scenario=getattr(args, "scenario", "auto") or "auto",
     )
 
@@ -1149,6 +1150,42 @@ def score_initial_email(record, scenario, anchors: Anchors):
     return record.scenario_score
 
 
+def investigation_window(anchors: Anchors):
+    """The period the entry point is searched in, as (start, compromise).
+
+    Returns (None, None) when no compromise date is known, in which case every
+    caller falls back to searching the whole corpus as before.
+    """
+    if not anchors.compromise_date:
+        return None, None
+    days = max(1, int(getattr(anchors, "lookback_days", 90) or 90))
+    return anchors.compromise_date - timedelta(days=days), anchors.compromise_date
+
+
+def in_lookback(record, anchors: Anchors) -> bool:
+    """True when a message sits in the run-up to the known compromise.
+
+    Everything that asks "what came before the takeover" has to ask it of a
+    bounded period. Unbounded, the answer on a long-lived mailbox is always the
+    oldest message it contains.
+    """
+    start, end = investigation_window(anchors)
+    if start is None:
+        return True
+    dt = message_arrival_dt(record)
+    if dt is None:
+        return False
+    return start <= dt <= end
+
+
+def after_compromise(record, anchors: Anchors) -> bool:
+    """True when a message post-dates the known compromise."""
+    if not anchors.compromise_date:
+        return True
+    dt = message_arrival_dt(record)
+    return bool(dt and dt > anchors.compromise_date)
+
+
 def assign_tiers(records, scenario, anchors: Anchors):
     """Sort every message into review tiers so the analyst works a small, high-
     precision set first instead of thousands of candidates.
@@ -1161,7 +1198,10 @@ def assign_tiers(records, scenario, anchors: Anchors):
     for r in records:
         window_ok = True
         if scenario == "ato" and anchors.compromise_date:
-            window_ok = r.is_pre_compromise
+            # Not merely "before the compromise" -- on a long corpus that is
+            # almost every message and filters nothing. The entry point is in
+            # the run-up to it.
+            window_ok = in_lookback(r, anchors)
 
         if r.is_inbound and r.anchor_matches:
             r.tier = 1
@@ -1323,10 +1363,19 @@ def reconstruct_attack_narrative(records, scenario, anchors, initial_verdict,
         add_event(entry_rec, "initial_access", label)
 
     # -- 2. Account compromise / takeover markers ---------------------------
+    def _takeover_candidate(r):
+        if not (r.self_spoofing or r.sending_ip_anomaly
+                or any("attacker IP" in m or "attacker address" in m
+                       for m in r.anchor_matches)):
+            return False
+        # A takeover marker is only evidence of *this* takeover if it sits near
+        # it. An anchor match is investigator ground truth and always counts.
+        if any("attacker IP" in m or "attacker address" in m for m in r.anchor_matches):
+            return True
+        return in_lookback(r, anchors) or after_compromise(r, anchors)
+
     takeover = sorted(
-        (r for r in records
-         if r.self_spoofing or r.sending_ip_anomaly
-         or any("attacker IP" in m or "attacker address" in m for m in r.anchor_matches)),
+        (r for r in records if _takeover_candidate(r)),
         key=lambda r: message_arrival_dt(r) or far,
     )
     audit_logins = audit_summary.get("attacker_logins") or []
@@ -1427,8 +1476,16 @@ def reconstruct_attack_narrative(records, scenario, anchors, initial_verdict,
         text = f"{r.subject}\n{scoring_text(r)}".lower()
         pay = any(t in text for t in _PAYMENT_TERMS) or any(t in text for t in _BANK_CHANGE_TERMS)
         anchored = any("fraud account" in m for m in r.anchor_matches)
-        post = bool(anchors.compromise_date) and not r.is_pre_compromise
-        return anchored or (pay and (post or not r.is_inbound or r.thread_injection))
+        post = after_compromise(r, anchors)
+        if anchored:
+            return True
+        if not pay:
+            return False
+        # Outbound payment talk and thread injection are only fraud signals in
+        # the window; otherwise fourteen years of ordinary invoicing qualifies.
+        if anchors.compromise_date and not post:
+            return False
+        return post or not r.is_inbound or r.thread_injection
 
     fraud = sorted((r for r in records if is_fraud(r)),
                    key=lambda r: message_arrival_dt(r) or far)
@@ -2360,7 +2417,15 @@ def build_attack_timeline(records: list[EmailRecord],
     return events
  
  
-def earliest_malicious_precursor_verdict(records: list[EmailRecord]) -> dict:
+def earliest_malicious_precursor_verdict(records: list[EmailRecord],
+                                         anchors: Anchors = None) -> dict:
+    # "Earliest" has to mean earliest *in the investigation window*. Over a
+    # whole corpus it means the oldest message the mailbox contains, which on
+    # a long-lived account is unrelated to the incident.
+    if anchors is not None and anchors.compromise_date:
+        scoped = [r for r in records if in_lookback(r, anchors)]
+        if scoped:
+            records = scoped
     ordered = sorted(records, key=date_sort_key)
     candidates = []
     for i, r in enumerate(ordered):
@@ -2371,7 +2436,7 @@ def earliest_malicious_precursor_verdict(records: list[EmailRecord]) -> dict:
             evidence = [x for x in r.indicators if any(k in x.lower() for k in ("precursor", "phishing", "login", "url"))]
             candidates.append((r, later, evidence))
     if not candidates:
-        return {"verdict": "NO_EARLIEST_MALICIOUS_PRECURSOR_IDENTIFIED", "confidence": "low", "message_path": "", "timestamp": "", "reason": "No earlier message met the heuristic precursor criteria and was followed by a materially suspicious event in the available corpus.", "follow_on_messages": []}
+        return {"verdict": "NO_EARLIEST_MALICIOUS_PRECURSOR_IDENTIFIED", "confidence": "low", "message_path": "", "timestamp": "", "reason": "No earlier message met the heuristic precursor criteria and was followed by a materially suspicious event in the searched window.", "follow_on_messages": []}
     candidates.sort(key=lambda x: (date_sort_key(x[0]), -x[0].score))
     r, later, evidence = candidates[0]
     confidence = "high" if r.score >= 18 and any(x.score >= 20 for x in later) else "medium"

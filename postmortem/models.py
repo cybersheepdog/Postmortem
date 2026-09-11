@@ -214,6 +214,12 @@ class Anchors:
     victim_domains: list[str] = field(default_factory=list)    # victim org's domains
     scenario: str = "auto"                                     # auto|ato|impersonation
 
+    # How far back before `compromise_date` the entry point is searched for.
+    # Without a bound, every "earliest" selection returns the oldest message in
+    # the corpus: on a fourteen-year mailbox with a 2026 compromise, that is a
+    # 2012 family email, not the phishing message that led to the takeover.
+    lookback_days: int = 90
+
     def active(self) -> bool:
         return bool(
             self.compromise_date

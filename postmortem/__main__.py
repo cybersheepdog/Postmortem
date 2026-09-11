@@ -167,6 +167,7 @@ from postmortem.scoring import (  # noqa: E402
 # ============================================================================
  
 from postmortem.clustering import build_campaign_clusters  # noqa: E402
+from postmortem.scoring import investigation_window  # noqa: E402
 from postmortem.utils import registered_domain_approx  # noqa: E402
 # ============================================================================
 # ATTACK TIMELINE / PRECURSOR VERDICT
@@ -249,6 +250,8 @@ from postmortem.workers import (  # noqa: E402
 
 
 def _persist_records(cache, records, args, label, batch_size=1000):
+    # Timed: on a six-figure corpus these SQLite batches run for minutes and
+    # were landing in the untimed remainder of the report.
     """Write records back to the analysis cache in batched transactions.
 
     Used by any phase that enriches records after the initial cache write, so
@@ -256,6 +259,7 @@ def _persist_records(cache, records, args, label, batch_size=1000):
     """
     if not records:
         return 0
+    started = time.monotonic()
     rows = []
     stored = 0
     for record in records:
@@ -280,6 +284,7 @@ def _persist_records(cache, records, args, label, batch_size=1000):
     if rows:
         cache.put_batch(rows)
         stored += len(rows)
+    record_timing(f"persist {label}", time.monotonic() - started)
     print(f"Persisted {stored} {label} to the cache")
     return stored
 def v8_cache_progress(phase, completed, total, started, extra=""):
@@ -851,6 +856,19 @@ def main():
             "post-compromise."
         ),
     )
+
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=90,
+        help=(
+            "How many days before the compromise timestamp to search for the "
+            "entry point (default: %(default)s). Applies only when a compromise "
+            "date is known, from --compromise-date or an audit log. Without a "
+            "bound, \"the earliest suspicious message\" on a long-lived mailbox "
+            "is simply its oldest message."
+        ),
+    )
     anchor_group.add_argument(
         "--impersonated",
         action="append",
@@ -1203,6 +1221,7 @@ def main():
                 "(metadata identity mode; use --content-hash to enable it)..."
             )
             hashed = []
+            _t_prep = time.monotonic()
             for completed, (path, record) in enumerate(hash_jobs, 1):
                 try:
                     record._cache_file_sha256 = ""
@@ -1218,6 +1237,7 @@ def main():
                     hash_total,
                     hash_started,
                 )
+            record_timing("metadata cache preparation", time.monotonic() - _t_prep)
             print()
         else:
             print(f"Hashing uncached messages ({hash_total} files)...")
@@ -1310,6 +1330,8 @@ def main():
  
             if metadata_rows:
                 cache.put_batch(metadata_rows)
+            record_timing("metadata cache persistence",
+                          time.monotonic() - persist_started)
             print()
         else:
             # Batch content-hash lookups first, then batch all new/updated records
@@ -1588,6 +1610,8 @@ def main():
  
     if deep_rows:
         cache.put_batch(deep_rows)
+    record_timing("deep-analysis persistence",
+                  time.monotonic() - deep_persist_started)
  
     print()
  
@@ -1660,13 +1684,24 @@ def main():
             registered_domain_approx(part.strip())
             for part in str(value).split(",") if part.strip()
         )
-    scenario, scenario_reason, initial_verdict = run_scenario_analysis(
-        records, internal_domains, anchors, audit_summary, allowlist=allowlist
-    )
+    with timed("scenario analysis"):
+        scenario, scenario_reason, initial_verdict = run_scenario_analysis(
+            records, internal_domains, anchors, audit_summary, allowlist=allowlist
+        )
     if audit_summary:
         initial_verdict["audit_log"] = audit_summary
     print("Scenario profile:  " + term.c(scenario, "magenta", "bold")
           + f" ({scenario_reason})")
+    # State the period searched. A verdict of "no entry point found" means
+    # something different depending on how far back the search reached, so the
+    # window belongs in the output rather than only in the arguments.
+    _win_start, _win_end = investigation_window(anchors)
+    if _win_start is not None:
+        print(f"Entry-point window: {_win_start:%Y-%m-%dT%H:%M:%SZ} to "
+              f"{_win_end:%Y-%m-%dT%H:%M:%SZ} "
+              f"({args.lookback_days}d before compromise; --lookback-days)")
+    else:
+        print("Entry-point window: whole corpus (no compromise date known)")
 
     # Optional enrichment passes over the Tier 1/2 suspects. Each annotates and
     # can promote a confirmed hit to Tier 1; run before IOC/clustering/reporting.
@@ -1749,7 +1784,8 @@ def main():
             t: sum(1 for r in records if r.tier == t) for t in (1, 2, 3)}
 
     # Pivot-ready indicators of compromise from the Tier 1/2 suspects.
-    iocs = extract_iocs(records)
+    with timed("IOC extraction"):
+        iocs = extract_iocs(records)
     if iocs:
         by_type = Counter(e["type"] for e in iocs)
         print("Indicators of compromise (Tier 1/2): "
@@ -1757,8 +1793,9 @@ def main():
 
     # The audit log is merged in here, so the report carries one
     # chronology rather than a message timeline and a separate UAL summary.
-    timeline = build_attack_timeline(records, audit_summary)
-    precursor_verdict = earliest_malicious_precursor_verdict(records)
+    with timed("timeline + precursor verdict"):
+        timeline = build_attack_timeline(records, audit_summary)
+        precursor_verdict = earliest_malicious_precursor_verdict(records)
 
     manifest = build_run_manifest(
         args, records, scenario, anchors, initial_verdict, campaigns, iocs,
@@ -1766,6 +1803,13 @@ def main():
         elapsed_seconds=time.monotonic() - run_started,
         phase_timings=list(PHASE_TIMINGS),
         host=resources.describe_host(),
+        entry_point_window=(
+            {"start": _win_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "end": _win_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "lookback_days": args.lookback_days}
+            if _win_start is not None else
+            {"start": "", "end": "", "lookback_days": None}
+        ),
     )
 
     print()
