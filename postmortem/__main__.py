@@ -118,10 +118,12 @@ from postmortem.urls import extract_url_domains, analyze_url_robust  # noqa: E40
 from postmortem.parsing import parse_eml  # noqa: E402
 from postmortem.scoring import (  # noqa: E402
     classify_attack_stage, build_anchors, run_scenario_analysis,
-    parse_anchor_datetime,
+    parse_anchor_datetime, message_arrival_dt,
 )
 from postmortem.iocs import extract_iocs, write_iocs_csv  # noqa: E402
-from postmortem.auditlog import analyze_audit_log  # noqa: E402
+from postmortem.auditlog import (  # noqa: E402
+    analyze_audit_log, coverage_warnings,
+)
 from postmortem.mailbox_ingest import (  # noqa: E402
     find_containers, ingest_all,
 )
@@ -1685,8 +1687,20 @@ def main():
             audit_summary = None
         if audit_summary:
             _merge_audit_anchors(anchors, audit_summary)
+            # Computed before the private datetimes are stripped below: the
+            # warnings need them, the JSON report must not carry them.
+            _corpus_dts = [d for d in (message_arrival_dt(r) for r in records) if d]
+            audit_warnings = coverage_warnings(
+                audit_summary,
+                corpus_first=min(_corpus_dts) if _corpus_dts else None,
+                corpus_last=max(_corpus_dts) if _corpus_dts else None,
+                lookback_days=getattr(args, "lookback_days", None),
+            )
+            audit_summary["coverage_warnings"] = audit_warnings
             audit_summary.pop("_compromise_dt", None)
-            print_audit_summary(audit_summary)
+            for _k in ("_first_dt", "_last_dt"):
+                (audit_summary.get("coverage") or {}).pop(_k, None)
+            print_audit_summary(audit_summary, audit_warnings)
 
     allowlist = []
     for value in (args.allowlist or []):
@@ -1826,6 +1840,7 @@ def main():
             if _win_start is not None else
             {"start": "", "end": "", "lookback_days": None}
         ),
+        audit_summary=audit_summary,
     )
 
     print()

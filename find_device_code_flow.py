@@ -63,6 +63,7 @@ import csv
 import json
 import os
 import sys
+import time
 import datetime
 import html
 from collections import Counter, OrderedDict
@@ -107,6 +108,97 @@ def setup_color(disabled: bool) -> None:
         except Exception:
             return
     C.enable()
+
+
+# --------------------------------------------------------------------------
+# Progress
+#
+# A forensic export can be tens of thousands of records across hundreds of
+# files, and a tool that prints nothing until it finishes is indistinguishable
+# from a tool that has hung. Progress goes to stderr so that piping stdout to
+# a file or a pager stays clean, and it is drawn only for a terminal -- a
+# redirected run gets one completion line per phase instead of thousands of
+# carriage returns.
+# --------------------------------------------------------------------------
+
+class Progress:
+    """One phase of work, drawn in place."""
+
+    WIDTH = 24
+
+    def __init__(self, label, total=0, stream=None):
+        self.label = label
+        self.total = total or 0
+        self.n = 0
+        self.note = ""
+        self.stream = stream or sys.stderr
+        self.live = self.stream.isatty() and bool(C.OFF)
+        self._last = -1.0
+        self._blocks = self._can_draw_blocks()
+        self.draw(force=True)
+
+    def _can_draw_blocks(self):
+        if not self.live:
+            return False
+        try:
+            self.stream.write("")
+            "█".encode(self.stream.encoding or "ascii")
+            return True
+        except (UnicodeEncodeError, LookupError, AttributeError, TypeError):
+            return False
+
+    def _bar(self, frac):
+        filled = int(round(frac * self.WIDTH))
+        if self._blocks:
+            return "█" * filled + "░" * (self.WIDTH - filled)
+        return "#" * filled + "-" * (self.WIDTH - filled)
+
+    def draw(self, force=False):
+        if not self.live:
+            return
+        now = time.monotonic()
+        # Redrawing faster than the eye resolves only costs time.
+        if not force and (now - self._last) < 0.08:
+            return
+        self._last = now
+        if self.total:
+            frac = min(1.0, self.n / float(self.total))
+            head = "%s%s%s %s%3d%%%s" % (C.CYA, self._bar(frac), C.OFF,
+                                         C.BOLD, frac * 100, C.OFF)
+            count = " %s%s/%s%s" % (C.DIM, _thousands(self.n),
+                                    _thousands(self.total), C.OFF)
+        else:
+            head = "%s%s%s" % (C.CYA, self._spinner(), C.OFF)
+            count = " %s%s%s" % (C.DIM, _thousands(self.n), C.OFF)
+        line = "  %s %-26s%s %s%s%s" % (
+            head, self.label[:26], count, C.DIM, self.note[:40], C.OFF)
+        self.stream.write("\r\033[K" + line)
+        self.stream.flush()
+
+    _SPIN = "|/-\\"
+
+    def _spinner(self):
+        return self._SPIN[int(time.monotonic() * 8) % 4]
+
+    def advance(self, by=1, note=""):
+        self.n += by
+        if note:
+            self.note = note
+        self.draw()
+
+    def done(self, note=""):
+        if self.live:
+            self.stream.write("\r\033[K")
+            self.stream.flush()
+        if note:
+            print("%s%s%s %s" % (C.GRN, "  ok", C.OFF, note), file=self.stream)
+
+
+def _thousands(n):
+    try:
+        return "{:,}".format(int(n))
+    except (TypeError, ValueError):
+        return str(n)
 
 
 def rule(char="-", width=74):
@@ -283,24 +375,37 @@ def iter_records(path):
 
 
 def load_folder(folder, verbose):
+    scan = Progress("scanning for log files")
     files = []
     for root, _dirs, names in os.walk(folder):
         for n in sorted(names):
             if n.lower().endswith((".json", ".ndjson", ".jsonl")):
                 files.append(os.path.join(root, n))
+                scan.advance(note=os.path.basename(n))
+    scan.done()
     if not files:
         print("No .json/.ndjson/.jsonl files under %s" % folder, file=sys.stderr)
         return [], []
 
+    # Reading and flattening is where the time goes on a real export, so this
+    # is the phase that most needs to show it is moving.
+    bar = Progress("reading sign-in logs", total=len(files))
     records = []
     for p in files:
         before = len(records)
         for r in iter_records(p):
             records.append((os.path.basename(p), _flatten(r)))
+        bar.advance(note="%s (%s records)"
+                    % (os.path.basename(p)[:24], _thousands(len(records))))
         if verbose:
+            bar.done()
             print("  %s%-52s%s %6d records"
                   % (C.DIM, os.path.basename(p)[:52], C.OFF,
                      len(records) - before))
+            bar = Progress("reading sign-in logs", total=len(files))
+            bar.n = files.index(p) + 1
+    bar.done("read %s record(s) from %d file(s)"
+             % (_thousands(len(records)), len(files)))
     return files, records
 
 
@@ -899,17 +1004,28 @@ def build_coverage(records, files, have_transfer, have_protocol, hits):
     return rows, note
 
 
-def build_timelines(records, groups, limit=400):
+def build_timelines(records, groups, limit=400, progress=None):
     """Every sign-in for each account that has a device code record."""
     affected = OrderedDict()
     for g in groups:
         affected.setdefault(g["user"], 0)
         affected[g["user"]] += sum(1 for _ in g["legs"])
 
+    # One pass to index by account, rather than a full scan per affected user.
+    # On a 160k-record export with a dozen affected accounts the difference is
+    # a couple of million string comparisons.
+    wanted = {u.lower() for u in affected}
+    by_user = {}
+    for _s, f in records:
+        key = str(get(f, "user", "")).lower()
+        if key in wanted:
+            by_user.setdefault(key, []).append(f)
+
     out = []
     for user, dcf_count in affected.items():
-        rows = [f for _s, f in records
-                if str(get(f, "user", "")).lower() == user.lower()]
+        if progress is not None:
+            progress.advance(note=user[:30])
+        rows = by_user.get(user.lower(), [])
         rows.sort(key=lambda f: str(get(f, "time", "")))
         events = [{
             "time": str(get(f, "time", ""))[:19].replace("T", " "),
@@ -1052,23 +1168,38 @@ def main():
     have_protocol = sum(1 for _, f in records if get(f, "protocol", "") != "")
     fields_present = bool(have_transfer or have_protocol)
 
-    hits = [(src, f) for src, f in records if is_device_code(f)[0]]
+    scan = Progress("checking for device code", total=len(records))
+    hits = []
+    for src, f in records:
+        if is_device_code(f)[0]:
+            hits.append((src, f))
+        scan.advance(note="%s found" % _thousands(len(hits)))
+    scan.done("%s device code record(s)" % _thousands(len(hits)))
+
+    group_bar = Progress("grouping by correlation id", total=max(1, len(hits)))
     groups = build_groups(hits)
+    group_bar.n = len(hits)
+    group_bar.done("%d correlation group(s)" % len(groups))
     counts = Counter(g["verdict"] for g in groups)
 
     generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     coverage_rows, coverage_note = build_coverage(
         records, files, have_transfer, have_protocol, len(hits))
-    timelines = build_timelines(records, groups)
+    tl_bar = Progress("building account timelines",
+                      total=max(1, len({g["user"] for g in groups})))
+    timelines = build_timelines(records, groups, progress=tl_bar)
+    tl_bar.done("%d account timeline(s)" % len(timelines))
     ioc_text = build_iocs(groups)
 
     report_path = ""
     if not args.no_report:
+        rep_bar = Progress("writing report")
         target = args.report or os.path.join(
             args.folder, "device_code_flow_report.html")
         report_path = write_report(build_report_data(
             records, groups, files, args.folder, generated, fields_present,
             coverage_rows, coverage_note, timelines, ioc_text, len(hits)), target)
+        rep_bar.done()
 
     csv_path = ""
     if hits:

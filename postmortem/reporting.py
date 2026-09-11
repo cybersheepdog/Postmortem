@@ -35,6 +35,18 @@ def _confidence_c(text: str) -> str:
     return term.c(text, *styles)
 
 
+def _wrap_indent(text: str, indent: int, width: int = 78) -> str:
+    """Wrap `text` to `width`, indenting every line after the first.
+
+    Coverage warnings are full sentences that have to stay readable in a
+    terminal; a paragraph run off the right edge is a warning nobody reads.
+    """
+    import textwrap
+    lines = textwrap.wrap(str(text), width=max(20, width - indent))
+    pad = " " * indent
+    return ("\n" + pad).join(lines) if lines else ""
+
+
 def _hdr(title: str, ch: str = "=") -> None:
     """Print a consistent, color-coded section header."""
     print(term.c(ch * 80, "cyan"))
@@ -282,13 +294,48 @@ def print_attack_narrative(narrative: dict):
     print(f"  Note: {narrative.get('disclaimer', '')}")
 
 
-def print_audit_summary(audit: dict):
-    """Console section for an ingested M365 Unified Audit Log."""
+def print_audit_summary(audit: dict, warnings=None):
+    """Console section for an ingested M365 Unified Audit Log.
+
+    `warnings` come from auditlog.coverage_warnings() and state what the export
+    cannot speak to. They print first: a conclusion drawn from a log that does
+    not span the incident is worse than no conclusion, and an analyst needs to
+    know that before reading the findings, not after.
+    """
     if not audit:
         return
     d = audit.get("derived", {})
+    cov = audit.get("coverage", {}) or {}
     print()
     _hdr("M365 UNIFIED AUDIT LOG (confirmed attacker activity)")
+
+    if cov:
+        span = cov.get("span_days", 0)
+        print(f"  Log covers:             {cov.get('first_event', '?')} to "
+              f"{cov.get('last_event', '?')}"
+              + (f"  ({span}d)" if span else ""))
+        print(f"  Scope:                  {cov.get('mailboxes', 0)} mailbox(es), "
+              f"{cov.get('client_ips', 0)} client IP(s), "
+              f"{cov.get('distinct_operations', 0)} distinct operation(s)")
+        if cov.get("events_without_timestamp"):
+            print(f"  Undated events:         "
+                  f"{cov['events_without_timestamp']} (excluded from the timeline)")
+
+    ops = cov.get("operations") or []
+    if ops:
+        top = ops[:8]
+        print("  Operations:             " + ", ".join(
+            f"{name} ({count})" for name, count in top)
+            + (f", +{len(ops) - len(top)} more" if len(ops) > len(top) else ""))
+
+    for w in (warnings or []):
+        print()
+        label = "COVERAGE GAP" if w["severity"] == "high" else "Coverage note"
+        prefix = f"  {label}: "
+        print(prefix + _wrap_indent(w["text"], len(prefix)))
+    if warnings:
+        print()
+
     print(f"  Events parsed:          {audit.get('events_parsed', 0)}")
     if d.get("compromise_date"):
         print(f"  Compromise (earliest):  {d['compromise_date']}")
@@ -970,7 +1017,8 @@ def _command_line() -> str:
 
 def build_run_manifest(args, records, scenario, anchors, initial_verdict,
                        campaigns, iocs, generated_utc, elapsed_seconds,
-                       phase_timings=None, host=None, entry_point_window=None):
+                       phase_timings=None, host=None, entry_point_window=None,
+                       audit_summary=None):
     """Reproducibility / chain-of-custody metadata recorded in every report."""
     digest, basis = corpus_fingerprint(records)
     tier_counts = Counter(r.tier for r in records)
@@ -987,6 +1035,11 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
         # means something different depending on how far back the search
         # reached, so the window is part of the record.
         "entry_point_window": entry_point_window or {},
+        # Provenance of the audit evidence. A conclusion drawn from a log is
+        # bounded by that log, so the log's own range, operation mix and known
+        # gaps belong in the chain-of-custody record alongside the corpus
+        # hash -- otherwise a reader cannot tell what the run could not see.
+        "audit_log": _audit_provenance(args, audit_summary),
         "tool": "postmortem",
         "tool_version": TOOL_VERSION,
         "parser_version": PARSER_VERSION,
@@ -1031,6 +1084,21 @@ def build_run_manifest(args, records, scenario, anchors, initial_verdict,
     }
 
 
+def _audit_provenance(args, audit_summary):
+    path = str(getattr(args, "audit_log", "") or "")
+    if not audit_summary:
+        return {"supplied": bool(path), "path": path}
+    cov = dict(audit_summary.get("coverage") or {})
+    for k in ("_first_dt", "_last_dt"):
+        cov.pop(k, None)
+    return {
+        "supplied": True,
+        "path": path,
+        "coverage": cov,
+        "warnings": audit_summary.get("coverage_warnings") or [],
+    }
+
+
 def print_run_manifest(manifest):
     print()
     _hdr("RUN MANIFEST (reproducibility / chain of custody)")
@@ -1039,6 +1107,19 @@ def print_run_manifest(manifest):
     print(f"Generated (UTC): {manifest['generated_utc']}   Elapsed: {manifest['elapsed_seconds']}s")
     print(f"Corpus: {c['message_count']} messages | SHA-256 ({c['hash_basis']}): {c['corpus_sha256']}")
     print(f"Scenario: {manifest['scenario_profile']}   Command: {manifest['command_line']}")
+    a = manifest.get("audit_log") or {}
+    if a.get("supplied") and a.get("coverage"):
+        cov = a["coverage"]
+        print(f"Audit log: {cov.get('events_parsed', 0)} events, "
+              f"{cov.get('first_event', '?')} to {cov.get('last_event', '?')}"
+              f" ({cov.get('span_days', 0)}d)"
+              + (f" | {len(a['warnings'])} coverage warning(s)"
+                 if a.get("warnings") else ""))
+    elif a.get("supplied"):
+        print("Audit log: supplied but no events were parsed")
+    else:
+        print("Audit log: none supplied - every attacker action below is "
+              "inferred from message content alone")
 
 
 def write_json(

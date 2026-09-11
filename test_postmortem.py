@@ -1993,6 +1993,189 @@ def test_low_confidence_clusters_are_not_reported_but_are_kept():
 
 
 # --------------------------------------------------------------------------
+# E8: the audit export's own coverage
+#
+# A conclusion drawn from an audit log is bounded by that log. These lock down
+# that the run says where that boundary is, rather than reporting the earliest
+# attacker action it happens to see as though it were the start of the attack.
+# --------------------------------------------------------------------------
+def _ual(tmp_path, events, name="ual.json"):
+    import json
+    p = tmp_path / name
+    p.write_text(json.dumps(events), encoding="utf-8")
+    return str(p)
+
+
+def _ev(op, when, ip="203.0.113.9", user="victim@acme.com", **extra):
+    d = {"Operation": op, "UserId": user, "ClientIP": ip}
+    if when:
+        d["CreationTime"] = when
+    d.update(extra)
+    return d
+
+
+_RULE_PARAMS = [{"Name": "SubjectContainsWords", "Value": "invoice"},
+                {"Name": "DeleteMessage", "Value": "True"}]
+
+
+def test_audit_coverage_reports_range_and_operations(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    events = [_ev("UserLoggedIn", "2026-08-01T09:00:00"),
+              _ev("HardDelete", "2026-08-05T10:00:00"),
+              _ev("HardDelete", "2026-08-09T10:00:00"),
+              _ev("MailItemsAccessed", "2026-08-11T10:00:00"),
+              _ev("Set-Mailbox", None)]  # no timestamp at all
+    summary = analyze_audit_log(_ual(tmp_path, events))
+    cov = summary["coverage"]
+
+    assert cov["first_event"].startswith("2026-08-01")
+    assert cov["last_event"].startswith("2026-08-11")
+    assert cov["span_days"] == 10
+    assert cov["events_parsed"] == 5
+    assert cov["events_without_timestamp"] == 1
+    # The histogram is what tells an analyst the export was scoped to the wrong
+    # operations -- a log with no HardDelete cannot speak to deletions.
+    assert dict(cov["operations"])["HardDelete"] == 2
+    assert cov["distinct_operations"] == 4
+    assert cov["mailboxes"] == 1
+
+
+def test_corpus_older_than_the_log_is_a_high_severity_gap(tmp_path):
+    # The failure mode that silently invalidates an entry-point finding: the
+    # export starts after the corpus does, so "nothing before X" is a property
+    # of the export rather than of the intrusion.
+    from datetime import datetime, timezone
+    from postmortem.auditlog import analyze_audit_log, coverage_warnings
+
+    summary = analyze_audit_log(_ual(tmp_path, [
+        _ev("UserLoggedIn", "2026-08-25T09:00:00"),
+        _ev("HardDelete", "2026-08-27T09:00:00"),
+    ]))
+    warns = coverage_warnings(
+        summary,
+        corpus_first=datetime(2026, 5, 20, tzinfo=timezone.utc),
+        corpus_last=datetime(2026, 9, 8, tzinfo=timezone.utc),
+    )
+    gap = [w for w in warns
+           if w["severity"] == "high" and "before the audit log" in w["text"]]
+    assert gap, [w["text"] for w in warns]
+    assert "97 day(s)" in gap[0]["text"]
+    assert "not evidence of absence" in gap[0]["text"]
+
+    tail = [w for w in warns if "ends" in w["text"] and "before the corpus" in w["text"]]
+    assert tail and tail[0]["severity"] == "medium"
+
+    # A log that comfortably brackets the corpus raises neither.
+    clean = coverage_warnings(
+        summary,
+        corpus_first=datetime(2026, 8, 26, tzinfo=timezone.utc),
+        corpus_last=datetime(2026, 8, 26, tzinfo=timezone.utc),
+    )
+    assert not [w for w in clean if "before the audit log" in w["text"]]
+    assert not [w for w in clean if "before the corpus" in w["text"]]
+
+
+def test_compromise_on_the_first_day_of_the_export_is_flagged(tmp_path):
+    # The most misleading output the tool can produce: a compromise date that
+    # is really just where the export begins. It looks identical to a finding.
+    from postmortem.auditlog import analyze_audit_log, coverage_warnings
+
+    summary = analyze_audit_log(_ual(tmp_path, [
+        _ev("New-InboxRule", "2026-08-25T15:54:33", Parameters=_RULE_PARAMS),
+        _ev("HardDelete", "2026-09-10T09:00:00"),
+    ]))
+    assert summary["derived"]["compromise_date"].startswith("2026-08-25")
+
+    warns = coverage_warnings(summary)
+    lower = [w for w in warns if "lower bound set by the export" in w["text"]]
+    assert lower and lower[0]["severity"] == "high"
+
+    # Push the same rule well inside the export and the warning goes away --
+    # the date is then a finding, not an artifact.
+    later = analyze_audit_log(_ual(tmp_path, [
+        _ev("UserLoggedIn", "2026-07-01T09:00:00", ip="198.51.100.1"),
+        _ev("New-InboxRule", "2026-08-25T15:54:33", Parameters=_RULE_PARAMS),
+    ], name="later.json"))
+    assert not [w for w in coverage_warnings(later)
+                if "lower bound set by the export" in w["text"]]
+
+
+def test_lookback_longer_than_the_log_is_reported(tmp_path):
+    from postmortem.auditlog import analyze_audit_log, coverage_warnings
+
+    summary = analyze_audit_log(_ual(tmp_path, [
+        _ev("UserLoggedIn", "2026-08-25T09:00:00"),
+        _ev("HardDelete", "2026-08-30T09:00:00"),
+    ]))
+    warns = coverage_warnings(summary, lookback_days=90)
+    hit = [w for w in warns if "reaches back 90 days" in w["text"]]
+    assert hit, [w["text"] for w in warns]
+    assert "spans only 5" in hit[0]["text"]
+
+    # A log longer than the window is not worth a warning.
+    assert not [w for w in coverage_warnings(summary, lookback_days=3)
+                if "reaches back" in w["text"]]
+
+
+def test_empty_and_undated_exports_say_so(tmp_path):
+    from postmortem.auditlog import analyze_audit_log, coverage_warnings
+
+    empty = analyze_audit_log(_ual(tmp_path, [], name="empty.json"))
+    assert [w for w in coverage_warnings(empty) if w["severity"] == "high"]
+
+    undated = analyze_audit_log(_ual(tmp_path, [
+        _ev("UserLoggedIn", None), _ev("HardDelete", None),
+    ], name="undated.json"))
+    warns = coverage_warnings(undated)
+    assert warns and warns[0]["severity"] == "high"
+    assert "no compromise date can be derived" in warns[0]["text"]
+
+
+def test_manifest_carries_audit_provenance_and_stays_serialisable(tmp_path):
+    # The review's point: for a tool that emits a chain-of-custody manifest,
+    # the provenance of the audit evidence belongs in it. And the manifest is
+    # written to JSON, so the private datetimes must not leak into it.
+    import json
+    from types import SimpleNamespace
+    from postmortem.auditlog import analyze_audit_log, coverage_warnings
+    from postmortem.reporting import build_run_manifest
+    from postmortem.models import Anchors
+
+    summary = analyze_audit_log(_ual(tmp_path, [
+        _ev("New-InboxRule", "2026-08-25T15:54:33", Parameters=_RULE_PARAMS),
+        _ev("HardDelete", "2026-08-27T09:00:00"),
+    ]))
+    summary["coverage_warnings"] = coverage_warnings(summary)
+    summary.pop("_compromise_dt", None)
+    for k in ("_first_dt", "_last_dt"):
+        summary["coverage"].pop(k, None)
+
+    args = SimpleNamespace(directory=str(tmp_path), audit_log="ual.json",
+                           lookback_days=90)
+    recs = [make_record(path="/m/1.eml")]
+    m = build_run_manifest(args, recs, "ato", Anchors(), {}, [], [],
+                           generated_utc="2026-09-11T00:00:00Z",
+                           elapsed_seconds=1.0, audit_summary=summary)
+
+    a = m["audit_log"]
+    assert a["supplied"] is True
+    assert a["coverage"]["events_parsed"] == 2
+    assert a["coverage"]["first_event"].startswith("2026-08-25")
+    assert isinstance(a["warnings"], list)
+    json.dumps(m["audit_log"])  # must not raise on a datetime
+
+    # And a run with no audit log says so rather than staying silent, because
+    # "no confirmed attacker action" means something different without a log.
+    bare = build_run_manifest(
+        SimpleNamespace(directory=str(tmp_path), audit_log="", lookback_days=None),
+        recs, "ato", Anchors(), {}, [], [],
+        generated_utc="2026-09-11T00:00:00Z", elapsed_seconds=1.0,
+        audit_summary=None)
+    assert bare["audit_log"]["supplied"] is False
+
+
+# --------------------------------------------------------------------------
 # minimal fallback runner
 # --------------------------------------------------------------------------
 if __name__ == "__main__":

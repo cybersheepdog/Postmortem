@@ -20,6 +20,7 @@ treated as an attacker session.
 import csv
 import json
 import re
+from collections import Counter
 from datetime import datetime, timezone
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -196,6 +197,112 @@ def _rule_findings(event):
     }
 
 
+
+def _coverage(events):
+    """What this export can and cannot speak to.
+
+    A finding drawn from an audit log is bounded by the log. If the export
+    covers thirty days and the intrusion began sixty days ago, every conclusion
+    downstream is wrong and nothing in the report would previously have said
+    so -- the run would simply report the earliest attacker action it could
+    see, which is an artifact of where the export begins.
+    """
+    stamped = [e["timestamp"] for e in events if e["timestamp"]]
+    ops = Counter(e["operation"] for e in events if e["operation"])
+    first = min(stamped) if stamped else None
+    last = max(stamped) if stamped else None
+    return {
+        "first_event": first.strftime("%Y-%m-%dT%H:%M:%SZ") if first else "",
+        "last_event": last.strftime("%Y-%m-%dT%H:%M:%SZ") if last else "",
+        "span_days": (last - first).days if (first and last) else 0,
+        "events_parsed": len(events),
+        "events_without_timestamp": len(events) - len(stamped),
+        "distinct_operations": len(ops),
+        "operations": ops.most_common(),
+        "mailboxes": len({e["user"] for e in events if e["user"]}),
+        "client_ips": len({e["client_ip"] for e in events if e["client_ip"]}),
+        "_first_dt": first,
+        "_last_dt": last,
+    }
+
+
+def coverage_warnings(audit_summary, corpus_first=None, corpus_last=None,
+                      lookback_days=None):
+    """Where this log's answers stop being trustworthy.
+
+    Returns a list of ``{"severity": "high"|"medium", "text": ...}``. Each one
+    names a specific thing the export cannot support, rather than a general
+    caution -- an investigator can act on "the log begins 41 days after the
+    oldest message" and cannot act on "coverage may be incomplete".
+    """
+    if not audit_summary:
+        return []
+    cov = audit_summary.get("coverage") or {}
+    first = cov.get("_first_dt")
+    last = cov.get("_last_dt")
+    out = []
+
+    def add(sev, text):
+        out.append({"severity": sev, "text": text})
+
+    if not cov.get("events_parsed"):
+        add("high", "No audit events were parsed from the export.")
+        return out
+
+    if not first:
+        add("high",
+            "No event in the export carries a parseable timestamp, so the log "
+            "cannot bound anything in time and no compromise date can be "
+            "derived from it.")
+        return out
+
+    missing = cov.get("events_without_timestamp") or 0
+    if missing:
+        add("medium",
+            f"{missing} of {cov['events_parsed']} events carry no parseable "
+            "timestamp and are absent from every time-bounded conclusion.")
+
+    # The export beginning after the corpus does is the failure mode that
+    # silently invalidates an entry-point finding.
+    if corpus_first and corpus_first < first:
+        gap = (first - corpus_first).days
+        add("high",
+            f"The corpus begins {gap} day(s) before the audit log does "
+            f"(oldest message {corpus_first:%Y-%m-%d}, first log event "
+            f"{first:%Y-%m-%d}). Attacker activity in that period would not "
+            "appear here, so an absence of evidence before "
+            f"{first:%Y-%m-%d} is not evidence of absence.")
+
+    if corpus_last and last and corpus_last > last:
+        gap = (corpus_last - last).days
+        add("medium",
+            f"The audit log ends {gap} day(s) before the corpus does "
+            f"(last log event {last:%Y-%m-%d}, newest message "
+            f"{corpus_last:%Y-%m-%d}). Attacker actions after "
+            f"{last:%Y-%m-%d} are not covered.")
+
+    # A compromise date sitting on the first day of the export is the single
+    # most misleading output this tool can produce: it looks like a finding
+    # and is indistinguishable from the export simply starting there.
+    compromise = audit_summary.get("_compromise_dt")
+    if compromise and first and (compromise - first).total_seconds() <= 86400:
+        add("high",
+            f"The earliest attacker action ({compromise:%Y-%m-%d %H:%M}) falls "
+            f"within the first day of the export ({first:%Y-%m-%d}). The real "
+            "compromise may predate the log entirely -- this date is a lower "
+            "bound set by the export, not a finding. Re-export further back "
+            "before treating it as the start of the intrusion.")
+
+    if lookback_days and cov.get("span_days", 0) < lookback_days:
+        add("medium",
+            f"The entry-point search reaches back {lookback_days} days but the "
+            f"log spans only {cov['span_days']}. The earlier part of that "
+            "window rests on message content alone, with no audit log to "
+            "confirm or contradict it.")
+
+    return out
+
+
 def analyze_audit_log(path):
     """Parse a UAL export and derive anchors + confirmed attacker events.
 
@@ -261,6 +368,8 @@ def analyze_audit_log(path):
     }
     return {
         "events_parsed": len(events),
+        # What the export can speak to. Every finding below is bounded by it.
+        "coverage": _coverage(events),
         "malicious_rules": malicious_rules,
         "forwarding_rules": forwarding,
         "attacker_logins": sorted(attacker_logins, key=lambda x: x["time"]),
