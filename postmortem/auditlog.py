@@ -173,6 +173,19 @@ def _rule_findings(event):
     forwards, keywords, move_to = [], [], ""
     delete = False
     keeps_copy = False
+    # The rule's conditions kept apart by which field they test, so the rule
+    # can be re-run as a predicate rather than only mined for keywords. A
+    # word that must appear in the subject is a different rule from the same
+    # word appearing anywhere in the body.
+    conditions = {"subject": [], "body": [], "subject_or_body": [], "from": []}
+    _COND_FIELD = {
+        "subjectcontainswords": "subject",
+        "bodycontainswords": "body",
+        "subjectorbodycontainswords": "subject_or_body",
+        "fromaddresscontainswords": "from",
+        "from": "from",
+        "fromaddress": "from",
+    }
     for name, value in params.items():
         if name in _FORWARD_PARAMS and value:
             # "smtp:exfil@evil.example" is the usual Set-Mailbox form.
@@ -182,7 +195,14 @@ def _rule_findings(event):
         elif name in _MOVE_PARAMS and value:
             move_to = str(value)
         elif name in _KEYWORD_PARAMS and value:
-            keywords.extend(_split_words(value))
+            words = _split_words(value)
+            keywords.extend(words)
+            field = _COND_FIELD.get(name)
+            if field:
+                conditions[field].extend(words)
+        elif name in _COND_FIELD and value:
+            words = _split_words(value)
+            conditions[_COND_FIELD[name]].extend(words)
         elif name in ("deletemessage",) and str(value).lower() in ("true", "1"):
             delete = True
     for fld in ("ForwardingSmtpAddress", "ForwardingAddress"):
@@ -190,10 +210,12 @@ def _rule_findings(event):
             forwards.extend(_EMAIL_RE.findall(str(ad[fld])))
     forwards = list(dict.fromkeys(a.lower() for a in forwards))
     keywords = list(dict.fromkeys(keywords))
+    conditions = {k: list(dict.fromkeys(v)) for k, v in conditions.items() if v}
     hides = delete or any(h in move_to.lower() for h in _HIDDEN_FOLDERS)
     suspicious = bool(forwards or hides or keywords)
     return {
         "forwards": forwards, "keywords": keywords, "move_to": move_to,
+        "conditions": conditions,
         "delete": delete, "suspicious": suspicious, "keeps_copy": keeps_copy,
         "mailbox_level": bool(forwards) and event["op_lower"] == "set-mailbox",
     }
@@ -319,6 +341,80 @@ def build_message_index(events, attacker_ips=(), compromise_dt=None):
         "messages_referenced": len(index),
         "events_with_message_id": matched_events,
     }
+
+
+
+def _ip_activity(events, attacker_ips):
+    """Per-client-IP operation profile, for attribution and geolocation.
+
+    Attribution previously stopped at UserLoggedIn: an attacker could create a
+    rule, read a hundred messages and delete a dozen from the same address and
+    only the sign-in was ever attributed to them. Every operation from a known
+    attacker address is attacker activity.
+    """
+    attacker_ips = set(attacker_ips or ())
+    profile = {}
+    for e in events:
+        ip = e["client_ip"]
+        if not ip:
+            continue
+        p = profile.setdefault(ip, {
+            "ip": ip, "events": 0, "operations": Counter(),
+            "users": set(), "first": None, "last": None,
+            "is_attacker": ip in attacker_ips,
+        })
+        p["events"] += 1
+        p["operations"][e["operation"]] += 1
+        if e["user"]:
+            p["users"].add(e["user"])
+        ts = e["timestamp"]
+        if ts:
+            if p["first"] is None or ts < p["first"]:
+                p["first"] = ts
+            if p["last"] is None or ts > p["last"]:
+                p["last"] = ts
+
+    out = []
+    for p in profile.values():
+        out.append({
+            "ip": p["ip"],
+            "events": p["events"],
+            "operations": p["operations"].most_common(8),
+            "users": sorted(p["users"])[:5],
+            "first_seen": p["first"].strftime("%Y-%m-%dT%H:%M:%SZ") if p["first"] else "",
+            "last_seen": p["last"].strftime("%Y-%m-%dT%H:%M:%SZ") if p["last"] else "",
+            "is_attacker": p["is_attacker"],
+            # Filled in later by the GeoIP pass, when a database is supplied.
+            "country": "", "asn": "", "org": "", "unexpected_country": False,
+        })
+    out.sort(key=lambda x: (not x["is_attacker"], -x["events"]))
+    return out
+
+
+def annotate_audit_geoip(audit_summary, resolver, expected_countries=()):
+    """Geolocate audit client IPs and flag sessions outside the expected set.
+
+    ``--geoip-db`` was already wired for message headers and never applied to
+    the audit log, even though a mailbox operation from an unexpected country
+    is among the clearest signals in the whole dataset -- and unlike a header,
+    a ClientIP is recorded by the service rather than asserted by the sender.
+    """
+    if not audit_summary or not resolver or not resolver.available():
+        return {"resolved": 0, "unexpected": 0}
+    expected = {c.strip().upper() for c in (expected_countries or []) if c.strip()}
+    resolved = unexpected = 0
+    for entry in audit_summary.get("ip_activity") or []:
+        info = resolver.lookup(entry["ip"])
+        if not info.get("country") and not info.get("asn"):
+            continue
+        resolved += 1
+        entry["country"] = info.get("country", "")
+        entry["asn"] = info.get("asn", "")
+        entry["org"] = info.get("org", "")
+        if expected and entry["country"] and entry["country"].upper() not in expected:
+            entry["unexpected_country"] = True
+            unexpected += 1
+    return {"resolved": resolved, "unexpected": unexpected}
 
 
 def _coverage(events):
@@ -453,6 +549,7 @@ def analyze_audit_log(path):
                 "operation": e["operation"], "user": e["user"], "client_ip": e["client_ip"],
                 "forwards": f["forwards"], "move_to": f["move_to"],
                 "delete": f["delete"], "keywords": f["keywords"],
+                "conditions": f["conditions"],
                 "keeps_copy": f["keeps_copy"],
                 "mailbox_level": f["mailbox_level"],
             }
@@ -468,16 +565,25 @@ def analyze_audit_log(path):
             if e["timestamp"]:
                 action_times.append(e["timestamp"])
 
-    # Any sign-in from an attacker IP is an attacker session.
+    # Any sign-in from an attacker IP is an attacker session -- and so is
+    # every other operation from it. Stopping at UserLoggedIn meant an
+    # attacker could create a rule, read a hundred messages and delete a dozen
+    # from one address, and only the sign-in was ever attributed to them.
     attacker_logins = []
+    attacker_operations = []
     for e in events:
-        if e["op_lower"] in _LOGIN_OPS and e["client_ip"] and e["client_ip"] in attacker_ips:
+        if not (e["client_ip"] and e["client_ip"] in attacker_ips):
+            continue
+        stamp = e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ") if e["timestamp"] else ""
+        entry = {"time": stamp, "ip": e["client_ip"], "user": e["user"],
+                 "operation": e["operation"]}
+        attacker_operations.append(entry)
+        if e["op_lower"] in _LOGIN_OPS:
             attacker_logins.append({
-                "time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ") if e["timestamp"] else "",
-                "ip": e["client_ip"], "user": e["user"],
+                "time": stamp, "ip": e["client_ip"], "user": e["user"],
             })
-            if e["timestamp"]:
-                action_times.append(e["timestamp"])
+        if e["timestamp"]:
+            action_times.append(e["timestamp"])
 
     deletions = sum(1 for e in events if e["op_lower"] in _DELETE_OPS)
 
@@ -503,6 +609,12 @@ def analyze_audit_log(path):
         "malicious_rules": malicious_rules,
         "forwarding_rules": forwarding,
         "attacker_logins": sorted(attacker_logins, key=lambda x: x["time"]),
+        # Every operation attributable to a known attacker address, and the
+        # per-IP profile the GeoIP pass annotates.
+        "attacker_operations": sorted(attacker_operations, key=lambda x: x["time"]),
+        "attacker_operation_counts": Counter(
+            x["operation"] for x in attacker_operations).most_common(),
+        "ip_activity": _ip_activity(events, attacker_ips),
         "deletions": deletions,
         "derived": derived,
         "_compromise_dt": compromise_dt,

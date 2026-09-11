@@ -1469,6 +1469,247 @@ def deletion_completeness(records, audit_summary):
     }
 
 
+
+# E3 ------------------------------------------------------------------------
+
+_SEND_VERBS = {"sent", "sent as the mailbox owner",
+               "sent on behalf of the mailbox owner"}
+
+
+def attacker_authorship(records, audit_summary, anchors=None):
+    """Messages the audit log records the attacker as having SENT.
+
+    B1 infers a mass-mail burst from repeated body text. This confirms it, and
+    catches the case the heuristic cannot: an attacker who varied the wording
+    between recipients leaves no repetition to detect, but every message they
+    sent is named here.
+
+    Authorship is established by the sending address, or -- when no ClientIP
+    was recorded, which is common on Send -- by the send falling inside the
+    compromise window. The two are reported separately: one is attribution,
+    the other is inference from timing.
+    """
+    index = ((audit_summary or {}).get("message_index") or {}).get("by_message_id") or {}
+    if not index:
+        return {}
+
+    compromise = getattr(anchors, "compromise_date", None) if anchors else None
+    by_id = {}
+    for r in records:
+        key = normalize_message_id(getattr(r, "message_id", "") or "")
+        if key:
+            by_id.setdefault(key, r)
+
+    attributed, in_window = [], []
+    for mid, hits in index.items():
+        sends = [h for h in hits if h["verb"] in _SEND_VERBS]
+        if not sends:
+            continue
+        s = sends[0]
+        record = by_id.get(mid)
+        entry = {
+            "message_id": mid,
+            "time": s["time"],
+            "operation": s["operation"],
+            "subject": s["subject"] or (getattr(record, "subject", "") if record else ""),
+            "client_ip": s["client_ip"],
+            "actor": s["user"],
+            "in_corpus": record is not None,
+            "path": getattr(record, "path", "") if record else "",
+            "recipients": list(getattr(record, "recipients", []) or [])[:5] if record else [],
+            "burst_copies": int(getattr(record, "burst_copies", 0) or 0) if record else 0,
+        }
+        if s["by_attacker"]:
+            entry["basis"] = "sent from a known attacker address"
+            attributed.append(entry)
+        elif compromise and s["time"] and _iso_after(s["time"], compromise):
+            entry["basis"] = "sent after the compromise timestamp"
+            in_window.append(entry)
+
+    for entry in attributed:
+        record = by_id.get(entry["message_id"])
+        if record is not None:
+            record.attacker_authored = True
+
+    attributed.sort(key=lambda e: e["time"])
+    in_window.sort(key=lambda e: e["time"])
+    corroborated = [e for e in attributed if e["burst_copies"]]
+    return {
+        "attributed": attributed,
+        "in_window": in_window,
+        "attributed_count": len(attributed),
+        "in_window_count": len(in_window),
+        "burst_corroborated": len(corroborated),
+    }
+
+
+def _iso_after(stamp, dt):
+    """True when an ISO-8601 audit timestamp is at or after `dt`."""
+    parsed = parse_date(stamp)
+    if parsed is None or dt is None:
+        return False
+    try:
+        return parsed >= dt
+    except TypeError:
+        return False
+
+
+# E4 ------------------------------------------------------------------------
+
+def exposure_scope(records, audit_summary):
+    """Which messages an attacker session actually read.
+
+    Microsoft added MailItemsAccessed specifically to scope a post-compromise
+    investigation, and in a BEC case it answers the question the client cares
+    about most -- what did they see -- which often drives the
+    breach-notification decision.
+
+    The absence of the operation is reported as loudly as its contents. It
+    requires E5/G5 licensing, so a corpus without it means *unknown*, not
+    *nothing was read*, and those are very different answers to give a client.
+    """
+    summary = audit_summary or {}
+    index = (summary.get("message_index") or {}).get("by_message_id") or {}
+    operations = dict((summary.get("coverage") or {}).get("operations") or [])
+    has_operation = any(
+        str(op).lower() == "mailitemsaccessed" for op in operations)
+
+    # The gate is the operation's presence in the export, and nothing else.
+    # Keying off "did the index find anything" was wrong: a log containing
+    # HardDelete but no MailItemsAccessed has a populated index and would have
+    # reported "no message was accessed", which is the precise false negative
+    # this function exists to prevent.
+    if not has_operation:
+        return {
+            "available": False,
+            "reason": ("MailItemsAccessed does not appear in this export. It "
+                       "requires E5/G5 or Microsoft 365 E5 Compliance "
+                       "licensing; without it the mailbox may still have been "
+                       "read and the log simply would not record it. Treat "
+                       "the exposure scope as UNKNOWN, not as none."),
+        }
+
+    by_id = {}
+    for r in records:
+        key = normalize_message_id(getattr(r, "message_id", "") or "")
+        if key:
+            by_id.setdefault(key, r)
+
+    read = []
+    for mid, hits in index.items():
+        accesses = [h for h in hits if h["verb"] in ("read",
+                                                     "opened in the reading pane")
+                    and h["by_attacker"]]
+        if not accesses:
+            continue
+        record = by_id.get(mid)
+        read.append({
+            "message_id": mid,
+            "first_access": accesses[0]["time"],
+            "accesses": len(accesses),
+            "client_ip": accesses[0]["client_ip"],
+            "subject": (accesses[0]["subject"]
+                        or (getattr(record, "subject", "") if record else "")),
+            "sender": getattr(record, "sender_email", "") if record else "",
+            "in_corpus": record is not None,
+            "path": getattr(record, "path", "") if record else "",
+            "has_attachment": bool(getattr(record, "attachments", None)) if record else False,
+        })
+    read.sort(key=lambda e: e["first_access"])
+
+    return {
+        "available": True,
+        "has_operation": has_operation,
+        "messages_read": len(read),
+        "read_and_in_corpus": sum(1 for e in read if e["in_corpus"]),
+        "read_with_attachments": sum(1 for e in read if e["has_attachment"]),
+        "read": read,
+    }
+
+
+# E6 ------------------------------------------------------------------------
+
+def replay_rules(records, audit_summary):
+    """Run each malicious rule's own conditions over the corpus.
+
+    A rule carrying ``SubjectContainsWords: invoice, payment, wire`` is a
+    written statement of what the attacker wanted hidden. Scoring its keywords
+    uses that statement as a hint; running the rule is using it as a
+    specification. The result is the set of messages the rule would have
+    caught -- including ones that arrived after it was created and were filed
+    away without the user ever seeing them, which is the set nobody has looked
+    at.
+    """
+    rules = list((audit_summary or {}).get("malicious_rules") or [])
+    rules += list((audit_summary or {}).get("forwarding_rules") or [])
+    if not rules or not records:
+        return {}
+
+    out = []
+    for rule in rules:
+        conditions = rule.get("conditions") or {}
+        subject_words = [w.lower() for w in conditions.get("subject", []) if w]
+        body_words = [w.lower() for w in conditions.get("body", []) if w]
+        either_words = [w.lower() for w in conditions.get("subject_or_body", []) if w]
+        senders = [w.lower() for w in conditions.get("from", []) if w]
+        if not (subject_words or body_words or either_words or senders):
+            continue
+
+        created = parse_date(rule.get("time", "") or "")
+        before, after = [], []
+        for r in records:
+            subject = (getattr(r, "subject", "") or "").lower()
+            body = (scoring_text(r) or "").lower()
+            sender = (getattr(r, "sender_email", "") or "").lower()
+
+            why = ""
+            if subject_words and any(w in subject for w in subject_words):
+                why = "subject"
+            elif body_words and any(w in body for w in body_words):
+                why = "body"
+            elif either_words and any(w in subject or w in body for w in either_words):
+                why = "subject or body"
+            elif senders and any(w in sender for w in senders):
+                why = "sender"
+            if not why:
+                continue
+
+            arrival = message_arrival_dt(r)
+            entry = {
+                "path": r.path, "subject": getattr(r, "subject", ""),
+                "sender": sender, "date": getattr(r, "date", ""),
+                "matched_on": why, "tier": getattr(r, "tier", 0),
+            }
+            if created and arrival and arrival >= created:
+                after.append(entry)
+            else:
+                before.append(entry)
+
+        out.append({
+            "rule_time": rule.get("time", ""),
+            "operation": rule.get("operation", ""),
+            "client_ip": rule.get("client_ip", ""),
+            "action": ("deletes matching mail" if rule.get("delete")
+                       else (f"moves to '{rule.get('move_to')}'"
+                             if rule.get("move_to")
+                             else ("forwards to " + ", ".join(rule.get("forwards", []))
+                                   if rule.get("forwards") else "acts on matching mail"))),
+            "conditions": conditions,
+            "matched_total": len(before) + len(after),
+            "matched_before_rule": len(before),
+            "matched_after_rule": len(after),
+            "before": sorted(before, key=lambda e: e["date"])[:200],
+            "after": sorted(after, key=lambda e: e["date"])[:200],
+        })
+
+    out.sort(key=lambda x: -x["matched_after_rule"])
+    return {
+        "rules": out,
+        "rules_replayed": len(out),
+        "matched_after_any_rule": sum(x["matched_after_rule"] for x in out),
+    }
+
+
 def assign_tiers(records, scenario, anchors: Anchors):
     """Sort every message into review tiers so the analyst works a small, high-
     precision set first instead of thousands of candidates.
@@ -1892,6 +2133,9 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     # What the attacker removed, and whether it is still in the export. This
     # is a claim about the completeness of the evidence, not about a message.
     completeness = deletion_completeness(records, audit_summary)
+    authorship = attacker_authorship(records, audit_summary, anchors)
+    exposure = exposure_scope(records, audit_summary)
+    rule_replay = replay_rules(records, audit_summary)
 
     for r in records:
         score_initial_email(r, scenario, anchors)
@@ -1900,6 +2144,9 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     verdict["tier_counts"] = {t: tier_counts.get(t, 0) for t in (1, 2, 3)}
     verdict["audit_join"] = audit_join
     verdict["deletion_completeness"] = completeness
+    verdict["attacker_authorship"] = authorship
+    verdict["exposure_scope"] = exposure
+    verdict["rule_replay"] = rule_replay
     verdict["victim_address"] = victim_address
     verdict["attack_narrative"] = reconstruct_attack_narrative(
         records, scenario, anchors, verdict, audit_summary

@@ -314,6 +314,130 @@ def print_deletion_completeness(verdict: dict, limit: int = 15):
               "(complete list in the JSON report)")
 
 
+
+def print_attacker_authorship(verdict: dict, limit: int = 12):
+    """What the attacker sent from the mailbox they took over (E3)."""
+    a = (verdict or {}).get("attacker_authorship") or {}
+    if not (a.get("attributed_count") or a.get("in_window_count")):
+        return
+    print()
+    _hdr("SENT BY THE ATTACKER (confirmed from the audit log)")
+    print(f"  Sent from a known attacker address:  {a['attributed_count']}")
+    if a.get("in_window_count"):
+        print(f"  Sent after the compromise timestamp: {a['in_window_count']}"
+              "   (timing, not attribution)")
+    if a.get("burst_corroborated"):
+        print(f"  Also detected as a mass-mail burst:  {a['burst_corroborated']}"
+              "   (corpus repetition agrees)")
+
+    rows = (a.get("attributed") or []) + (a.get("in_window") or [])
+    if not rows:
+        return
+    print()
+    for e in rows[:limit]:
+        print(f"    {e['time'] or '(no time)':20} {e['operation']:14} "
+              f"{'in corpus' if e['in_corpus'] else 'NOT in corpus'}")
+        print(f"      subject: {e['subject'] or '(not recorded)'}")
+        if e.get("recipients"):
+            print(f"      to:      {', '.join(e['recipients'])}")
+        print(f"      basis:   {e['basis']}")
+    if len(rows) > limit:
+        print(f"    ... and {len(rows) - limit} more (full list in the JSON report)")
+
+
+def print_exposure_scope(verdict: dict, limit: int = 12):
+    """Which messages the intruder actually read (E4)."""
+    x = (verdict or {}).get("exposure_scope") or {}
+    if not x:
+        return
+    print()
+    _hdr("EXPOSURE SCOPE (what the intruder read)")
+
+    if not x.get("available"):
+        print("  " + _wrap_indent(x.get("reason", ""), 2))
+        return
+
+    if not x.get("messages_read"):
+        print("  The log carries MailItemsAccessed, and no message in it was")
+        print("  accessed from a known attacker address.")
+        return
+
+    print(f"  Messages read from an attacker address:  {x['messages_read']}")
+    print(f"    present in this export:                {x['read_and_in_corpus']}")
+    print(f"    carrying an attachment:                {x['read_with_attachments']}")
+    print()
+    print("  This is the set a breach-notification decision rests on: mail the")
+    print("  intruder is recorded as having opened, not mail they could have.")
+    print()
+    for e in x["read"][:limit]:
+        print(f"    {e['first_access'] or '(no time)':20} "
+              f"{('x%d' % e['accesses']) if e['accesses'] > 1 else '  ':4} "
+              f"{'' if e['in_corpus'] else '(NOT in corpus) '}"
+              f"{e['subject'] or '(subject not recorded)'}")
+        if e.get("sender"):
+            print(f"      from: {e['sender']}"
+                  + ("   [has attachment]" if e["has_attachment"] else ""))
+    if len(x["read"]) > limit:
+        print(f"    ... and {len(x['read']) - limit} more "
+              "(full list in the JSON report)")
+
+
+def print_rule_replay(verdict: dict, limit: int = 10):
+    """What each malicious rule would have caught (E6)."""
+    r = (verdict or {}).get("rule_replay") or {}
+    if not r.get("rules"):
+        return
+    print()
+    _hdr("MALICIOUS RULES REPLAYED OVER THE CORPUS")
+    print("  A rule's conditions are a written statement of what the attacker")
+    print("  wanted hidden. Each is re-run here as a predicate over the corpus.")
+
+    for rule in r["rules"]:
+        conds = rule.get("conditions") or {}
+        spec = "; ".join(
+            f"{field.replace('_', ' ')}: {', '.join(words)}"
+            for field, words in conds.items() if words)
+        print()
+        print(f"  {rule['rule_time'] or '(no time)'} {rule['operation']}"
+              f" from {rule['client_ip'] or '(no IP)'} - {rule['action']}")
+        print(f"    conditions: {spec}")
+        print(f"    would have caught {rule['matched_total']} message(s) in this "
+              f"corpus:")
+        print(f"      {rule['matched_before_rule']} that arrived BEFORE the rule "
+              "existed")
+        print(f"      {rule['matched_after_rule']} that arrived AFTER it - filed "
+              "away unseen")
+        for e in rule["after"][:limit]:
+            print(f"        {e['date'][:31]:31} {e['subject'][:44]}")
+        if len(rule["after"]) > limit:
+            print(f"        ... and {len(rule['after']) - limit} more")
+
+
+def print_attacker_ip_activity(audit: dict, limit: int = 8):
+    """Everything done from each attacker address, and where it was (E9)."""
+    if not audit:
+        return
+    rows = [x for x in (audit.get("ip_activity") or []) if x["is_attacker"]]
+    flagged = [x for x in (audit.get("ip_activity") or [])
+               if x.get("unexpected_country") and not x["is_attacker"]]
+    if not rows and not flagged:
+        return
+    print()
+    _hdr("ATTACKER SESSION ACTIVITY (every operation, not just sign-ins)")
+    for x in rows:
+        where = ", ".join(v for v in (x.get("country"), x.get("org")) if v)
+        print(f"  {x['ip']:>39}  {x['events']} event(s)"
+              + (f"   {where}" if where else ""))
+        print(f"    {x['first_seen'] or '?'} to {x['last_seen'] or '?'}")
+        print("    " + ", ".join(f"{op} ({n})" for op, n in x["operations"]))
+        if x.get("unexpected_country"):
+            print(f"    OUTSIDE --expected-countries: {x['country']}")
+    for x in flagged:
+        print(f"  {x['ip']:>39}  {x['events']} event(s)   "
+              f"{x['country']} - outside --expected-countries, not otherwise "
+              "attributed")
+
+
 def print_initial_compromise(verdict: dict):
     print()
     _hdr("INITIAL COMPROMISE ANALYSIS")

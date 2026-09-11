@@ -122,7 +122,7 @@ from postmortem.scoring import (  # noqa: E402
 )
 from postmortem.iocs import extract_iocs, write_iocs_csv  # noqa: E402
 from postmortem.auditlog import (  # noqa: E402
-    analyze_audit_log, coverage_warnings,
+    analyze_audit_log, coverage_warnings, annotate_audit_geoip,
 )
 from postmortem.mailbox_ingest import (  # noqa: E402
     find_containers, ingest_all,
@@ -517,6 +517,8 @@ from postmortem.reporting import (  # noqa: E402
     print_run_manifest, build_run_manifest, generate_html_interactive,
     write_json, write_csv, print_attack_narrative, print_audit_summary,
     print_audit_join, print_deletion_completeness,
+    print_attacker_authorship, print_exposure_scope, print_rule_replay,
+    print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
 )
 from postmortem import term  # noqa: E402
@@ -1809,14 +1811,26 @@ def main():
         with phase("GeoIP / ASN lookups"):
             resolver = GeoResolver(db_paths)
             geo_n = host_n = 0
+            audit_geo = {}
             if resolver.available():
                 expected = [c for c in (args.expected_countries or "").split(",") if c.strip()]
                 geo_n, host_n = geo_annotate(
                     records, resolver, expected, _CFG.get("high_abuse_asn_keywords", []))
+                # The audit log's ClientIPs get the same treatment. Unlike a
+                # message header, a ClientIP is recorded by the service rather
+                # than asserted by the sender, so an unexpected country here is
+                # a much stronger signal than the same country in a Received.
+                audit_geo = annotate_audit_geoip(audit_summary, resolver, expected)
                 resolver.close()
         if resolver.available():
             print(f"GeoIP: {geo_n} suspicious-geography, {host_n} "
                   f"high-abuse-hosting message(s)")
+            if audit_geo.get("resolved"):
+                print(f"GeoIP (audit log): {audit_geo['resolved']} client IP(s) "
+                      f"located"
+                      + (f", {audit_geo['unexpected']} outside "
+                         f"--expected-countries"
+                         if audit_geo.get("unexpected") else ""))
             enriched = enriched or bool(geo_n or host_n)
     if enriched:
         initial_verdict["tier_counts"] = {
@@ -1882,6 +1896,14 @@ def main():
     print_audit_join(initial_verdict)
 
     print_deletion_completeness(initial_verdict)
+
+    print_attacker_authorship(initial_verdict)
+
+    print_exposure_scope(initial_verdict)
+
+    print_rule_replay(initial_verdict)
+
+    print_attacker_ip_activity(audit_summary)
 
     print_initial_compromise(initial_verdict)
 

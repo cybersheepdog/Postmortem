@@ -192,6 +192,9 @@ class EmailRecord:
     # Seen by an attacker session but not acted on -- often one line of a
     # folder sync, so it is context rather than targeting.
     audit_attacker_read: bool = False
+    # The audit log records this message as SENT from the mailbox by the
+    # attacker: confirmed authorship, not inferred from its wording.
+    attacker_authored: bool = False
     # Structured provenance for the initial-email verdict, parallel to
     # `provenance` for the main score: same shape, same make_finding().
     scenario_findings: list[dict] = field(default_factory=list)

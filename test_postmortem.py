@@ -10,6 +10,7 @@ is required.
 """
 
 import copy
+import json
 import sys
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -2612,6 +2613,257 @@ def test_completeness_reaches_the_manifest(tmp_path):
     # The ids are recorded so a later reader knows exactly what was never seen.
     assert cc["absent_items"][0]["message_id"] == "<gone@bank.example>"
     json.dumps(m["corpus_completeness"])
+
+
+# --------------------------------------------------------------------------
+# E3 / E4 / E6 / E9: the rest of what the audit log knows
+# --------------------------------------------------------------------------
+def _rule_with(words, field="SubjectContainsWords", when="2026-08-25T15:54:33"):
+    return {"CreationTime": when, "Operation": "New-InboxRule",
+            "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+            "Parameters": [{"Name": field, "Value": words},
+                           {"Name": "DeleteMessage", "Value": "True"}]}
+
+
+def _mail(mid, subject, day, sender="ap@supplier.example", body="Body."):
+    r = make_record(sender_email=sender, sender_domain=sender.split("@")[1],
+                    subject=subject, path="/m/%s.eml" % abs(hash(mid)),
+                    date="Wed, %02d Aug 2026 09:00:00 +0000" % day)
+    r.body = body
+    r.message_id = mid
+    r.urls = []; r.url_analysis = []; r.attachments = []
+    r.attachment_details = []; r.authentication_results = {}
+    return r
+
+
+# ---- E3 -------------------------------------------------------------------
+def test_sends_from_an_attacker_address_are_confirmed_authorship(tmp_path):
+    # B1 infers a mass-mail burst from repeated body text. This is the case the
+    # heuristic cannot see: an attacker who varied the wording leaves no
+    # repetition, but every message they sent is named in the log.
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import attacker_authorship
+    from postmortem.models import Anchors
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        _rule_with("invoice"),
+        {"CreationTime": "2026-08-26T09:10:00", "Operation": "Send",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "Item": {"InternetMessageId": "<out-1@acme.com>",
+                  "Subject": "Updated remittance instructions"}},
+        # the owner sending their own mail is not attacker authorship
+        {"CreationTime": "2026-08-20T09:00:00", "Operation": "Send",
+         "UserId": "victim@acme.com", "ClientIP": OWNER_IP,
+         "Item": {"InternetMessageId": "<own-1@acme.com>", "Subject": "Lunch"}},
+    ]), encoding="utf-8")
+    summary = analyze_audit_log(str(p))
+
+    sent = _mail("<out-1@acme.com>", "Updated remittance instructions", 26,
+                 sender="victim@acme.com")
+    own = _mail("<own-1@acme.com>", "Lunch", 20, sender="victim@acme.com")
+
+    anchors = Anchors()
+    anchors.compromise_date = summary["_compromise_dt"]
+    a = attacker_authorship([sent, own], summary, anchors)
+
+    assert a["attributed_count"] == 1
+    assert a["attributed"][0]["message_id"] == "<out-1@acme.com>"
+    assert a["attributed"][0]["subject"] == "Updated remittance instructions"
+    assert sent.attacker_authored is True
+    assert own.attacker_authored is False
+
+    # The owner's send, which is after the compromise but from their own
+    # address, is not silently upgraded to attacker authorship.
+    assert all(e["message_id"] != "<own-1@acme.com>" for e in a["attributed"])
+
+
+# ---- E4 -------------------------------------------------------------------
+def test_exposure_scope_lists_what_the_attacker_read(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import exposure_scope
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        _rule_with("invoice"),
+        {"CreationTime": "2026-08-25T16:02:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "Folders": [{"Path": "\\Inbox", "FolderItems": [
+             {"InternetMessageId": "<read-1@supplier.example>"},
+             {"InternetMessageId": "<read-2@supplier.example>"}]}]},
+        # the owner reading their own mail is not exposure
+        {"CreationTime": "2026-08-11T08:00:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": OWNER_IP,
+         "Folders": [{"Path": "\\Inbox", "FolderItems": [
+             {"InternetMessageId": "<own-read@list.example>"}]}]},
+    ]), encoding="utf-8")
+    summary = analyze_audit_log(str(p))
+
+    records = [_mail("<read-1@supplier.example>", "Invoice 7781", 10),
+               _mail("<own-read@list.example>", "Weekly digest", 11)]
+    x = exposure_scope(records, summary)
+
+    assert x["available"] is True
+    assert x["messages_read"] == 2          # both attacker-read ids
+    assert x["read_and_in_corpus"] == 1     # only one survives in the corpus
+    ids = [e["message_id"] for e in x["read"]]
+    assert "<read-2@supplier.example>" in ids
+    assert "<own-read@list.example>" not in ids, "owner's own reads are not exposure"
+
+
+def test_absent_mailitemsaccessed_is_unknown_not_none(tmp_path):
+    # The dangerous false negative: a log that simply lacks the operation must
+    # never read as "nothing was accessed". Keying off whether the message
+    # index found anything got this wrong -- a log with HardDelete but no
+    # MailItemsAccessed has a populated index.
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import exposure_scope
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        _rule_with("invoice"),
+        {"CreationTime": "2026-08-25T16:00:00", "Operation": "HardDelete",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP,
+         "AffectedItems": [{"InternetMessageId": "<gone@x.example>"}]},
+    ]), encoding="utf-8")
+    x = exposure_scope([], analyze_audit_log(str(p)))
+
+    assert x["available"] is False
+    assert "UNKNOWN" in x["reason"]
+    assert "E5/G5" in x["reason"]
+
+
+# ---- E6 -------------------------------------------------------------------
+def test_the_rule_is_replayed_over_the_corpus(tmp_path):
+    # A rule's conditions are a specification of what the attacker wanted
+    # hidden. Running it names the messages that were filed away unseen.
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import replay_rules
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([_rule_with("invoice, wire")]), encoding="utf-8")
+    summary = analyze_audit_log(str(p))
+
+    records = [
+        _mail("<pre@s.example>", "Invoice 7781 attached", 10),     # before
+        _mail("<post1@s.example>", "Invoice 7782 overdue", 27),    # after
+        _mail("<post2@s.example>", "Wire transfer confirmation", 28),
+        _mail("<none@s.example>", "Weekly digest", 11),            # no match
+    ]
+    r = replay_rules(records, summary)
+    assert r["rules_replayed"] == 1
+    rule = r["rules"][0]
+
+    assert rule["matched_total"] == 3
+    assert rule["matched_before_rule"] == 1
+    assert rule["matched_after_rule"] == 2
+    assert r["matched_after_any_rule"] == 2
+
+    after_subjects = [e["subject"] for e in rule["after"]]
+    assert "Invoice 7782 overdue" in after_subjects
+    assert "Wire transfer confirmation" in after_subjects
+    assert all("digest" not in s.lower() for s in after_subjects)
+    assert rule["conditions"]["subject"] == ["invoice", "wire"]
+
+
+def test_rule_conditions_are_kept_apart_by_field(tmp_path):
+    # A word that must appear in the subject is a different rule from the same
+    # word anywhere in the body; replaying them as one would over-match.
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import replay_rules
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        _rule_with("confidential", field="BodyContainsWords"),
+    ]), encoding="utf-8")
+    summary = analyze_audit_log(str(p))
+
+    subject_only = _mail("<a@s.example>", "Confidential matters", 27,
+                         body="Nothing notable here.")
+    body_only = _mail("<b@s.example>", "Monthly update", 27,
+                      body="Please treat as confidential.")
+    r = replay_rules([subject_only, body_only], summary)
+    rule = r["rules"][0]
+    assert rule["conditions"].get("body") == ["confidential"]
+    assert "subject" not in rule["conditions"]
+    matched = [e["subject"] for e in rule["after"]]
+    assert matched == ["Monthly update"], matched
+
+
+# ---- E9 -------------------------------------------------------------------
+def test_every_operation_from_an_attacker_ip_is_attributed(tmp_path):
+    # Attribution used to stop at UserLoggedIn, so an attacker could create a
+    # rule, read mail and delete it from one address and only the sign-in was
+    # ever attributed to them.
+    from postmortem.auditlog import analyze_audit_log
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        _rule_with("invoice"),
+        {"CreationTime": "2026-08-25T15:50:00", "Operation": "UserLoggedIn",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP},
+        {"CreationTime": "2026-08-25T16:02:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP},
+        {"CreationTime": "2026-08-25T16:30:00", "Operation": "HardDelete",
+         "UserId": "victim@acme.com", "ClientIP": ATTACKER_IP},
+        {"CreationTime": "2026-08-11T08:00:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": OWNER_IP},
+    ]), encoding="utf-8")
+    summary = analyze_audit_log(str(p))
+
+    ops = {x["operation"] for x in summary["attacker_operations"]}
+    assert ops == {"New-InboxRule", "UserLoggedIn", "MailItemsAccessed",
+                   "HardDelete"}
+    assert len(summary["attacker_logins"]) == 1, "sign-ins remain identifiable"
+
+    profile = {x["ip"]: x for x in summary["ip_activity"]}
+    assert profile[ATTACKER_IP]["is_attacker"] is True
+    assert profile[ATTACKER_IP]["events"] == 4
+    assert profile[OWNER_IP]["is_attacker"] is False
+    # The attacker's IP sorts first, so it is the first thing an analyst reads.
+    assert summary["ip_activity"][0]["ip"] == ATTACKER_IP
+
+
+def test_audit_ips_are_geolocated_and_flagged(tmp_path):
+    # --geoip-db was wired for message headers and never applied to the audit
+    # log, even though a ClientIP is recorded by the service rather than
+    # asserted by a sender, and so is the stronger of the two.
+    from postmortem.auditlog import analyze_audit_log, annotate_audit_geoip
+
+    class FakeResolver:
+        def available(self):
+            return True
+
+        def lookup(self, ip):
+            if ip == ATTACKER_IP:
+                return {"country": "IR", "asn": "AS197207", "org": "Example Host"}
+            return {"country": "US", "asn": "AS15169", "org": "Corp ISP"}
+
+    p = tmp_path / "ual.json"
+    p.write_text(json.dumps([
+        _rule_with("invoice"),
+        {"CreationTime": "2026-08-11T08:00:00", "Operation": "MailItemsAccessed",
+         "UserId": "victim@acme.com", "ClientIP": OWNER_IP},
+    ]), encoding="utf-8")
+    summary = analyze_audit_log(str(p))
+
+    result = annotate_audit_geoip(summary, FakeResolver(), ["US"])
+    assert result["resolved"] == 2
+    assert result["unexpected"] == 1
+
+    profile = {x["ip"]: x for x in summary["ip_activity"]}
+    assert profile[ATTACKER_IP]["country"] == "IR"
+    assert profile[ATTACKER_IP]["unexpected_country"] is True
+    assert profile[OWNER_IP]["country"] == "US"
+    assert profile[OWNER_IP]["unexpected_country"] is False
+
+    # No resolver, no claims.
+    class NoResolver:
+        def available(self):
+            return False
+
+    assert annotate_audit_geoip(summary, NoResolver(), ["US"]) == {
+        "resolved": 0, "unexpected": 0}
 
 
 # --------------------------------------------------------------------------
