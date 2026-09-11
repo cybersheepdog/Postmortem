@@ -65,20 +65,32 @@ CONFIG = {
 }
 
 # Version identifiers recorded in cache rows and the run manifest.
-# DEFERRED: the value is stale. The identifier was renamed from
-# V7_PARSER_VERSION (a development-generation prefix that outlived its
-# generation), but the *string* is deliberately unchanged, because it is the
-# analysis cache key: bumping it invalidates every cached record and forces a
-# full re-parse of the corpus.
 #
-# It should be bumped -- and must be -- the next time the EmailRecord schema or
-# the analysis semantics change in a way that makes a cached record wrong.
-# Several changes since it was last set have added fields (body_own,
-# quoted_signals, burst_copies, enrichment_fingerprint, enrichment_hits);
-# those are additive and old rows still load, so reuse stays safe for now.
-# Pair the bump with a run that can afford a cold cache.
-PARSER_VERSION = "8.2-attachment-inspection"
-TOOL_VERSION = "8.2"
+# BUMPED from "8.2-attachment-inspection". The previous value was held stale
+# deliberately -- it is the analysis cache key, and bumping it invalidates
+# every cached record and forces a full re-parse -- on the standing condition
+# that it "should be bumped, and must be, the next time the EmailRecord schema
+# or the analysis semantics change in a way that makes a cached record wrong".
+#
+# That condition is now met. URL extraction changed at PARSE time, not at
+# scoring time: extract_urls() drops schema/namespace hosts, html hrefs are
+# filtered through is_navigable(), and decode_base64_urls() no longer mines
+# encoded attachments (and no longer truncates what it recovers). `urls`,
+# `url_domains` and `url_analysis` are all built in parse_eml() and stored in
+# the cache, so a record cached under 8.2 still carries w3.org and
+# schemas.microsoft.com entries and the malformed half-URLs the old decoder
+# produced. Reusing those rows would feed the new scoring stale input and put
+# malformed URLs back into the IOC export.
+#
+# Scoring changes alone never require a bump: calculate_score() rebuilds
+# indicators on every run and is not cached. This bump is specifically about
+# the parse-time URL semantics.
+#
+# Extraction is unaffected: mailbox_ingest does not key on PARSER_VERSION, so
+# this costs a re-parse of the extracted .eml files, not a re-extraction from
+# the source containers.
+PARSER_VERSION = "8.3-url-extraction"
+TOOL_VERSION = "8.3"
 
 
 def load_config(path):
