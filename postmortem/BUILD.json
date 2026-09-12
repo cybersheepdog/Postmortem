@@ -1,5 +1,5 @@
 {
- "build_id": "f1a20a32c2",
+ "build_id": "76bbe44b1b",
  "file_count": 30,
  "files": {
   "__init__.py": "b69826ca1e0da639de6ec1e60334fc6e097fdc46884daa281e7ff792af7e69e6",
@@ -23,7 +23,7 @@
   "parsing.py": "4214e3d7628ee61e033ca2c35e119b9a56daa59f722fa71c50b8017f62b6db4a",
   "persistence.py": "bfe074bc71f8225ec221c2a7f54d83977473b337aff497414e3378f949aaccaa",
   "qr_scan.py": "c0a23037081d68f932483be9889494e672a298d3eabc8e7a90c58403d7abdc22",
-  "reporting.py": "01ec7fd51e67143db723ff5532a06271025ddda022e72378789b532bf3ce9573",
+  "reporting.py": "79a215add4889676e31e92cbda9fb6dc223c554339dcd5c6e060bbab11794069",
   "resources.py": "6ffba02fbabd3b9fbd669622f51b2414356eefc497f4620a5845d974b3541f5b",
   "scoring.py": "ba0e4309dc4277a7fd8f12fe8f6bbed1120e5cdcc08555051cbd895f00682ecf",
   "signin.py": "568322124a02c3b09b967ab38647eb76a1dfebdf791fb379ec9a9f4d5cd8f052",
@@ -33,7 +33,7 @@
   "workers.py": "49853ad9b99421a202859b010417a9bfde47e183c8c6665ca530e4fb2974a080",
   "yara_scan.py": "7f6e6c50d51dd508c054986eff5566f621a216ebc91309ac486101bc65c4176e"
  },
- "parser_version": "8.3-url-extraction",
+ "parser_version": "",
  "schema": "postmortem-build/1",
- "tool_version": "8.3"
+ "tool_version": ""
 }
