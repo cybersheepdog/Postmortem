@@ -33,14 +33,26 @@ def _package_dir():
 
 
 def _hash_file(path):
-    h = hashlib.sha256()
+    """SHA-256 of the file's CONTENT, with line endings normalised to LF.
+
+    Hashing raw bytes was wrong for the pipeline this actually travels:
+    git on Windows converts LF to CRLF on checkout by default
+    (core.autocrlf=true), so a correct, complete copy hashed differently
+    from the tree it came from and every file was reported stale. That is a
+    false alarm of the worst kind -- it trains the analyst to ignore the
+    warning, which is the one thing this must never do.
+
+    Normalising line endings is the narrowest fix that survives git: the
+    question is whether the CODE matches, and a checkout style is not a
+    difference in code. Nothing else is normalised -- whitespace, encoding
+    and content are all still compared exactly.
+    """
     try:
         with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(65536), b""):
-                h.update(chunk)
+            data = fh.read()
     except OSError:
         return None
-    return h.hexdigest()
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
 def file_digests(pkg_dir=None):

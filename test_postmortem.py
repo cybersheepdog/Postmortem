@@ -4587,6 +4587,37 @@ def test_a_complete_copy_verifies(tmp_path):
     assert result["differing"] == [] and result["missing"] == []
 
 
+def test_a_checkout_style_is_not_a_stale_file(tmp_path):
+    """git on Windows rewrites line endings; that is not a code change.
+
+    Hashing raw bytes meant a correct, complete copy pulled through git with
+    core.autocrlf=true reported EVERY file stale. A verifier that cries wolf
+    on a good deployment is worse than none: it teaches the analyst to
+    ignore the one warning that matters.
+    """
+    from postmortem.build_check import verify, file_digests
+
+    pkg = _fake_package(tmp_path, {"a.py": "A = 1\nB = 2\n",
+                                   "b.py": "C = 3\n"})
+    before = dict(file_digests(pkg))
+
+    for name in ("a.py", "b.py"):
+        raw = (pkg / name).read_bytes()
+        (pkg / name).write_bytes(raw.replace(b"\n", b"\r\n"))
+    assert (pkg / "a.py").read_bytes().count(b"\r\n") == 2, "fixture must be CRLF"
+
+    assert file_digests(pkg) == before, "line endings must not change the digest"
+    result = verify(pkg)
+    assert result["ok"] is True, result
+    assert result["differing"] == []
+
+    # ... but an actual content change is still caught, CRLF or not.
+    (pkg / "a.py").write_bytes(b"A = 999\r\nB = 2\r\n")
+    bad = verify(pkg)
+    assert bad["ok"] is False
+    assert bad["differing"] == ["a.py"]
+
+
 def test_a_stale_file_is_named(tmp_path):
     # The real failure: everything copied except one file, which keeps its
     # previous content. The question the analyst has is not "is something
