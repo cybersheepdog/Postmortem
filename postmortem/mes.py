@@ -86,7 +86,7 @@ CONSUMED = {"entra_audit", "oauth_permissions", "mfa", "devices",
             "role_activity", "risk_detections",
             "users", "accepted_domains", "mailbox_rules",
             "transport_rules", "mailbox_permissions",
-            "mailbox_audit_status"}
+            "mailbox_audit_status", "message_trace"}
 
 # Recognised here but parsed by the module that owns the format, so the
 # manifest can say "routed" rather than implying it went unread.
@@ -178,6 +178,7 @@ def collect(root, overrides=None):
     """
     from postmortem import persistence as P
     from postmortem import directory as D
+    from postmortem import messagetrace as MT
 
     by_kind, unrecognised, seen = ({}, [], 0)
     if root:
@@ -200,6 +201,7 @@ def collect(root, overrides=None):
         "transport_rules": D.parse_transport_rules,
         "mailbox_permissions": D.parse_mailbox_permissions,
         "mailbox_audit_status": D.parse_mailbox_audit_status,
+        "message_trace": MT.parse_trace,
     }
 
     sources = {}

@@ -131,6 +131,9 @@ from postmortem.mes import collect as collect_mes
 from postmortem.persistence import (
     analyze_persistence, remediation_plan, strip_private,
 )
+from postmortem.messagetrace import (
+    analyze_message_trace, notification_scope,
+)
 from postmortem.directory import (
     build_directory, config_drift, audit_coverage_for,
     summarize as summarize_directory,
@@ -530,7 +533,7 @@ from postmortem.reporting import (  # noqa: E402
     print_audit_join, print_deletion_completeness,
     print_signin_analysis, print_signin_lures,
     print_persistence, print_remediation, print_mes_manifest,
-    print_directory,
+    print_directory, print_message_trace, print_notification_scope,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -987,6 +990,12 @@ def main():
         type=Path,
         metavar="DIR",
         help="Microsoft-Extractor-Suite output directory. Every recognised artefact under it is ingested without a separate flag: directory audit, OAuth grants, MFA methods, devices, role activity and risk detections. The individual flags below still override what is found here.",
+    )
+    anchor_group.add_argument(
+        "--message-trace",
+        type=Path,
+        metavar="FILE",
+        help="Exchange message trace export (Get-MessageTraceLog / Get-MessageTraceV2). Answers what left the mailbox that is not in the PST: attacker-sent mail deleted from Sent Items but retained by the service for 90 days, and the third parties who received it.",
     )
     anchor_group.add_argument(
         "--directory-users",
@@ -1898,6 +1907,7 @@ def main():
         "mailbox_permissions": getattr(args, "mailbox_permissions", None),
         "transport_rules": getattr(args, "transport_rules", None),
         "mailbox_audit_status": getattr(args, "mailbox_audit_status", None),
+        "message_trace": getattr(args, "message_trace", None),
     }
     _mes_overrides = {k: v for k, v in _mes_overrides.items() if v}
     if getattr(args, "mes_dir", None) or _mes_overrides:
@@ -2012,6 +2022,41 @@ def main():
             directory, drift, _src.get('mailbox_audit_status'))
         if dir_summary.get('available'):
             print_directory(dir_summary)
+
+    # Last of the evidence sources: it borrows the victim address, the
+    # attacker addresses and the compromise anchor from everything above, so
+    # it cannot run until they are settled.
+    trace = None
+    trace_scope = None
+    if mes_bundle and (mes_bundle.get('sources') or {}).get('message_trace'):
+        _atk_t = set((audit_summary or {}).get('derived', {}).get(
+            'attacker_ips', []))
+        _atk_t |= set((signin_summary or {}).get('attacker_ips', []))
+        _anchor_t = (signin_summary or {}).get('_earliest_token_dt')
+        if _anchor_t is None:
+            _anchor_t = anchors.compromise_date or None
+        # Anchors carries victim DOMAINS, not addresses. The mailbox this
+        # corpus came from is the dominant recipient, which is the same
+        # inference run_scenario_analysis makes -- but that runs later, so it
+        # is made here rather than reached for.
+        _victims_t = set((signin_summary or {}).get('affected_users', []))
+        _rc = Counter()
+        for _r in records:
+            for _a in (_r.recipients or []):
+                if _a:
+                    _rc[str(_a).lower()] += 1
+        if _rc:
+            _victims_t.add(_rc.most_common(1)[0][0])
+        _internal_t = set(internal_domains or [])
+        if directory and directory.accepted_domains:
+            _internal_t |= directory.accepted_domains
+        trace = analyze_message_trace(
+            mes_bundle['sources']['message_trace'], records,
+            victim_addresses=_victims_t, attacker_ips=_atk_t,
+            compromise_dt=_anchor_t, internal_domains=_internal_t)
+        print_message_trace(trace)
+        trace_scope = notification_scope(trace)
+        print_notification_scope(trace_scope)
 
     allowlist = []
     for value in (args.allowlist or []):
@@ -2239,6 +2284,10 @@ def main():
             initial_verdict['persistence'] = strip_private(persistence)
         if dir_summary:
             initial_verdict['directory'] = dir_summary
+        if trace:
+            initial_verdict['message_trace'] = trace
+        if trace_scope:
+            initial_verdict['notification_scope'] = trace_scope
         initial_verdict['remediation'] = remediation
 
     print_initial_compromise(initial_verdict)

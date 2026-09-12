@@ -1002,6 +1002,88 @@ def print_directory(dir_summary: dict):
     print("  " + _wrap_indent(drift.get("note", ""), 2))
 
 
+
+def print_message_trace(trace: dict, limit: int = 12):
+    """What the account sent that the corpus never saw.
+
+    The corpus is a PST: it holds what survived. An attacker who sent from
+    the account and emptied Sent Items leaves a mailbox that looks untouched,
+    so the outbound half of a BEC is routinely the half that was destroyed.
+    """
+    t = trace or {}
+    if not t.get("available"):
+        return
+    print()
+    _hdr("MESSAGE TRACE (what left the mailbox)")
+
+    print(f"  Trace rows read:         {t['rows']}")
+    if t.get("victim_addresses"):
+        print(f"  Outbound from:           {', '.join(t['victim_addresses'])}")
+    print(f"  Sent in the window:      {t['outbound_in_window']} "
+          f"of {t['outbound_total']} outbound")
+    line = (f"  Delivered:               {t['delivered']}"
+            f"    blocked/failed: {t['blocked']}")
+    print(line)
+
+    if t.get("attacker_sent_count"):
+        print(term.c(f"  CONFIRMED attacker-sent: {t['attacker_sent_count']}"
+                     "   (submitted from a known attacker address)",
+                     "red", "bold"))
+    if t.get("unattributed_count"):
+        print(f"  Unattributed in window:  {t['unattributed_count']}"
+              "   (includes the owner's own sending)")
+
+    absent = t.get("absent_count", 0)
+    if absent:
+        print()
+        _ad = t.get("absent_delivered_count", absent)
+        print(term.c(f"  {absent} message(s) the service recorded are NOT in "
+                     f"this export ({_ad} of them delivered).", "red", "bold"))
+        print("  " + _wrap_indent(
+            "These existed and are gone. E5 infers gaps from deletion events; "
+            "this observes them directly.", 2))
+        for e in t.get("absent_from_corpus", [])[:limit]:
+            print(f"    {e.get('time', '')[:19]:<20} -> {e.get('recipient', ''):<38} "
+                  f"{(e.get('subject') or '(no subject)')[:34]}")
+        if absent > limit:
+            print(f"    ... {absent - limit} more in the JSON report")
+
+    recips = t.get("recipients") or []
+    if recips:
+        print()
+        print(f"  Third parties who received mail from this account "
+              f"({t.get('distinct_recipients', 0)} address(es) across "
+              f"{t.get('recipient_domains', 0)} domain(s)):")
+        print()
+        print(f"    {'domain':<34} {'addrs':>6} {'msgs':>6}  top subject")
+        print("    " + "-" * 74)
+        for r in recips[:limit]:
+            subj = r["top_subjects"][0][0][:30] if r["top_subjects"] else ""
+            row = (f"    {r['domain'][:34]:<34} {r['recipient_count']:>6} "
+                   f"{r['messages']:>6}  {subj}")
+            print(term.c(row, "yellow") if r["external"] else row)
+        if len(recips) > limit:
+            print(f"    ... {len(recips) - limit} more domain(s) in the JSON report")
+
+    for w in t.get("warnings", []):
+        print()
+        print(term.c("  [!] " + _wrap_indent(w, 6), "yellow"))
+
+
+def print_notification_scope(scope: dict):
+    """The list someone has to act on, readable without the rest of the report."""
+    s = scope or {}
+    if not s.get("assessed") or not s.get("external_domains"):
+        return
+    print()
+    _hdr("THIRD-PARTY NOTIFICATION SCOPE")
+    print(f"  External organisations:  {s['external_domains']}")
+    print(f"  External recipients:     {s['external_recipients']}")
+    print(f"  Messages delivered:      {s['messages_delivered']}")
+    print()
+    print("  " + _wrap_indent(s.get("note", ""), 2))
+
+
 def print_summary(
     records: list[EmailRecord],
     timeline: list[AttackTimelineEvent],

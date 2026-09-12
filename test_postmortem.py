@@ -5154,3 +5154,227 @@ def test_details_without_a_matching_filename_are_ignored_quietly(tmp_path):
     r2 = _attach_record("a.pdf", {}, "/m/nodet.eml")
     r2.attachment_details = []
     calculate_score(r2, {"acme.com"}, set())
+
+
+
+# --------------------------------------------------------------------------
+# Message trace: what left the mailbox that the corpus never saw
+#
+# The corpus is a PST, and a PST holds what survived. An attacker who sent
+# from the account and emptied Sent Items leaves a mailbox that looks
+# untouched, so the outbound half of a BEC is routinely the half that was
+# destroyed. Trace is retained by the service for 90 days regardless.
+# --------------------------------------------------------------------------
+from datetime import datetime as _dt, timezone as _tz
+
+TRACE_ATK = "45.147.230.88"
+TRACE_OWNER = "203.0.113.10"
+
+
+def _trace_rows():
+    from postmortem.messagetrace import parse_trace
+
+    return parse_trace([
+        # the owner's own mail, before the compromise
+        {"received": "2026-08-26T08:00:00Z", "senderaddress": "ap@acme.com",
+         "recipientaddress": "supplier@partner.example",
+         "subject": "Weekly numbers", "status": "Delivered",
+         "messageid": "<kept-1@acme.com>", "fromip": TRACE_OWNER},
+        # attacker-sent, delivered, destroyed
+        {"received": "2026-08-27T10:00:00Z", "senderaddress": "ap@acme.com",
+         "recipientaddress": "finance@clientco.example",
+         "subject": "Updated remittance instructions", "status": "Delivered",
+         "messageid": "<gone-1@acme.com>", "fromip": TRACE_ATK},
+        {"received": "2026-08-27T10:01:00Z", "senderaddress": "ap@acme.com",
+         "recipientaddress": "ap@clientco.example",
+         "subject": "Updated remittance instructions", "status": "Delivered",
+         "messageid": "<gone-2@acme.com>", "fromip": TRACE_ATK},
+        # attempted and blocked: intent, but no exposure
+        {"received": "2026-08-27T10:05:00Z", "senderaddress": "ap@acme.com",
+         "recipientaddress": "blocked@othercorp.example",
+         "subject": "Updated remittance instructions", "status": "Failed",
+         "messageid": "<f-1@acme.com>", "fromip": TRACE_ATK},
+        # somebody else's mail entirely -- a tenant-wide export
+        {"received": "2026-08-27T11:00:00Z", "senderaddress": "hr@acme.com",
+         "recipientaddress": "staff@acme.com", "subject": "Policy",
+         "status": "Delivered", "messageid": "<hr-1@acme.com>",
+         "fromip": TRACE_OWNER},
+    ])
+
+
+def _kept_record():
+    r = make_record(sender_email="ap@acme.com", sender_domain="acme.com",
+                    subject="Weekly numbers", path="/m/kept.eml",
+                    date="Wed, 26 Aug 2026 08:00:00 +0000")
+    r.body = "Attached."
+    r.message_id = "<kept-1@acme.com>"
+    r.urls = []; r.url_analysis = []; r.attachments = []
+    r.attachment_details = []; r.authentication_results = {}
+    return r
+
+
+def _trace_compromise():
+    return _dt(2026, 8, 27, 9, 0, tzinfo=_tz.utc)
+
+
+def test_mail_the_attacker_sent_and_destroyed_is_recovered(tmp_path):
+    # The finding this exists for: three messages left the account, one is in
+    # the export, and the service remembers the other two.
+    from postmortem.messagetrace import analyze_message_trace
+
+    out = analyze_message_trace(
+        _trace_rows(), [_kept_record()],
+        victim_addresses=["ap@acme.com"], attacker_ips=[TRACE_ATK],
+        compromise_dt=_trace_compromise(), internal_domains={"acme.com"})
+
+    assert out["available"] is True
+    assert out["outbound_total"] == 4        # hr@ is somebody else
+    assert out["outbound_in_window"] == 3    # the pre-compromise one is excluded
+    assert out["attacker_sent_count"] == 3
+    assert out["delivered"] == 2 and out["blocked"] == 1
+
+    assert out["absent_count"] == 3
+    ids = [e["message_id"] for e in out["absent_from_corpus"]]
+    assert "<kept-1@acme.com>" not in ids, "a message still in the corpus is not a gap"
+    assert "<gone-1@acme.com>" in ids and "<gone-2@acme.com>" in ids
+
+
+def test_a_blocked_send_is_intent_not_exposure(tmp_path):
+    # It is still a message that existed and is not here, and still evidence
+    # the attacker composed it -- but it reached nobody, and calling it
+    # delivered would overstate the notification list.
+    from postmortem.messagetrace import analyze_message_trace, notification_scope
+
+    out = analyze_message_trace(
+        _trace_rows(), [_kept_record()], victim_addresses=["ap@acme.com"],
+        attacker_ips=[TRACE_ATK], compromise_dt=_trace_compromise(),
+        internal_domains={"acme.com"})
+
+    assert out["absent_count"] == 3
+    assert out["absent_delivered_count"] == 2
+
+    scope = notification_scope(out)
+    # othercorp only ever received the blocked one, so it is not in scope.
+    assert [d["domain"] for d in scope["domains"]] == ["clientco.example"]
+    assert scope["external_recipients"] == 2
+
+
+def test_the_notification_list_is_grouped_not_enumerated(tmp_path):
+    # A flat list of every address is the doom-scroll this report has been
+    # fighting since the campaign list.
+    from postmortem.messagetrace import parse_trace, analyze_message_trace
+
+    rows = parse_trace([
+        {"received": "2026-08-27T10:%02d:00Z" % (i % 60),
+         "senderaddress": "ap@acme.com",
+         "recipientaddress": "user%d@bigclient.example" % i,
+         "subject": "Updated remittance instructions", "status": "Delivered",
+         "messageid": "<m%d@acme.com>" % i, "fromip": TRACE_ATK}
+        for i in range(120)
+    ])
+    out = analyze_message_trace(rows, [], victim_addresses=["ap@acme.com"],
+                                attacker_ips=[TRACE_ATK],
+                                compromise_dt=_trace_compromise(),
+                                internal_domains={"acme.com"})
+    assert out["recipient_domains"] == 1
+    assert out["distinct_recipients"] == 120
+    group = out["recipients"][0]
+    assert group["domain"] == "bigclient.example"
+    assert group["messages"] == 120
+    # The addresses themselves are capped; the count is not.
+    assert len(group["recipients"]) <= 40
+    assert group["recipient_count"] == 120
+
+
+def test_internal_recipients_are_not_a_notification_scope(tmp_path):
+    from postmortem.messagetrace import analyze_message_trace, notification_scope
+
+    out = analyze_message_trace(
+        _trace_rows(), [], victim_addresses=["ap@acme.com"],
+        attacker_ips=[TRACE_ATK], compromise_dt=_trace_compromise(),
+        internal_domains={"acme.com", "clientco.example"})
+    scope = notification_scope(out)
+    assert scope.get("external_domains", 0) == 0
+    assert [d["domain"] for d in out["recipients"] if d["external"]] == []
+
+
+def test_without_an_anchor_the_whole_window_is_reported_and_said_so(tmp_path):
+    from postmortem.messagetrace import analyze_message_trace
+
+    out = analyze_message_trace(_trace_rows(), [],
+                                victim_addresses=["ap@acme.com"],
+                                attacker_ips=[TRACE_ATK], compromise_dt=None)
+    assert out["outbound_in_window"] == out["outbound_total"] == 4
+    assert any("compromise date" in w for w in out["warnings"])
+
+
+def test_a_trace_without_message_ids_cannot_prove_a_gap(tmp_path):
+    # The dangerous false positive: no ids means no join, and reporting
+    # everything as absent would be a large, alarming, meaningless number.
+    from postmortem.messagetrace import parse_trace, analyze_message_trace
+
+    rows = parse_trace([
+        {"received": "2026-08-27T10:00:00Z", "senderaddress": "ap@acme.com",
+         "recipientaddress": "x@ext.example", "subject": "s",
+         "status": "Delivered"},
+    ])
+    out = analyze_message_trace(rows, [], victim_addresses=["ap@acme.com"],
+                                compromise_dt=_trace_compromise())
+    assert out["traced_with_id"] == 0
+    assert out["absent_count"] == 0, "no ids means no claim, not every claim"
+    assert any("no message ids" in w for w in out["warnings"])
+
+
+def test_the_dominant_sender_is_used_when_no_victim_is_supplied(tmp_path):
+    # A single-mailbox trace export is the common case and should work
+    # without being told whose mailbox it is.
+    from postmortem.messagetrace import parse_trace, analyze_message_trace
+
+    rows = parse_trace([
+        {"received": "2026-08-27T10:0%d:00Z" % i, "senderaddress": "ap@acme.com",
+         "recipientaddress": "u%d@ext.example" % i, "subject": "s",
+         "status": "Delivered", "messageid": "<m%d@acme.com>" % i}
+        for i in range(6)
+    ] + [
+        {"received": "2026-08-27T11:00:00Z", "senderaddress": "other@acme.com",
+         "recipientaddress": "z@ext.example", "subject": "s",
+         "status": "Delivered", "messageid": "<z@acme.com>"},
+    ])
+    out = analyze_message_trace(rows, [], compromise_dt=_trace_compromise())
+    assert out["victim_addresses"] == ["ap@acme.com"]
+    assert out["outbound_total"] == 6
+
+
+def test_no_trace_changes_nothing(tmp_path):
+    from postmortem.messagetrace import analyze_message_trace, notification_scope
+
+    for empty in ([], None):
+        out = analyze_message_trace(empty, [])
+        assert out["available"] is False
+        assert notification_scope(out) == {}
+    assert notification_scope(None) == {}
+
+def test_no_helper_in_this_file_is_defined_twice():
+    """Two test groups defining the same helper is a silent wrong-answer bug.
+
+    Everything here lives in one module, so a second `def _compromise()`
+    replaces the first and every earlier test quietly starts using the later
+    definition. That happened: the message-trace group redefined the
+    persistence group's compromise date, and it only surfaced because the two
+    dates differed enough to fail. Had they been compatible, those tests would
+    have passed while asserting against the wrong fixture.
+    """
+    import ast
+    import io as _io
+    import os
+
+    path = os.path.abspath(__file__)
+    tree = ast.parse(_io.open(path, encoding="utf-8").read())
+    seen, dupes = {}, []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in seen:
+                dupes.append("%s (lines %d and %d)"
+                             % (node.name, seen[node.name], node.lineno))
+            seen[node.name] = node.lineno
+    assert not dupes, "duplicate top-level definitions:\n  " + "\n  ".join(dupes)
