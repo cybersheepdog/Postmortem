@@ -25,6 +25,7 @@ from postmortem.utils import (
 )
 from functools import lru_cache
 from postmortem.urls import IP_URL_RE
+from postmortem.parsing import _EXECUTABLE_KINDS as _EXECUTABLE_SNIFF_KINDS
 from pathlib import Path
 
 
@@ -3310,8 +3311,61 @@ def calculate_score(
                       "password", "encrypted")
         )
 
+        # What the inspection actually found inside each file. Keyed by
+        # filename so it lines up with the extension pass below, and scored
+        # separately from it: the name and the content are two different
+        # claims, and the interesting case is when they disagree.
+        # calculate_score otherwise carries literal weights; these are
+        # configurable because they are new and unmeasured, and the first
+        # corpus that exercises them may well move them.
+        pw = CONFIG.get("priority_weights", {})
+        _details = {}
+        for d in (record.attachment_details or []):
+            if isinstance(d, dict):
+                _details[str(d.get("filename", "")).lower()] = d
+
         for filename in record.attachments:
             extension = Path(filename).suffix.lower()
+            _d = _details.get(str(filename).lower(), {})
+
+            if _d.get("ext_mismatch"):
+                sniffed = _d.get("sniffed_type", "") or "something else"
+                # An executable wearing a document's name is not a mismatch
+                # in the ordinary sense; it is the attack.
+                if sniffed in _EXECUTABLE_SNIFF_KINDS:
+                    add(f"Attachment is a disguised executable: {filename} "
+                        f"contains {sniffed}",
+                        pw.get("attach_disguised_exe", 8),
+                        category="attachment", source="attachment",
+                        matched=f"{filename}: content {sniffed}, extension {extension}")
+                else:
+                    add(f"Attachment content does not match its name: {filename}",
+                        pw.get("attach_content_mismatch", 6),
+                        category="attachment", source="attachment",
+                        matched=f"{filename}: content {sniffed}, extension {extension}")
+
+            if _d.get("html_form"):
+                add(f"Attachment contains a credential form: {filename}",
+                    pw.get("attach_credential_form", 6),
+                    category="attachment", source="attachment",
+                    matched=filename)
+
+            # A macro found by inspection, in a file whose extension does not
+            # already declare one -- a .doc carrying macros is the classic,
+            # and the extension pass below cannot see it.
+            if _d.get("macro") and extension not in MACRO_EXTENSIONS:
+                add(f"Macros found in an attachment that does not declare them: "
+                    f"{filename}",
+                    pw.get("attach_macro_found", 4),
+                    category="attachment", source="attachment",
+                    matched=filename)
+
+            if _d.get("suspicious_name"):
+                add(f"Deceptive attachment name: {filename}",
+                    pw.get("attach_double_extension", 5),
+                    category="attachment", source="attachment",
+                    matched=filename)
+
             if extension in EXECUTABLE_EXTENSIONS:
                 # No legitimate business use in mail. These are the ones the
                 # old flat list buried among archives and web pages.

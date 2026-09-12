@@ -4985,3 +4985,172 @@ def test_no_rule_keywords_changes_nothing(tmp_path):
     run_scenario_analysis([r], {"acme.com"}, Anchors())
     assert r.rule_target is False
     assert r.rule_target_keywords == []
+
+
+
+# --------------------------------------------------------------------------
+# C2: what a file IS, not what it is called
+#
+# calculate_score judged attachments purely by filename suffix. The offline
+# content inspection -- magic-byte sniffing, macro detection, embedded
+# credential forms, double extensions -- was parsed, stored on the record,
+# used by the scenario score, and ignored by the score that ranks the review
+# queue. So invoice.exe sent as invoice.pdf scored as an ordinary PDF, which
+# is the exact case magic-byte sniffing exists to catch.
+# --------------------------------------------------------------------------
+def _attach_record(name, details, path="/m/att.eml"):
+    from postmortem.models import EmailRecord
+
+    r = EmailRecord(path=path, filename=path.rsplit("/", 1)[-1])
+    r.sender_email = "ap@supplier.example"
+    r.sender_domain = "supplier.example"
+    r.subject = "Invoice attached"
+    r.date = "Wed, 26 Aug 2026 09:00:00 +0000"
+    r.body = "Please see attached."
+    r.recipients = ["v@acme.com"]
+    r.urls = []; r.url_domains = []; r.url_analysis = []
+    r.attachments = [name]
+    r.attachment_details = [dict(details, filename=name)]
+    r.authentication_results = {}
+    return r
+
+
+def _attach_findings(record):
+    return [f for f in record.provenance
+            if f["category"] == "attachment" and f["weight"]]
+
+
+def test_renaming_an_executable_no_longer_hides_it(tmp_path):
+    # The whole point. Both messages carry the same executable; one of them
+    # lies about it. The liar must not score lower.
+    from postmortem.scoring import calculate_score
+
+    honest = _attach_record("invoice.exe", {"sniffed_type": "pe_executable"},
+                            "/m/honest.eml")
+    disguised = _attach_record("invoice.pdf",
+                               {"ext_mismatch": True,
+                                "sniffed_type": "pe_executable"},
+                               "/m/disguised.eml")
+    benign = _attach_record("report.pdf", {}, "/m/benign.eml")
+
+    for r in (honest, disguised, benign):
+        calculate_score(r, {"acme.com"}, set())
+
+    assert disguised.score >= honest.score, (disguised.score, honest.score)
+    assert disguised.score > benign.score
+    sig = " ".join(f["signal"] for f in _attach_findings(disguised))
+    assert "disguised executable" in sig
+    # The evidence names both claims, so a reader can check it.
+    matched = " ".join(f["matched"] for f in _attach_findings(disguised))
+    assert "pe_executable" in matched and ".pdf" in matched
+
+
+def test_the_executable_kinds_come_from_parsing(tmp_path):
+    # Restating this set by hand got it wrong on the first attempt -- the real
+    # kinds are underscored and there are three, not seven -- which would have
+    # silently downgraded every disguised executable to an ordinary mismatch.
+    from postmortem.parsing import _EXECUTABLE_KINDS
+    from postmortem.scoring import _EXECUTABLE_SNIFF_KINDS
+
+    assert _EXECUTABLE_SNIFF_KINDS is _EXECUTABLE_KINDS
+    assert "pe_executable" in _EXECUTABLE_SNIFF_KINDS
+
+
+def test_a_mismatch_that_is_not_an_executable_scores_lower(tmp_path):
+    # Content that simply is not what it claims is worth reporting, but it is
+    # not the same finding as a disguised binary.
+    from postmortem.scoring import calculate_score
+
+    exe = _attach_record("a.pdf", {"ext_mismatch": True,
+                                   "sniffed_type": "pe_executable"}, "/m/1.eml")
+    other = _attach_record("b.pdf", {"ext_mismatch": True,
+                                     "sniffed_type": "html"}, "/m/2.eml")
+    for r in (exe, other):
+        calculate_score(r, {"acme.com"}, set())
+
+    assert exe.score > other.score
+    assert "does not match its name" in " ".join(
+        f["signal"] for f in _attach_findings(other))
+
+
+def test_macros_are_found_in_a_file_that_does_not_declare_them(tmp_path):
+    # A .doc carrying macros is the classic, and the extension pass cannot
+    # see it -- only .docm and friends are in MACRO_EXTENSIONS.
+    from postmortem.scoring import calculate_score
+
+    plain = _attach_record("notes.doc", {"macro": True}, "/m/doc.eml")
+    calculate_score(plain, {"acme.com"}, set())
+    assert "Macros found" in " ".join(f["signal"] for f in _attach_findings(plain))
+
+    # A .docm already scores for its extension; it must not be charged twice
+    # for the same observation.
+    declared = _attach_record("notes.docm", {"macro": True}, "/m/docm.eml")
+    calculate_score(declared, {"acme.com"}, set())
+    sigs = [f["signal"] for f in _attach_findings(declared)]
+    assert sum(1 for s in sigs if "acro" in s) == 1, sigs
+
+
+def test_a_credential_form_in_an_attachment_scores(tmp_path):
+    from postmortem.scoring import calculate_score
+
+    form = _attach_record("login.html", {"html_form": True}, "/m/f.eml")
+    plain = _attach_record("page.html", {}, "/m/p.eml")
+    for r in (form, plain):
+        calculate_score(r, {"acme.com"}, set())
+
+    assert form.score > plain.score
+    assert "credential form" in " ".join(
+        f["signal"] for f in _attach_findings(form))
+
+
+def test_a_deceptive_name_is_its_own_finding(tmp_path):
+    # invoice.pdf.scr earns both: the name is deceptive AND the extension is
+    # executable. Two distinct observations, not one counted twice.
+    from postmortem.scoring import calculate_score
+
+    r = _attach_record("invoice.pdf.scr", {"suspicious_name": True})
+    calculate_score(r, {"acme.com"}, set())
+    sigs = " ".join(f["signal"] for f in _attach_findings(r))
+    assert "Deceptive attachment name" in sigs
+    assert "Executable/script attachment" in sigs
+
+
+def test_an_ordinary_attachment_still_scores_nothing_for_being_one(tmp_path):
+    # B5 must survive: presence is context, not evidence.
+    from postmortem.scoring import calculate_score
+
+    r = _attach_record("Q3-report.pdf", {"sniffed_type": "pdf"})
+    calculate_score(r, {"acme.com"}, set())
+    assert _attach_findings(r) == []
+
+    zipped = _attach_record("Q3-report.zip", {"sniffed_type": "zip"},
+                            "/m/z.eml")
+    calculate_score(zipped, {"acme.com"}, set())
+    assert _attach_findings(zipped) == []
+
+
+def test_details_without_a_matching_filename_are_ignored_quietly(tmp_path):
+    # The details list is keyed back to the attachment by name. A record whose
+    # two lists disagree -- which a cache row from an earlier parser can
+    # produce -- must not raise, and must not attribute one file's content to
+    # another.
+    from postmortem.scoring import calculate_score
+    from postmortem.models import EmailRecord
+
+    r = EmailRecord(path="/m/odd.eml", filename="odd.eml")
+    r.sender_email = "a@b.example"; r.sender_domain = "b.example"
+    r.subject = "x"; r.body = "y"; r.date = "Wed, 26 Aug 2026 09:00:00 +0000"
+    r.recipients = ["v@acme.com"]
+    r.urls = []; r.url_domains = []; r.url_analysis = []
+    r.attachments = ["real.pdf"]
+    r.attachment_details = [{"filename": "something-else.pdf",
+                             "ext_mismatch": True,
+                             "sniffed_type": "pe_executable"}]
+    r.authentication_results = {}
+    calculate_score(r, {"acme.com"}, set())
+    assert "disguised" not in " ".join(f["signal"] for f in r.provenance)
+
+    # And missing details entirely is fine.
+    r2 = _attach_record("a.pdf", {}, "/m/nodet.eml")
+    r2.attachment_details = []
+    calculate_score(r2, {"acme.com"}, set())

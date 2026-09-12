@@ -38,6 +38,14 @@ CONFIG = {
         "reply_to_mismatch": 5, "lookalike": 9, "sending_ip_anomaly": 4,
         "thread_injection": 7, "display_name_spoof": 6, "deleted": 4,
         "moved": 2, "rule_target": 3, "attachment_threat": 6, "anchor": 12,
+        # What the file IS, as opposed to what it is called. Renaming an
+        # executable is the cheapest evasion there is, and until now it
+        # worked completely against the priority score.
+        "attach_disguised_exe": 8,
+        "attach_content_mismatch": 6,
+        "attach_credential_form": 6,
+        "attach_macro_found": 4,
+        "attach_double_extension": 5,
         # A rule keyword matching more than this share of the corpus is
         # not selecting anything. Measured at 0.871 on a real case, where
         # it contributed 44% of all score mass at a lift of 1.16x -- i.e.
