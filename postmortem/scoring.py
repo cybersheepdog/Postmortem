@@ -777,6 +777,7 @@ def annotate_forensic_signals(
 
         reply_to_addr = normalize_email(str(auth.get("reply_to", "") or ""))
         reply_to_domain = domain_of(reply_to_addr)
+        r.reply_to_address = reply_to_addr
         r.reply_to_mismatch = bool(
             reply_to_domain and r.sender_domain and reply_to_domain != r.sender_domain
         )
@@ -982,7 +983,8 @@ def annotate_forensic_signals(
         if r.reply_to_mismatch:
             nf(f"Reply-To domain ({reply_to_domain}) differs from sender domain",
                pw["reply_to_mismatch"], category="identity", source="header:Reply-To",
-               matched=reply_to_domain)
+               matched=f"From {r.sender_email} -> Reply-To "
+                       f"{r.reply_to_address or reply_to_domain}")
         if r.lookalike_of:
             nf(f"Sender domain resembles a known domain: {r.lookalike_of}",
                pw["lookalike"], category="identity", source="header:From",
@@ -1170,7 +1172,8 @@ def score_initial_email(record, scenario, anchors: Anchors):
     if record.reply_to_mismatch:
         note("Reply-To differs from sender domain", iw["reply_to_mismatch"],
              category="identity", source="header:Reply-To",
-             matched=f"From {record.sender_email} -> Reply-To {record.reply_to}")
+             matched=f"From {record.sender_email} -> Reply-To "
+                     f"{record.reply_to_address or '(not recorded)'}")
     if record.sending_ip_anomaly:
         note("Unusual originating IP for this sender", iw["sending_ip_anomaly"],
              category="identity", source="origin_ip",
@@ -1209,11 +1212,20 @@ def score_initial_email(record, scenario, anchors: Anchors):
     if record.attachment_threat:
         # A credential-form attachment is an entry vector like a login link;
         # macros/deceptive names are weaker but still material.
-        note(f"Dangerous attachment ({attach_notes[0]})",
+        # attachment_threat is set in annotate_forensic_signals from one call
+        # to attachment_threat_summary(); this is a second, independent call.
+        # The two normally agree, but a record whose flag was restored from a
+        # cache written by an earlier parser -- or whose details were trimmed
+        # between the passes -- has the flag set and no notes, and indexing
+        # [0] blind then crashed the whole run. Same shape as the Reply-To
+        # bug: trusting a boolean to imply a value computed elsewhere.
+        _label = (attach_notes[0] if attach_notes
+                  else record.attachment_threat_note or "unspecified")
+        note(f"Dangerous attachment ({_label})",
              iw["attachment_credential"] if attach_credential
              else iw["attachment_other"],
              category="attachment", source="attachment",
-             matched=record.attachment_threat_note or attach_notes[0])
+             matched=record.attachment_threat_note or _label)
 
     if scenario == "ato":
         if cred_lure:

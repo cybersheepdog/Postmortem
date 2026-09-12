@@ -164,6 +164,12 @@ class EmailRecord:
     sender_established: bool = False
     sender_first_contact: bool = False
     reply_to_mismatch: bool = False
+    # The Reply-To address itself. The mismatch flag alone cannot say
+    # WHERE a reply would have gone, which is the entire evidence for
+    # the finding -- and score_initial_email read a `reply_to`
+    # attribute that never existed, crashing any run containing a
+    # message with a Reply-To mismatch.
+    reply_to_address: str = ""
     lookalike_of: str = ""
     origin_ip: str = ""
     sending_ip_anomaly: bool = False

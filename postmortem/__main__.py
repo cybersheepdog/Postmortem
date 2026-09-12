@@ -91,7 +91,7 @@ from pathlib import Path
 
 # Tunable weights/thresholds live in the postmortem.config module (overridable with
 # --config); imported here so the rest of this file can reference them directly.
-from postmortem.config import load_config, PARSER_VERSION
+from postmortem.config import load_config, PARSER_VERSION, TOOL_VERSION
 
 
 # URL regexes, constants, and offline analysis live in postmortem.urls.
@@ -679,6 +679,29 @@ def progress_bar(
  
 
 
+
+def _build_banner():
+    """One line naming the version, the code digest and where it loaded from."""
+    import hashlib
+    import postmortem
+
+    pkg_dir = Path(postmortem.__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in sorted(os.listdir(pkg_dir)):
+        if not name.endswith(".py"):
+            continue
+        try:
+            with open(pkg_dir / name, "rb") as fh:
+                digest.update(name.encode("utf-8"))
+                digest.update(fh.read())
+        except OSError:
+            continue
+    short = digest.hexdigest()[:10]
+    return (term.c("postmortem %s" % TOOL_VERSION, "cyan", "bold")
+            + term.c("  parser %s  build %s" % (PARSER_VERSION, short), "cyan")
+            + "\n" + term.c("  loaded from %s" % pkg_dir, "dim"))
+
+
 def main():
  
     parser = argparse.ArgumentParser(
@@ -1131,6 +1154,17 @@ def main():
     term.set_enabled(not args.no_color and term.supports_color())
 
     run_started = time.monotonic()
+
+    # Which copy of the tool is this, and is it the one you think it is?
+    #
+    # The run manifest already records the version, but it prints at the END,
+    # which is no help when the run dies partway. With several working copies
+    # on several boxes all calling themselves the same version, the only
+    # reliable answer is the resolved package path plus a digest of the code
+    # actually loaded -- two copies at "8.3" with different content produce
+    # different digests, so a stale deployment is visible in the first line
+    # of output instead of in a traceback an hour later.
+    print(_build_banner())
 
     if args.config:
         try:
