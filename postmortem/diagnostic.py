@@ -44,6 +44,17 @@ SCHEMA = "postmortem-diagnostic/1"
 # --------------------------------------------------------------------------
 
 _SUBS = (
+    # Timestamps first: they are the most specific pattern here, and
+    # the IPv6 rule below otherwise swallows the clock half of a
+    # space-separated stamp. The generic number rule cannot template
+    # one at all -- \b\d[\d,]*\b fails on the 24 in "24T17" because
+    # 4 and T are both word characters -- so an ISO stamp came out as
+    # <n>-<n>-24T17:<n>:46Z and every distinct second became its own
+    # signal. On a real corpus that split one audit finding into 197
+    # rows, 79% of the table, burying everything worth reading.
+    (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<timestamp>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "<date>"),
+    (re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b"), "<time>"),
     # Longest and most specific first -- an email must be caught before the
     # domain pattern gets to the half of it after the @.
     (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "<email>"),
@@ -184,6 +195,28 @@ def _quantiles(values):
             "max": vs[-1], "mean": round(sum(vs) / len(vs), 2)}
 
 
+
+def _corpus_span_days(records):
+    """Days between the first and last message that carries a usable date."""
+    from postmortem.scoring import message_arrival_dt
+
+    stamps = []
+    for r in records or []:
+        try:
+            dt = message_arrival_dt(r)
+        except Exception:
+            dt = None
+        if dt is not None:
+            stamps.append(dt)
+    if len(stamps) < 2:
+        return None
+    try:
+        return (max(stamps) - min(stamps)).days
+    except TypeError:
+        # Mixed aware/naive datetimes: a span is not worth raising over.
+        return None
+
+
 def build(records, verdict=None, audit_summary=None, manifest=None,
           campaigns=None, timings=None, config=None,
           signin_summary=None, persistence=None):
@@ -277,7 +310,10 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "distinct_senders": len({getattr(r, "sender_email", "")
                                      for r in records
                                      if getattr(r, "sender_email", "")}),
-            "date_span_days": (manifest or {}).get("corpus", {}).get("span_days", None),
+            # Computed here rather than read from the manifest, which
+            # never carried a span_days key -- so this reported null on
+            # every run, including a corpus with 179 days of mail in it.
+            "date_span_days": _corpus_span_days(records),
         },
         "tiers": {str(k): v for k, v in sorted(tiers.items())},
         "scores": {

@@ -681,25 +681,33 @@ def progress_bar(
 
 
 def _build_banner():
-    """One line naming the version, the code digest and where it loaded from."""
-    import hashlib
+    """Version, build id, load path -- and a loud warning if the copy is stale.
+
+    Printed before any work so a mis-synced deployment is visible in the first
+    line of output rather than in a traceback an hour in. The check is
+    advisory: a tree with no manifest behaves exactly as it always did.
+    """
     import postmortem
+    from postmortem.build_check import verify, describe
 
     pkg_dir = Path(postmortem.__file__).resolve().parent
-    digest = hashlib.sha256()
-    for name in sorted(os.listdir(pkg_dir)):
-        if not name.endswith(".py"):
-            continue
-        try:
-            with open(pkg_dir / name, "rb") as fh:
-                digest.update(name.encode("utf-8"))
-                digest.update(fh.read())
-        except OSError:
-            continue
-    short = digest.hexdigest()[:10]
-    return (term.c("postmortem %s" % TOOL_VERSION, "cyan", "bold")
-            + term.c("  parser %s  build %s" % (PARSER_VERSION, short), "cyan")
-            + "\n" + term.c("  loaded from %s" % pkg_dir, "dim"))
+    result = verify(pkg_dir)
+
+    head = (term.c("postmortem %s" % TOOL_VERSION, "cyan", "bold")
+            + term.c("  parser %s  build %s"
+                     % (PARSER_VERSION, result["build_id"]), "cyan"))
+    lines = [head, term.c("  loaded from %s" % pkg_dir, "dim")]
+
+    problems = describe(result)
+    if problems:
+        lines.append("")
+        lines.append(term.c("  " + "!" * 74, "red", "bold"))
+        for line in problems:
+            lines.append(term.c("  " + line, "red", "bold"))
+        lines.append(term.c("  " + "!" * 74, "red", "bold"))
+    elif result["checked"]:
+        lines[0] += term.c("  [verified]", "green")
+    return "\n".join(lines)
 
 
 def main():
@@ -843,6 +851,14 @@ def main():
         help="Ignore any existing cached results and re-parse every message fresh",
     )
 
+    parser.add_argument(
+        "--verify-build",
+        action="store_true",
+        help="Check this deployment against the build manifest that shipped "
+             "with it and exit. Names any file that is stale or missing, so "
+             "an incomplete copy is caught before a run rather than during "
+             "one. Exit code 3 on mismatch.",
+    )
     parser.add_argument(
         "--no-color",
         action="store_true",
@@ -1148,6 +1164,34 @@ def main():
         help="Re-download GeoLite2 databases when the cached copy is older than "
              "this many days (default 7; GeoLite2 rebuilds twice a week).",
     )
+
+    # Parsed before anything else so the build can be checked on a box with
+    # no corpus to hand, which is exactly when you want to check it.
+    if "--verify-build" in sys.argv[1:]:
+        from postmortem.build_check import verify, describe, read_manifest
+        import postmortem as _pm
+        _dir = Path(_pm.__file__).resolve().parent
+        _res = verify(_dir)
+        print("postmortem %s  parser %s" % (TOOL_VERSION, PARSER_VERSION))
+        print("  package    %s" % _dir)
+        print("  build id   %s" % _res["build_id"])
+        _doc = read_manifest(_dir)
+        if not _res["checked"]:
+            print("  manifest   none (this tree predates the build manifest;")
+            print("             nothing to compare against)")
+            raise SystemExit(0)
+        print("  expected   %s  (%d file(s) recorded)"
+              % (_res["expected"], len(_doc.get("files") or {})))
+        if _res["ok"]:
+            print("  result     MATCHES the recorded build")
+            if _res["extra"]:
+                print("  note       extra file(s) present, not a problem: %s"
+                      % ", ".join(_res["extra"]))
+            raise SystemExit(0)
+        print("  result     MISMATCH")
+        for _line in describe(_res):
+            print("  " + _line)
+        raise SystemExit(3)
 
     args = parser.parse_args()
 

@@ -4552,3 +4552,352 @@ def test_every_printer_survives_nothing_to_print(tmp_path):
         if fn:
             fn(None)
             fn({})
+
+
+
+# --------------------------------------------------------------------------
+# Build verification
+#
+# The code is edited on one machine and run on another, and it travels by
+# hand. The same defect survived two syncs and produced two identical
+# tracebacks an hour into two separate runs, because an incomplete copy
+# imports cleanly, passes a grep for whatever was last fixed, and runs the
+# old logic anyway. Nothing in the tool could tell the difference.
+# --------------------------------------------------------------------------
+def _fake_package(tmp_path, files=None):
+    """A miniature package directory with a manifest beside it."""
+    from postmortem.build_check import write_manifest
+
+    pkg = tmp_path / "postmortem"
+    pkg.mkdir()
+    for name, body in (files or {"a.py": "A = 1\n", "b.py": "B = 2\n"}).items():
+        (pkg / name).write_text(body, encoding="utf-8")
+    write_manifest(pkg, tool_version="9.9", parser_version="9.9-test")
+    return pkg
+
+
+def test_a_complete_copy_verifies(tmp_path):
+    from postmortem.build_check import verify
+
+    pkg = _fake_package(tmp_path)
+    result = verify(pkg)
+    assert result["checked"] is True
+    assert result["ok"] is True
+    assert result["build_id"] == result["expected"]
+    assert result["differing"] == [] and result["missing"] == []
+
+
+def test_a_stale_file_is_named(tmp_path):
+    # The real failure: everything copied except one file, which keeps its
+    # previous content. The question the analyst has is not "is something
+    # wrong" but "what do I copy again", so the answer has to be a filename.
+    from postmortem.build_check import verify, describe
+
+    pkg = _fake_package(tmp_path)
+    (pkg / "a.py").write_text("A = 999  # stale\n", encoding="utf-8")
+
+    result = verify(pkg)
+    assert result["ok"] is False
+    assert result["differing"] == ["a.py"]
+    assert result["missing"] == []
+    assert result["build_id"] != result["expected"]
+
+    text = "\n".join(describe(result))
+    assert "a.py" in text
+    assert "STALE" in text
+
+
+def test_a_file_that_never_arrived_is_named(tmp_path):
+    from postmortem.build_check import verify, describe
+
+    pkg = _fake_package(tmp_path)
+    (pkg / "b.py").unlink()
+
+    result = verify(pkg)
+    assert result["ok"] is False
+    assert result["missing"] == ["b.py"]
+    assert "b.py" in "\n".join(describe(result))
+
+
+def test_an_extra_file_is_not_a_failure(tmp_path):
+    # A scratch file left in the package directory is untidy, not a stale
+    # deployment, and treating it as one would train the warning to be ignored.
+    from postmortem.build_check import verify
+
+    pkg = _fake_package(tmp_path)
+    (pkg / "scratch.py").write_text("# notes\n", encoding="utf-8")
+
+    result = verify(pkg)
+    assert result["ok"] is True
+    assert result["extra"] == ["scratch.py"]
+
+
+def test_a_tree_with_no_manifest_still_runs(tmp_path):
+    # Every copy that predates this mechanism must behave exactly as before.
+    # The failure being guarded against is silence, so the one thing this
+    # must never do is introduce a new way to stop.
+    from postmortem.build_check import verify, describe, read_manifest
+
+    pkg = tmp_path / "postmortem"
+    pkg.mkdir()
+    (pkg / "a.py").write_text("A = 1\n", encoding="utf-8")
+
+    assert read_manifest(pkg) is None
+    result = verify(pkg)
+    assert result["checked"] is False
+    assert result["ok"] is True
+    assert result["build_id"]
+    assert describe(result) == []
+
+
+def test_an_unreadable_manifest_is_not_fatal(tmp_path):
+    from postmortem.build_check import verify
+
+    pkg = _fake_package(tmp_path)
+    (pkg / "BUILD.json").write_text("{ this is not json", encoding="utf-8")
+
+    result = verify(pkg)
+    assert result["checked"] is False
+    assert result["ok"] is True
+
+
+def test_the_build_id_changes_with_content_not_with_name(tmp_path):
+    # Two copies both calling themselves 8.3 with different content must not
+    # produce the same id -- that identity is the entire point.
+    from postmortem.build_check import build_id, file_digests
+
+    pkg = _fake_package(tmp_path)
+    before = build_id(file_digests(pkg))
+    (pkg / "a.py").write_text("A = 2\n", encoding="utf-8")
+    after = build_id(file_digests(pkg))
+    assert before != after
+
+    # ... and it is stable for identical content.
+    (pkg / "a.py").write_text("A = 1\n", encoding="utf-8")
+    assert build_id(file_digests(pkg)) == before
+
+
+def test_the_shipped_package_matches_its_own_manifest(tmp_path):
+    # Guards the release step itself: a manifest regenerated before the last
+    # edit is worse than none, because it reports a clean tree as clean while
+    # the deployed copy of it is not.
+    from postmortem.build_check import verify
+
+    result = verify()
+    if not result["checked"]:
+        import pytest
+        pytest.skip("no BUILD.json in this working tree")
+    assert result["ok"], (
+        "BUILD.json is out of date with the package it sits in; "
+        "regenerate it before syncing. differing=%s missing=%s"
+        % (result["differing"], result["missing"]))
+
+
+
+# --------------------------------------------------------------------------
+# Weight tuning from the first real corpus (117,299 messages, 263 Tier 1)
+#
+# The measurements these encode:
+#   rule-keyword anchor   87.1% of corpus, +3, lift 1.16x -> 44% of all score
+#   missing Date header   20,985 fires, ~47 Tier 1 expected, 0 observed
+#   Received out of order  4,001 fires, ~9 expected, 0 observed
+#   auth failed (hard)     7,323 fires, lift 11.8x, scoring only +3
+# --------------------------------------------------------------------------
+def _kw_record(subject, body, path):
+    r = make_record(sender_email="ap@ext.example", sender_domain="ext.example",
+                    subject=subject, path=path,
+                    date="Wed, 26 Aug 2026 09:00:00 +0000")
+    r.body = body
+    r.urls = []; r.url_domains = []; r.url_analysis = []
+    r.attachments = []; r.attachment_details = []
+    r.authentication_results = {}
+    return r
+
+
+def test_a_rule_keyword_matches_on_word_boundaries(tmp_path):
+    # `kw in text` made 'pay' match 'company' and 'repay'. On a real corpus
+    # the field-blind substring check fired on 87.1% of messages.
+    from postmortem.scoring import build_rule_policy
+    from postmortem.models import Anchors
+
+    hit = _kw_record("Invoice", "Please pay this week.", "/m/1.eml")
+    miss = _kw_record("Company news", "The company will repay the loan.",
+                      "/m/2.eml")
+
+    anchors = Anchors()
+    anchors.rule_keywords = ["pay"]
+    policy = build_rule_policy([hit, miss], anchors, None)
+
+    # Both messages contain the letters "pay"; only one contains the word.
+    assert policy["counts"]["pay"] == 1, policy["counts"]
+
+
+def test_a_keyword_is_matched_in_the_field_the_rule_filtered_on(tmp_path):
+    # A rule matching a word in the SUBJECT is a different rule from one
+    # matching it anywhere in the body. Replaying them as one is why the
+    # anchor found 102,153 messages where replay_rules found 11,820.
+    from postmortem.scoring import build_rule_policy
+    from postmortem.models import Anchors
+
+    subject_only = _kw_record("Remittance advice", "Nothing notable.", "/m/a.eml")
+    body_only = _kw_record("Monthly update", "See the remittance attached.",
+                           "/m/b.eml")
+
+    anchors = Anchors()
+    anchors.rule_keywords = ["remittance"]
+    audit = {"malicious_rules": [
+        {"conditions": {"subject": ["remittance"]}, "keywords": ["remittance"]}]}
+
+    policy = build_rule_policy([subject_only, body_only], anchors, audit)
+    assert policy["fields"]["remittance"] == {"subject"}
+    assert policy["counts"]["remittance"] == 1, policy["counts"]
+
+    # With no recorded condition, look everywhere: not knowing where the rule
+    # looked is a reason to look broadly, not to skip the keyword.
+    loose = build_rule_policy([subject_only, body_only], anchors,
+                              {"malicious_rules": [{"keywords": ["remittance"]}]})
+    assert loose["fields"]["remittance"] == {"subject", "body"}
+    assert loose["counts"]["remittance"] == 2
+
+
+def test_a_keyword_matching_most_of_the_corpus_stops_scoring(tmp_path):
+    # The measured failure: +3 on 87% of a corpus is a constant offset, not a
+    # signal. It stays visible as a finding -- the investigator supplied it --
+    # but it must not rank anything.
+    from postmortem.scoring import build_rule_policy, run_scenario_analysis
+    from postmortem.models import Anchors
+
+    records = [_kw_record("Update %d" % i, "Regarding the invoice attached.",
+                          "/m/%d.eml" % i) for i in range(20)]
+    rare = _kw_record("One off", "About the chargeback only.", "/m/rare.eml")
+    records.append(rare)
+
+    anchors = Anchors()
+    anchors.rule_keywords = ["invoice", "chargeback"]
+    policy = build_rule_policy(records, anchors, None)
+
+    # 20 of 21 messages -- far over the cap.
+    assert "invoice" in policy["over_cap"]
+    # 1 of 21 -- selects something, so it still counts.
+    assert "chargeback" not in policy["over_cap"]
+
+    run_scenario_analysis(records, {"acme.com"}, anchors)
+    over = [r for r in records if "invoice" in (r.rule_target_keywords or [])]
+    assert over == [], "a keyword over the cap must not mark messages"
+    assert rare.rule_target is True
+    assert rare.rule_target_keywords == ["chargeback"]
+
+
+def test_the_two_measured_dead_signals_score_nothing(tmp_path):
+    # Both still reported -- they are true facts about the message -- but
+    # neither moves the score, having landed on zero of 263 Tier 1 findings.
+    from postmortem.config import CONFIG
+
+    pw = CONFIG["priority_weights"]
+    assert pw["date_anomaly_missing"] == 0
+    assert pw["received_anomaly_out_of_order"] == 0
+    # The other variants of each check are untouched: nothing was measured
+    # against them, so nothing justifies zeroing them.
+    assert pw["date_anomaly"] > 0
+    assert pw["received_anomaly"] > 0
+
+
+def test_a_missing_date_is_reported_but_not_scored(tmp_path):
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    r = _kw_record("Hello", "Body text.", "/m/nodate.eml")
+    r.date = ""
+    run_scenario_analysis([r], {"acme.com"}, Anchors())
+
+    found = [f for f in r.provenance if f["source"] == "header:Date"]
+    assert found, "the finding must still be stated"
+    assert all(f["weight"] == 0 for f in found), found
+
+
+def test_an_out_of_order_chain_is_zeroed_only_when_it_stands_alone(tmp_path):
+    # A note that ALSO reports a missing or truncated chain is a different
+    # observation and keeps its weight.
+    from postmortem.config import CONFIG
+
+    pw = CONFIG["priority_weights"]
+    alone = "Received timestamps out of order (possible forged hop)"
+    combined = "no Received chain on an external message; " + alone
+
+    def weight_for(note):
+        return (pw.get("received_anomaly_out_of_order", 0)
+                if "out of order" in note and ";" not in note
+                else pw["received_anomaly"])
+
+    assert weight_for(alone) == 0
+    assert weight_for(combined) == pw["received_anomaly"] > 0
+
+
+def test_the_highest_lift_signals_were_raised(tmp_path):
+    from postmortem.config import CONFIG, PHISHING_TERMS
+
+    # 11.8x lift over 7,323 messages, previously hardcoded at 3.
+    assert CONFIG["priority_weights"]["auth_fail_hard"] == 5
+    # 10.7x and 5.4x, both previously at 2.
+    assert PHISHING_TERMS["sign in"] == 4
+    assert PHISHING_TERMS["urgent"] == 3
+
+
+# ---- the diagnostic's own defects ---------------------------------------
+def test_one_audit_finding_stays_one_signal(tmp_path):
+    # 197 of 250 signal rows were the same finding split by timestamp,
+    # because \\b\\d[\\d,]*\\b cannot match the 24 in "24T17" -- 4 and T are
+    # both word characters, so the boundary fails.
+    from postmortem.diagnostic import template, scan_for_identifiers
+
+    a = template("Audit log: this message was read by bob@acme.com at "
+                 "2026-08-24T17:32:46Z from 203.0.113.9")
+    b = template("Audit log: this message was read by jane@acme.com at "
+                 "2026-08-24T18:05:11Z from 198.51.100.2")
+    assert a == b, (a, b)
+    assert "<timestamp>" in a
+    assert "2026" not in a and "24T17" not in a
+    assert not scan_for_identifiers(a)
+
+    # Other timestamp shapes template too.
+    for stamp in ("2026-08-24 17:32:46", "2026-08-24T17:32:46.123456Z",
+                  "2026-08-24T17:32:46+02:00", "2026-08-24T17:32"):
+        out = template("seen at %s here" % stamp)
+        assert "<timestamp>" in out, (stamp, out)
+        assert "2026" not in out, (stamp, out)
+
+
+def test_the_corpus_date_span_is_computed(tmp_path):
+    # Read from a manifest key build_run_manifest never wrote, so it reported
+    # null on every run -- including a corpus spanning 179 days.
+    from postmortem import diagnostic
+
+    records = []
+    for day, path in ((1, "/m/a.eml"), (31, "/m/b.eml")):
+        r = _kw_record("s", "b", path)
+        r.date = "Wed, %02d Aug 2026 09:00:00 +0000" % day
+        records.append(r)
+
+    doc = diagnostic.build(records, verdict={}, manifest={})
+    assert doc["corpus"]["date_span_days"] == 30, doc["corpus"]
+
+    # One message, or none, has no span -- and must not raise.
+    assert diagnostic.build(records[:1], verdict={}, manifest={})[
+        "corpus"]["date_span_days"] is None
+    assert diagnostic.build([], verdict={}, manifest={})[
+        "corpus"]["date_span_days"] is None
+
+
+def test_no_rule_keywords_changes_nothing(tmp_path):
+    # Every run without --rule-keyword must behave exactly as before.
+    from postmortem.scoring import build_rule_policy, run_scenario_analysis
+    from postmortem.models import Anchors
+
+    r = _kw_record("Hello", "Ordinary message.", "/m/plain.eml")
+    policy = build_rule_policy([r], Anchors(), None)
+    assert policy == {"fields": {}, "over_cap": set(), "counts": {},
+                      "total": 0, "cap": 0.0}
+
+    run_scenario_analysis([r], {"acme.com"}, Anchors())
+    assert r.rule_target is False
+    assert r.rule_target_keywords == []

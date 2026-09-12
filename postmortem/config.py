@@ -30,12 +30,32 @@ CONFIG = {
     # Weights folded into the general priority score (annotate_forensic_signals).
     "priority_weights": {
         "self_spoofing": 10, "auth_anomaly": 6, "auth_fail_chronic": 1,
+        # A hard alignment failure for a domain without an
+        # established passing history. Measured at 11.8x the Tier 1
+        # base rate on a 117k corpus, the highest lift of any
+        # high-volume signal, and previously hardcoded at 3.
+        "auth_fail_hard": 5,
         "reply_to_mismatch": 5, "lookalike": 9, "sending_ip_anomaly": 4,
         "thread_injection": 7, "display_name_spoof": 6, "deleted": 4,
         "moved": 2, "rule_target": 3, "attachment_threat": 6, "anchor": 12,
+        # A rule keyword matching more than this share of the corpus is
+        # not selecting anything. Measured at 0.871 on a real case, where
+        # it contributed 44% of all score mass at a lift of 1.16x -- i.e.
+        # indistinguishable from marking messages at random. Reported as
+        # a fact at weight 0 above the cap, never silently dropped.
+        "rule_keyword_corpus_cap": 0.25,
         # Header-hygiene signals: weak/corroborating (legit ESP mail can trip
         # the alignment checks), so kept low to avoid promoting benign senders.
         "received_anomaly": 2, "message_id_mismatch": 1, "date_anomaly": 2,
+        # Two header-hygiene variants measured at zero information on a
+        # 117k corpus: a missing Date header fired 20,985 times with ~47
+        # Tier 1 hits expected and zero observed, and out-of-order
+        # Received timestamps 4,001 times with ~9 expected and zero
+        # observed. Both are still reported -- they are true facts about
+        # the message -- but they no longer move the score. The other
+        # variants of each check keep their weight.
+        "date_anomaly_missing": 0,
+        "received_anomaly_out_of_order": 0,
         "dkim_misalignment": 2, "return_path_mismatch": 2,
         # A random-looking sender local-part (corroboration-gated); a small
         # NEGATIVE for legit bulk/marketing mail; a strong newly-registered
@@ -116,7 +136,7 @@ PHISHING_TERMS = {
     "reset your password": 5,
     "change your password": 4,
     "login": 2,
-    "sign in": 2,
+    "sign in": 4,
     "log in": 2,
     "authenticate": 3,
     "authentication": 3,
@@ -126,7 +146,7 @@ PHISHING_TERMS = {
     "account suspended": 5,
     "account locked": 5,
     "action required": 3,
-    "urgent": 2,
+    "urgent": 3,
     "immediately": 2,
     "within 24 hours": 4,
     "click here": 4,

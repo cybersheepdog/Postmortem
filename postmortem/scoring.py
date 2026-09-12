@@ -731,11 +731,93 @@ def detect_scenario(records, anchors: Anchors):
     return "impersonation", "default profile (no account-takeover markers detected)"
 
 
+
+def rule_keyword_fields(audit_summary):
+    """Which message field each rule keyword was actually filtered on.
+
+    A rule that matched a word in the SUBJECT is a different rule from one
+    that matched it anywhere in the body, and replaying them as one
+    over-matches by an order of magnitude: on a real case the field-blind
+    check fired 102,153 times where replay_rules, which respects these
+    conditions, found 11,820.
+
+    Returns {keyword: set(of "subject" | "body")}. A keyword with no recorded
+    field falls back to both, because not knowing where a rule looked is a
+    reason to look everywhere, not a reason to skip it.
+    """
+    out = {}
+    for rule in ((audit_summary or {}).get("malicious_rules") or []):
+        conditions = rule.get("conditions") or {}
+        if conditions:
+            for field, words in conditions.items():
+                for word in (words or []):
+                    key = str(word).strip().lower()
+                    if key:
+                        out.setdefault(key, set()).add(str(field).lower())
+        else:
+            for word in (rule.get("keywords") or []):
+                key = str(word).strip().lower()
+                if key:
+                    out.setdefault(key, {"subject", "body"})
+    return out
+
+
+def rule_keyword_frequency(records, keywords, fields=None):
+    """How much of the corpus each rule keyword selects.
+
+    A keyword the attacker filtered on should pick out a slice of the
+    mailbox. One that matches most of it is telling us nothing, whatever the
+    investigator typed, and scoring it puts a constant offset on every
+    message in the case.
+    """
+    counts = {kw: 0 for kw in keywords if kw}
+    if not counts:
+        return {}, 0
+    total = 0
+    for r in records:
+        total += 1
+        subject = (getattr(r, "subject", "") or "").lower()
+        body = scoring_text(r).lower()
+        for kw in counts:
+            where = (fields or {}).get(kw) or {"subject", "body"}
+            hay = " ".join(x for x, name in ((subject, "subject"), (body, "body"))
+                           if name in where)
+            if term_present(kw, hay):
+                counts[kw] += 1
+    return counts, total
+
+
+
+def build_rule_policy(records, anchors, audit_summary=None):
+    """Settle, once per run, how the rule-keyword anchor may be applied.
+
+    Two questions the per-record loop cannot answer for itself: which field
+    each keyword was actually filtered on, and how much of THIS corpus the
+    keyword selects. A keyword above the cap stays visible as a finding at
+    weight 0 -- the investigator supplied it and deserves to see it was
+    considered -- but it does not move the score, because a term matching
+    most of the mailbox ranks nothing.
+    """
+    keywords = [kw for kw in (getattr(anchors, "rule_keywords", None) or []) if kw]
+    if not keywords:
+        return {"fields": {}, "over_cap": set(), "counts": {}, "total": 0,
+                "cap": 0.0}
+
+    fields = rule_keyword_fields(audit_summary)
+    counts, total = rule_keyword_frequency(records, keywords, fields)
+    cap = float(CONFIG.get("rule_keyword_corpus_cap", 0.25) or 0)
+    over = set()
+    if total and cap > 0:
+        over = {kw for kw, n in counts.items() if (n / total) > cap}
+    return {"fields": fields, "over_cap": over, "counts": counts,
+            "total": total, "cap": cap}
+
+
 def annotate_forensic_signals(
     records, internal_domains, frequent_domains, lookalike_map,
     sender_ip_counts, frequent_senders, anchors, baselines, victim_domains,
     victim_address, thread_participants, contact_names, allowlist=None,
-    directory=None,
+    directory=None, rule_policy=None,
 ):
     """Wire the parsed-but-unused signals (auth, Reply-To, look-alike domain,
     sending-IP anomaly) into the record's indicators/score, and record which
@@ -751,6 +833,11 @@ def annotate_forensic_signals(
     signal. Alignment, impersonation, and content checks are never suppressed,
     so spoofing an allowlisted From address cannot launder an attack."""
     enforce_domains = baselines["enforce_domains"]
+    # Which field each rule keyword was filtered on, and which
+    # keywords select too much of the corpus to mean anything.
+    # Computed once by the caller, which has the audit summary.
+    _rule_kw_fields = (rule_policy or {}).get("fields") or {}
+    _rule_kw_over_cap = (rule_policy or {}).get("over_cap") or set()
     established_domains = baselines["established_domains"]
     first_contact_domains = baselines["first_contact_domains"]
     allow = {str(d).lower() for d in (allowlist or [])}
@@ -893,6 +980,8 @@ def annotate_forensic_signals(
             r.is_pre_compromise = bool(dt and dt <= anchors.compromise_date)
 
         # Anchor matching.
+        subject_text = (r.subject or "").lower()
+        body_text = scoring_text(r).lower()
         text = f"{r.subject}\n{r.body}".lower()
         norm_text = _norm_account(text)
         matches = []
@@ -920,7 +1009,23 @@ def annotate_forensic_signals(
         # Concealment-rule keywords: what the malicious rule filtered on. Messages
         # the rule would have hidden are worth surfacing but are noisier than
         # infrastructure anchors, so they get a lighter, separate boost.
-        rule_hits = [kw for kw in anchors.rule_keywords if kw and kw in text]
+        # Word-boundary, field-aware, and capped. The previous version
+        # was `kw in text` against subject+body combined: a substring
+        # match (so 'pay' hit 'company') over the wrong haystack (so a
+        # subject-only rule matched on body text). On a 117k corpus that
+        # fired on 87.1% of messages at +3 -- 44% of all score mass, at a
+        # lift of 1.16x over the base rate, which is to say none.
+        rule_hits = []
+        for kw in anchors.rule_keywords:
+            if not kw or kw in _rule_kw_over_cap:
+                continue
+            where = _rule_kw_fields.get(kw) or {"subject", "body"}
+            hay = " ".join(
+                part for part, name in ((subject_text, "subject"),
+                                        (body_text, "body"))
+                if name in where)
+            if term_present(kw, hay):
+                rule_hits.append(kw)
         r.rule_target = bool(rule_hits)
         r.rule_target_keywords = list(rule_hits)
 
@@ -1018,16 +1123,33 @@ def annotate_forensic_signals(
                matched=r.attachment_threat_note)
         # Header-hygiene signals (weak/corroborating; see field comments).
         if r.received_chain_anomaly:
-            nf(f"Received-chain anomaly: {r.received_chain_note}",
-               pw["received_anomaly"], category="headers", source="header:Received",
-               matched=r.received_chain_note)
+            # Out-of-order timestamps alone: 4,001 fires, ~9 Tier 1 hits
+            # expected, zero observed. Zeroed only when it is the whole
+            # finding -- a note that ALSO reports a missing or truncated
+            # chain is a different observation and keeps its weight.
+            _rnote = r.received_chain_note or ""
+            _rw = (pw.get("received_anomaly_out_of_order", 0)
+                   if "out of order" in _rnote and ";" not in _rnote
+                   else pw["received_anomaly"])
+            nf(f"Received-chain anomaly: {_rnote}",
+               _rw, category="headers", source="header:Received",
+               matched=_rnote)
         if r.message_id_mismatch:
             nf("Message-ID domain does not align with the sender domain",
                pw["message_id_mismatch"], category="headers", source="header:Message-ID",
                matched=f"{mid_dom} vs {sender_reg}")
         if r.date_anomaly:
+            # A missing Date header fired on 20,985 messages of a 117k corpus
+            # and landed on zero of the 263 Tier 1 findings, where the base
+            # rate predicts ~47. It is a real fact about the message and is
+            # still reported; it is simply not evidence of anything. The
+            # other variants -- unparseable, or later than delivery -- keep
+            # their weight, having no such measurement against them.
+            _dw = (pw.get("date_anomaly_missing", 0)
+                   if "missing" in (r.date_anomaly_note or "")
+                   else pw["date_anomaly"])
             nf(f"Date header issue: {r.date_anomaly_note}",
-               pw["date_anomaly"], category="headers", source="header:Date",
+               _dw, category="headers", source="header:Date",
                matched=r.date_anomaly_note)
         if r.dkim_domain_mismatch:
             nf("DKIM d= domain does not align with the sender domain",
@@ -2359,12 +2481,19 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     thread_participants = build_thread_participants(records)
     contact_names = build_contact_names(records)
 
+    # The rule-keyword anchor needs two things the per-record loop
+    # cannot work out for itself: which field each keyword came from,
+    # and how much of this corpus it selects. Both are properties of
+    # the run, so they are settled once here.
+    rule_policy = build_rule_policy(records, anchors, audit_summary)
+
     scenario, reason = detect_scenario(records, anchors)
     annotate_forensic_signals(
         records, internal_domains, frequent_domains, lookalike_map,
         sender_ip_counts, frequent_senders, anchors, baselines, victim_domains,
         victim_address, thread_participants, contact_names,
         allowlist=allowlist, directory=directory,
+        rule_policy=rule_policy,
     )
     # Recorded attacker actions against specific messages, joined on
     # InternetMessageId. Must run before tiering: a confirmed message is Tier 1
@@ -2945,10 +3074,14 @@ def apply_baseline_modifiers(record, score, baseline, add):
                 matched=f"{passed}/{seen} previous message(s) passed")
             delta += 6
         else:
-            add(f"Authentication failed for {dom}", 3,
+            # Highest-lift signal measured on the first real corpus: 11.8x
+            # the base rate over 7,323 messages, while scoring +3 -- below
+            # several signals with a fraction of its discriminating power.
+            _afw = CONFIG.get("priority_weights", {}).get("auth_fail_hard", 5)
+            add(f"Authentication failed for {dom}", _afw,
                 category="auth", source="authentication_results",
                 matched=f"{passed}/{seen} previous message(s) passed")
-            delta += 3
+            delta += _afw
 
     # C3: rare-and-new amplifies whatever is already there.
     if familiarity == "new":
