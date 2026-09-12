@@ -4587,6 +4587,59 @@ def test_a_complete_copy_verifies(tmp_path):
     assert result["differing"] == [] and result["missing"] == []
 
 
+def test_bulk_term_matching_agrees_with_matching_one_at_a_time(tmp_path):
+    """The optimisation must be invisible in behaviour, only in time.
+
+    Scoring ran one compiled regex per phrase over the full body -- 66 scans
+    per message, 95% of calculate_score's time proving negatives. The bulk
+    form rejects a phrase whose first word is absent before running the
+    regex, which cannot turn a match into a miss; this asserts that over
+    text with the awkward cases: flexible whitespace, case, punctuation.
+    """
+    import random
+    from postmortem.scoring import term_present, terms_present, _COMBO_TERMS
+    from postmortem.config import PHISHING_TERMS
+
+    phrases = list(PHISHING_TERMS) + list(_COMBO_TERMS)
+    vocab = ("the please review attached account invoice payment wire transfer "
+             "bank details urgent immediately confidential password login sign "
+             "in click here gift card remittance today action required").split()
+
+    random.seed(4)
+    for i in range(600):
+        text = " ".join(random.choices(vocab, k=random.randint(3, 50)))
+        if i % 3 == 0:
+            text = text.replace(" ", "  ", 3)      # flexible whitespace
+        if i % 5 == 0:
+            text = text.upper()                     # case
+        if i % 11 == 0:
+            text = text + " don't tell anyone."     # punctuation in a phrase
+        assert terms_present(text, phrases) == {
+            p for p in phrases if term_present(p, text)}, text[:80]
+
+    assert terms_present("", phrases) == set()
+    assert terms_present("anything", []) == set()
+
+
+def test_the_combination_term_lists_have_one_source(tmp_path):
+    # Writing the scanned set out by hand dropped eight terms the first time,
+    # silently: remittance, payment, change bank, don't tell and others
+    # stopped matching while every test still passed.
+    from postmortem.scoring import (_COMBO_TERMS, _PAYMENT_TERMS,
+                                    _URGENCY_COMBO_TERMS, _SECRECY_TERMS)
+
+    for group in (_PAYMENT_TERMS, _URGENCY_COMBO_TERMS, _SECRECY_TERMS):
+        assert group, "a combination group must not be empty"
+        for term in group:
+            assert term in _COMBO_TERMS, term
+    assert len(_COMBO_TERMS) == (len(_PAYMENT_TERMS) + len(_URGENCY_COMBO_TERMS)
+                                 + len(_SECRECY_TERMS))
+    # The terms that were dropped, named so a future edit cannot lose them again.
+    for term in ("remittance", "payment", "change bank", "don't tell",
+                 "keep this confidential", "do not tell"):
+        assert term in _COMBO_TERMS, term
+
+
 def test_a_checkout_style_is_not_a_stale_file(tmp_path):
     """git on Windows rewrites line endings; that is not a code change.
 

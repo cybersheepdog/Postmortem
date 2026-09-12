@@ -2911,6 +2911,63 @@ def term_present(phrase: str, text: str) -> bool:
     return bool(_term_regex(phrase).search(text))
 
 
+@lru_cache(maxsize=4096)
+def _term_head(phrase: str) -> str:
+    """The phrase's first word, lowercased -- a necessary condition for a match.
+
+    If this substring is not in the text at all, no amount of boundary logic
+    can make the phrase match, so the regex need not run.
+    """
+    parts = phrase.split()
+    return (parts[0] if parts else phrase).lower()
+
+
+# Terms behind the payment/urgency/secrecy combination bonuses. Module-level
+# so that the single scan and the three membership tests read from the same
+# source: duplicating them by hand dropped eight terms once already.
+_PAYMENT_TERMS = (
+    "wire transfer", "bank account", "bank details", "change bank",
+    "new bank account", "updated bank details", "remittance", "payment",
+)
+_URGENCY_COMBO_TERMS = (
+    "urgent", "immediately", "as soon as possible", "action required",
+)
+_SECRECY_TERMS = (
+    "confidential", "do not call", "do not tell", "don't tell",
+    "keep this confidential",
+)
+_COMBO_TERMS = _PAYMENT_TERMS + _URGENCY_COMBO_TERMS + _SECRECY_TERMS
+
+
+def terms_present(text: str, phrases) -> set:
+    """Which of `phrases` appear in `text` as whole words.
+
+    Scoring ran one compiled regex per phrase over the full body: profiling a
+    real-sized corpus showed 66 regex scans per message and 95% of
+    calculate_score's time inside re.search. The phrases are mostly absent,
+    so nearly all of that work was proving a negative.
+
+    The regex is still the decider -- this only skips running it when the
+    phrase's first word does not occur in the text at all, which is a cheap
+    C-level substring scan and cannot turn a match into a miss. Semantics are
+    identical to calling term_present() for each phrase; there is a test
+    asserting exactly that over random text.
+    """
+    if not text:
+        return set()
+    low = text.lower()
+    found = set()
+    for phrase in phrases:
+        if not phrase:
+            continue
+        head = _term_head(phrase)
+        if head and head not in low:
+            continue
+        if _term_regex(phrase).search(text):
+            found.add(phrase)
+    return found
+
+
 # Contexts in which the high-noise terms are being discussed rather than used.
 # Deliberately short: each entry is a phrase observed to produce false
 # positives in bulk, not a general attempt at understanding.
@@ -3179,9 +3236,10 @@ def calculate_score(
     # does not count. A security-awareness bulletin quoting "reset your
     # password" is not a phishing message.
     about_phishing = discussing_not_doing(text)
+    _hits = terms_present(text, PHISHING_TERMS)
     for phrase, points in PHISHING_TERMS.items():
 
-        if term_present(phrase, text):
+        if phrase in _hits:
             if about_phishing and phrase in _CONTEXT_SENSITIVE_TERMS:
                 add(f"Contains phrase: {phrase!r} (in security-awareness "
                     "context, not scored)", 0,
@@ -3286,19 +3344,13 @@ def calculate_score(
     # BEC combinations
     # ------------------------------------------------------------------
 
-    has_payment_language = any(
-        term_present(term, text)
-        for term in (
-            "wire transfer",
-            "bank account",
-            "bank details",
-            "change bank",
-            "new bank account",
-            "updated bank details",
-            "remittance",
-            "payment",
-        )
-    )
+    # One scan for all three combination checks. The term lists are module
+    # constants so the scanned set and the tested sets cannot drift apart --
+    # a hand-maintained copy of them silently dropped eight terms the first
+    # time this was written.
+    _combo_hits = terms_present(text, _COMBO_TERMS)
+
+    has_payment_language = any(term in _combo_hits for term in _PAYMENT_TERMS)
 
     # B2: a second urgency list lived here, still carrying bare "today", so
     # removing it from _URGENCY_TERMS alone would not have reached the
@@ -3306,27 +3358,10 @@ def calculate_score(
     # today". Both lists now agree, and "today" counts only inside a deadline.
     has_urgency = (
         _DEADLINE_TODAY_RE.search(text) is not None
-        or any(
-            term_present(term, text)
-            for term in (
-                "urgent",
-                "immediately",
-                "as soon as possible",
-                "action required",
-            )
-        )
+        or any(term in _combo_hits for term in _URGENCY_COMBO_TERMS)
     )
 
-    has_secrecy = any(
-        term_present(term, text)
-        for term in (
-            "confidential",
-            "do not call",
-            "do not tell",
-            "don't tell",
-            "keep this confidential",
-        )
-    )
+    has_secrecy = any(term in _combo_hits for term in _SECRECY_TERMS)
 
     if (
         has_payment_language

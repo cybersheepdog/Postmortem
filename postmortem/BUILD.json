@@ -1,5 +1,5 @@
 {
- "build_id": "f9c3f40bd1",
+ "build_id": "c4a21d0cd5",
  "file_count": 29,
  "files": {
   "__init__.py": "b69826ca1e0da639de6ec1e60334fc6e097fdc46884daa281e7ff792af7e69e6",
@@ -24,7 +24,7 @@
   "qr_scan.py": "c0a23037081d68f932483be9889494e672a298d3eabc8e7a90c58403d7abdc22",
   "reporting.py": "6fa5f6639f21721b3b049bd5b8350ba8e944218e5fd5ce4d41f5234b18effb59",
   "resources.py": "6ffba02fbabd3b9fbd669622f51b2414356eefc497f4620a5845d974b3541f5b",
-  "scoring.py": "dd7c9c7856cf33920d59b7c9acdf2818d3ceeda1301a5cb5e57c721d56df763f",
+  "scoring.py": "73206c59345247df1915a7727bc5a7a9a4501fe4bad6cb451d47a1bf24400bb4",
   "signin.py": "568322124a02c3b09b967ab38647eb76a1dfebdf791fb379ec9a9f4d5cd8f052",
   "term.py": "32d1fbfe7731eb3f4a5cdc8cb51d40acb3e907f6f474f1e67d87dec5b5fb3c48",
   "urls.py": "db2466dab9a67ad6e4c62c1d973aa22294a224438781306d6a82633a7c20f447",
