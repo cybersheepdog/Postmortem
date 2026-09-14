@@ -52,6 +52,12 @@ CONFIG = {
         # indistinguishable from marking messages at random. Reported as
         # a fact at weight 0 above the cap, never silently dropped.
         "rule_keyword_corpus_cap": 0.25,
+        # A phishing term that appears in more than this share of the corpus
+        # is describing the mailbox, not the attack: its weight is scaled by
+        # cap/share rather than zeroed, so it stays visible and stays ranked
+        # below the vocabulary that is actually rare here.
+        "phrase_corpus_cap": 0.05,
+        "phrase_corpus_sample": 8000,
         # Header-hygiene signals: weak/corroborating (legit ESP mail can trip
         # the alignment checks), so kept low to avoid promoting benign senders.
         "received_anomaly": 2, "message_id_mismatch": 1, "date_anomaly": 2,

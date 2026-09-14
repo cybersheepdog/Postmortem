@@ -174,6 +174,7 @@ class AnalysisCache:
  
 from postmortem.scoring import (  # noqa: E402
     calculate_score, candidate_score, identify_internal_domains, corpus_baseline,
+    build_term_policy,
     identify_known_contacts, calculate_thread_ids, analyze_temporal_signals,
     detect_possible_impersonation, build_attack_timeline,
     earliest_malicious_precursor_verdict,
@@ -1670,6 +1671,9 @@ def main():
         # fixed weights in isolation, and a vendor of three years asking about
         # an invoice scores like a stranger asking the same thing.
         baseline = corpus_baseline(records)
+        # Which of the tool's own phishing terms select too much of THIS
+        # mailbox to rank anything. Same principle as the rule-keyword cap.
+        baseline["term_scale"] = build_term_policy(records)
         for record in records:
 
             calculate_score(

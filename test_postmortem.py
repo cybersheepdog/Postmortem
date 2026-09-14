@@ -5378,3 +5378,227 @@ def test_no_helper_in_this_file_is_defined_twice():
                              % (node.name, seen[node.name], node.lineno))
             seen[node.name] = node.lineno
     assert not dupes, "duplicate top-level definitions:\n  " + "\n  ".join(dupes)
+
+
+# --------------------------------------------------------------------------
+# The diagnostic's promise is that it carries no client values. Three got
+# through on a real corpus -- a bare domain label with no dot, an Exchange
+# system local-part, and a 24-character hex blob -- because every rule
+# required a dot, an @, or 32 hex characters. The gate scanned for the same
+# patterns, so it did not fire either.
+# --------------------------------------------------------------------------
+def test_the_three_values_that_leaked_are_templated(tmp_path):
+    from postmortem.diagnostic import template, scan_for_identifiers
+
+    leaked = [
+        ("Reply-To domain (bizclassifiedads) differs from sender domain",
+         "bizclassifiedads"),
+        ("Sender local-part looks machine-generated (microsoftexchange329e71e)",
+         "microsoftexchange329e71e"),
+        ("Sender local-part looks machine-generated (c05326c4efc54947842876b2)",
+         "c05326c4efc54947842876b2"),
+    ]
+    for text, value in leaked:
+        out = template(text)
+        assert value not in out, out
+        assert scan_for_identifiers(out) == [], (out, scan_for_identifiers(out))
+
+
+def test_the_gate_would_catch_them_if_the_transform_missed(tmp_path):
+    # The check is not the transform. It has to fail independently, or a
+    # fourth shape gets through in silence exactly like these three did.
+    from postmortem.diagnostic import scan_for_identifiers
+
+    for value in ("microsoftexchange329e71e", "c05326c4efc54947842876b2",
+                  "(bizclassifiedads)"):
+        assert scan_for_identifiers("Signal: " + value), value
+
+
+def test_the_tools_own_parenthetical_prose_survives(tmp_path):
+    # Default-deny on parentheses is only safe if it does not eat the text the
+    # tool wrote itself -- that would destroy the detail the diagnostic exists
+    # to show, which is what an over-broad first attempt did to all 45 phrase
+    # rows.
+    from postmortem.diagnostic import template
+
+    for text in (
+        "Authentication failure deviates from acme.com's norm (usually authenticates)",
+        "Message was deleted/moved to a low-visibility folder (purges)",
+        "Message was deleted/moved to a low-visibility folder (junk)",
+        "Email authentication failed (sender may be misconfigured)",
+        "Received-chain anomaly: Received timestamps out of order (possible forged hop)",
+        "Contains phrase: 'wire transfer' (in security-awareness context, not scored)",
+    ):
+        out = template(text)
+        tail = text[text.rindex("("):]
+        assert tail in out, (text, out)
+
+
+def test_a_number_touching_a_letter_is_still_a_number(tmp_path):
+    # \b\d+\b cannot see the 0 in "0h" or "attachment_0" -- both sides are word
+    # characters -- so one mass-sent finding was split across nineteen rows of
+    # the signal table, one per distinct hour, and the attachment finding
+    # across eight, one per index.
+    from postmortem.diagnostic import template
+
+    hours = {template("Body text mass-sent: %d near-identical message(s) "
+                      "from this sender within %dh" % (n, n))
+             for n in (1, 5, 47, 51)}
+    assert len(hours) == 1, hours
+
+    idx = {template("Dangerous attachment: macro-enabled attachment "
+                    "attachment_%d" % n) for n in (0, 1, 12)}
+    assert len(idx) == 1, idx
+
+
+# --------------------------------------------------------------------------
+# Device code detection needs both legs of a correlation group. An export of
+# interactive sign-ins alone contains only the victim's, so every group is
+# single-leg, assess() has nothing to compare, and a real attack produces a
+# clean result. That silence is the dangerous outcome, not the miss.
+# --------------------------------------------------------------------------
+def _single_leg_export(tmp_path, n=12, interactive=False, ok=True):
+    import json
+
+    recs = [{
+        "id": "r%d" % i, "correlationId": "c%d" % i,
+        "createdDateTime": "2026-08-2%dT1%d:00:00Z" % (i % 8, i % 10),
+        "userPrincipalName": "u%d@acme.com" % (i % 4),
+        "ipAddress": "203.0.113.%d" % i,
+        "originalTransferMethod": "deviceCodeFlow",
+        "isInteractive": interactive,
+        "status": {"errorCode": 0 if ok else 50126},
+        "userAgent": "python-requests/2.31.0",
+        "conditionalAccessStatus": "notApplied",
+        "location": {"city": "Lagos", "countryOrRegion": "NG"},
+    } for i in range(n)]
+    d = tmp_path / "signin"
+    d.mkdir()
+    (d / "signin.json").write_text(json.dumps(recs), encoding="utf-8")
+    return str(d)
+
+
+def test_an_interactive_only_export_says_so_instead_of_reporting_clean(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    out = analyze_signin_logs(_single_leg_export(tmp_path))
+    assert out["device_code_records"] == 12
+    assert out["attack_groups"] == 0
+    joined = " ".join(out["warnings"])
+    assert "single leg" in joined
+    assert "non-interactive" in joined
+    assert "not a negative" in joined
+
+
+def test_tokens_issued_counts_attributed_tokens_and_says_which(tmp_path):
+    # tokens_issued is downstream of a group being judged an attack, so it is
+    # structurally 0 whenever attribution failed. Reported alone it reads as
+    # "no token was ever issued", which is the opposite of what happened.
+    from postmortem.signin import analyze_signin_logs
+
+    out = analyze_signin_logs(_single_leg_export(tmp_path))
+    assert out["tokens_issued"] == 0
+    assert out["device_code_successes"] == 12
+    assert any("ATTRIBUTED" in w for w in out["warnings"])
+
+
+def test_a_lone_leg_is_reported_but_never_attributed(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    out = analyze_signin_logs(_single_leg_export(tmp_path))
+    assert out["single_leg_count"] == 12
+    # The whole point of the quarantine: nothing here reaches attacker_ips.
+    assert out["attacker_ips"] == []
+    row = out["single_leg_findings"][0]
+    assert len(row["reasons"]) >= 2
+    assert any("non-browser" in r for r in row["reasons"])
+
+
+def test_one_weak_reason_is_not_a_single_leg_finding(tmp_path):
+    # An ordinary interactive device code sign-in from a browser has one
+    # reason at most ("token issued"), which is not a finding.
+    import json
+    from postmortem.signin import analyze_signin_logs
+
+    recs = [{
+        "id": "r%d" % i, "correlationId": "c%d" % i,
+        "createdDateTime": "2026-08-2%dT10:00:00Z" % (i % 8),
+        "userPrincipalName": "u@acme.com",
+        "ipAddress": "203.0.113.%d" % i,
+        "originalTransferMethod": "deviceCodeFlow",
+        "isInteractive": True,
+        "status": {"errorCode": 0},
+        "userAgent": "Mozilla/5.0 Chrome/127",
+        "conditionalAccessStatus": "success",
+    } for i in range(6)]
+    d = tmp_path / "s2"
+    d.mkdir()
+    (d / "s.json").write_text(json.dumps(recs), encoding="utf-8")
+    out = analyze_signin_logs(str(d))
+    assert out["single_leg_count"] == 0
+
+
+# --------------------------------------------------------------------------
+# A phishing term is evidence because it is unusual. One that appears in a
+# sixth of an ordinary mailbox is describing the mailbox: on a real corpus
+# 'confidential' fired on 16.4% of messages and carried 10.6% of all score
+# mass at 1.9x the base rate.
+# --------------------------------------------------------------------------
+def _term_corpus(term, share, n=400):
+    out = []
+    for i in range(n):
+        r = make_record(sender_email="s%d@ext.example" % i,
+                        sender_domain="ext.example",
+                        subject="Note %d" % i, path="/m/t%d.eml" % i,
+                        date="Wed, 26 Aug 2026 09:00:00 +0000")
+        r.body = ("Please review. %s" % term) if i < int(n * share) else "Please review."
+        r.urls = []; r.url_domains = []; r.url_analysis = []
+        r.attachments = []; r.attachment_details = []
+        r.authentication_results = {}
+        out.append(r)
+    return out
+
+
+def test_a_term_that_selects_most_of_the_mailbox_is_damped(tmp_path):
+    from postmortem.scoring import build_term_policy
+
+    policy = build_term_policy(_term_corpus("confidential", 0.40))
+    assert "confidential" in policy
+    factor, share = policy["confidential"]
+    assert 0.35 < share < 0.45
+    assert 0 < factor < 0.2       # cap 0.05 / share 0.40
+
+
+def test_a_rare_term_is_left_alone(tmp_path):
+    from postmortem.scoring import build_term_policy
+
+    policy = build_term_policy(_term_corpus("gift card", 0.01))
+    assert "gift card" not in policy
+
+
+def test_the_damped_weight_is_scaled_not_zeroed_and_says_why(tmp_path):
+    from postmortem.scoring import calculate_score, build_term_policy
+    from postmortem.config import PHISHING_TERMS
+
+    records = _term_corpus("confidential", 0.40)
+    policy = build_term_policy(records)
+    hit = records[0]
+    calculate_score(hit, {"acme.com"}, set(), {"term_scale": policy})
+    found = [f for f in hit.provenance if "confidential" in f["signal"]]
+    assert found, [f["signal"] for f in hit.provenance]
+    assert found[0]["weight"] < PHISHING_TERMS["confidential"]
+    assert "common here" in found[0]["signal"]
+
+
+def test_scoring_without_a_term_policy_is_unchanged(tmp_path):
+    # Every existing caller passes no baseline, or a baseline with no
+    # term_scale. Neither may change what they already got.
+    from postmortem.scoring import calculate_score
+    from postmortem.config import PHISHING_TERMS
+
+    for baseline in (None, {}, {"term_scale": {}}):
+        r = _term_corpus("confidential", 1.0, n=1)[0]
+        calculate_score(r, {"acme.com"}, set(), baseline)
+        found = [f for f in r.provenance if "confidential" in f["signal"]]
+        assert found[0]["weight"] == PHISHING_TERMS["confidential"]
+        assert "common here" not in found[0]["signal"]

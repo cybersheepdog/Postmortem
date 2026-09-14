@@ -352,6 +352,64 @@ def _victim_addresses(records, affected_users):
     return out
 
 
+# Addresses that belong to hosting providers rather than people. Not an
+# allowlist of attackers -- a legitimate PowerShell automation runs from a
+# datacentre too -- which is exactly why this never attributes on its own.
+_AUTOMATION_AGENTS = ("python-requests", "curl", "go-http-client", "axios",
+                      "okhttp", "powershell", "libwww", "wget", "httpie",
+                      "restsharp", "java/", "node-fetch")
+
+
+def assess_single_leg(flat):
+    """Why one lone device code leg looks wrong, on its own merits.
+
+    The two-leg rule needs both halves of the flow under one correlation id:
+    the victim's interactive authentication and the attacker's polling
+    client. An export of interactive sign-ins alone contains only the first,
+    so every group has one leg, assess() finds nothing to compare, and a real
+    attack produces a clean result.
+
+    This reads the single leg directly. It is deliberately weaker and
+    deliberately quarantined -- the reasons below are suggestive, not
+    attributive, and nothing here ever reaches attacker_ips. Without
+    isInteractive to say which leg is whose, naming an address from one
+    record is the conservatism this module was built to avoid.
+    """
+    reasons = []
+    agent = str(get(flat, "user_agent", "") or get(flat, "client_app", "")).lower()
+    if agent and any(a in agent for a in _AUTOMATION_AGENTS):
+        reasons.append("non-browser client (%s)" % short_agent(flat, 40))
+    if not truthy(get(flat, "interactive", "")) and get(flat, "interactive", "") != "":
+        reasons.append("non-interactive leg")
+    ca = str(get(flat, "ca_status", "")).strip().lower()
+    if ca in ("notapplied", "not applied", "disabled"):
+        reasons.append("conditional access not applied")
+    if succeeded(flat):
+        reasons.append("token issued")
+    return reasons
+
+
+def _single_leg_findings(buckets, victim_ips, limit=50):
+    """Suspicious lone legs, ranked, never attributed."""
+    out = []
+    for cid, legs in buckets.items():
+        if len(legs) != 1:
+            continue
+        f = legs[0]
+        ip = str(get(f, "ip", ""))
+        if ip and ip in victim_ips:
+            continue          # the account signs in interactively from here
+        reasons = assess_single_leg(f)
+        if len(reasons) < 2:
+            continue          # one weak reason is noise, not a finding
+        row = _leg_row(f)
+        row.update({"correlation": cid, "reasons": reasons,
+                    "user": str(get(f, "user", "")) or "(unknown)"})
+        out.append(row)
+    out.sort(key=lambda r: (-len(r["reasons"]), r.get("time") or ""))
+    return out[:limit]
+
+
 def analyze_signin_logs(path):
     """Parse an Entra sign-in export and derive what the mail side can use.
 
@@ -446,9 +504,17 @@ def analyze_signin_logs(path):
             "tokens_issued": verdict == "attack" and any(r["ok"] for r in rows),
         })
 
+    # Counted over every device code sign-in, not only attributed ones.
+    # tokens_issued is downstream of a group being judged an attack, so it is
+    # structurally 0 whenever attribution failed -- which reads in a report as
+    # "no token was ever issued" when it means "none was tied to an attacker".
+    successes = sum(1 for _s, f in hits if succeeded(f))
+
     token_events.sort(key=lambda e: e["time"])
     dated = [e["_dt"] for e in token_events if e["_dt"]]
     earliest = min(dated) if dated else None
+
+    single_leg = _single_leg_findings(buckets, victim_ips)
 
     times = sorted(str(get(f, "time", "")) for _s, f in records
                    if get(f, "time", ""))
@@ -469,11 +535,30 @@ def analyze_signin_logs(path):
             "Neither originalTransferMethod nor authenticationProtocol is "
             "present in this export. It cannot answer the device code "
             "question at all; a clean result here is not a negative.")
-    if hits and not attacker_ips and not unattributed:
+    if hits and len(singles) >= 0.8 * max(1, len(buckets)):
+        warnings.append(
+            "%d of %d device code correlation groups contain a single leg. "
+            "Detection compares the victim's interactive authentication with "
+            "the attacker's polling client under one correlation id, so a "
+            "one-leg group cannot be assessed at all. This is the shape an "
+            "export of INTERACTIVE sign-ins only produces: the polling leg is "
+            "non-interactive and was never collected. Re-export including "
+            "non-interactive sign-ins (Get-GraphEntraSignInLogs collects "
+            "both) -- a clean result from this export is not a negative. "
+            "Entra retains 30 days and expiry is not retroactive."
+            % (len(singles), len(buckets)))
+    elif hits and not attacker_ips and not unattributed:
         warnings.append(
             "Device code sign-ins are present but none shows a location split, "
             "so no attacker address was derived. A residential proxy in the "
             "victim's own country produces exactly this picture.")
+    if hits and not attacker_ips and successes:
+        warnings.append(
+            "%d of %d device code sign-in(s) succeeded, but none is attributed "
+            "to an attacker. Device code flow has legitimate uses, so a "
+            "success is not a finding on its own -- but 'tokens issued: 0' in "
+            "this report counts ATTRIBUTED tokens only, not tokens."
+            % (successes, len(hits)))
     if vetoed_ips:
         warnings.append(
             "%d candidate address(es) were withheld because the account also "
@@ -504,6 +589,9 @@ def analyze_signin_logs(path):
         "vetoed_ips": sorted(vetoed_ips),
         "token_events": token_events,
         "tokens_issued": len(token_events),
+        "device_code_successes": successes,
+        "single_leg_findings": single_leg,
+        "single_leg_count": len(single_leg),
         "earliest_token": earliest.strftime("%Y-%m-%dT%H:%M:%SZ") if earliest else "",
         "_earliest_token_dt": earliest,
         "warnings": warnings,

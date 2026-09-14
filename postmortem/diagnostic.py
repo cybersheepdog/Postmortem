@@ -68,8 +68,24 @@ _SUBS = (
     (re.compile(r"<[^@\s>]+@[^\s>]+>"), "<message-id>"),
     (re.compile(r"'[^']{1,200}'"), "'<value>'"),
     (re.compile(r'"[^"]{1,200}"'), '"<value>"'),
-    (re.compile(r"\b[A-Fa-f0-9]{32,64}\b"), "<hash>"),
-    (re.compile(r"\b\d[\d,]*\b"), "<n>"),
+    # An interpolated identifier is a single token; the tool's own words are
+    # not. Three leaked past the older rules on a real corpus -- a bare domain
+    # label with no dot, an Exchange system local-part, and a 24-character hex
+    # blob -- because every pattern here required either a dot, an @, or 32
+    # hex characters. These three do not.
+    (re.compile(r"\b(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{12,}\b"),
+     "<value>"),
+    (re.compile(r"\b[A-Fa-f0-9]{16,64}\b"), "<hash>"),
+    # A lone token in parentheses is something the code put there. Prose the
+    # tool wrote itself is several words ("usually authenticates") or a short
+    # bare word ("purges", "junk"), so the deny is scoped to what an
+    # interpolated value looks like: long, or carrying a digit.
+    (re.compile(r"\((?=[^)\s]*(?:\d|[^)\s]{13}))[^)\s<]{2,}\)"), "(<value>)"),
+    # Digits that abut a letter have no trailing word boundary, so \b\d+\b
+    # cannot see them: "within 0h" and "attachment_0" both survived, and each
+    # distinct hour and index became its own row -- one mass-sent finding was
+    # split across nineteen lines of the signal table.
+    (re.compile(r"(?<![A-Za-z0-9])\d[\d,]*"), "<n>"),
 )
 
 
@@ -153,6 +169,14 @@ _FORBIDDEN = (
     ("hostname or domain",
      re.compile(r"\b(?!<)[A-Za-z0-9\-]{2,}\.(?:com|net|org|co|io|gov|edu|mil|"
                 r"uk|de|fr|ru|cn|info|biz|us|ca|au|nl|se|ch|it|es|pl|br|in|jp)\b")),
+    # Mirrors the three substitutions added above. The gate is the check, not
+    # the transform, so it repeats them deliberately: a value that reaches
+    # here has already defeated one pass.
+    ("machine identifier",
+     re.compile(r"\b(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{12,}\b")),
+    ("hex blob", re.compile(r"\b[A-Fa-f0-9]{16,}\b")),
+    ("untemplated value in parentheses",
+     re.compile(r"\((?=[^)\s]*(?:\d|[^)\s]{13}))[^)\s<]{2,}\)")),
 )
 
 

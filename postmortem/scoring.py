@@ -3024,6 +3024,53 @@ def _auth_state(record):
     return "absent"
 
 
+def build_term_policy(records):
+    """How much of THIS corpus each phishing term selects, and what that
+    should do to its weight.
+
+    Same principle as the rule-keyword cap, applied to the tool's own
+    vocabulary rather than the investigator's. A term is evidence because it
+    is unusual; one that appears in a sixth of an ordinary mailbox is
+    describing the mailbox, not the attack. On a real 117k-message corpus
+    'confidential' fired on 16.4% of messages and carried 10.6% of all score
+    mass at 1.9x the base rate -- the same shape the rule-keyword anchor had
+    before it was capped.
+
+    The weight is scaled, not zeroed, and the scaling is proportionate:
+    cap/share. A term at twice the cap keeps half its weight. Terms below the
+    cap are untouched, so the vocabulary that earns its place -- 'sign in'
+    fired on 0.7% at 35x -- is unaffected.
+
+    Counted on a deterministic stride sample rather than the whole corpus.
+    The estimate only has to be good enough to pick a scaling factor, and a
+    second full term scan would roughly double the cost of the most expensive
+    stage in the run.
+    """
+    cap = float(CONFIG.get("phrase_corpus_cap", 0.05) or 0)
+    if cap <= 0 or not records:
+        return {}
+    want = int(CONFIG.get("phrase_corpus_sample", 8000) or 8000)
+    stride = max(1, len(records) // want) if want else 1
+    sample = records[::stride]
+    if not sample:
+        return {}
+
+    counts = Counter()
+    for r in sample:
+        text = ("%s\n%s" % (getattr(r, "subject", "") or "",
+                            scoring_text(r) or "")).lower()
+        for phrase in terms_present(text, PHISHING_TERMS):
+            counts[phrase] += 1
+
+    n = len(sample)
+    scale = {}
+    for phrase, hits in counts.items():
+        share = hits / n
+        if share > cap:
+            scale[phrase] = (cap / share, share)
+    return scale
+
+
 def corpus_baseline(records):
     """One pass over the corpus, to model what normal looks like *here*.
 
@@ -3086,8 +3133,11 @@ def _familiarity(record, baseline):
     dom = getattr(record, "sender_domain", "")
     if not dom:
         return "unknown"
-    count = baseline["domain_counts"].get(dom, 0)
-    if dom in baseline["established"]:
+    # Read defensively: baseline now carries keys corpus_baseline() does not
+    # own (term_scale), so a partial dict is a shape a caller can legitimately
+    # build. A missing key here must degrade to "unknown", never raise.
+    count = (baseline.get("domain_counts") or {}).get(dom, 0)
+    if dom in (baseline.get("established") or ()):
         return "established"
     if count > 1:
         return "known"
@@ -3124,8 +3174,8 @@ def apply_baseline_modifiers(record, score, baseline, add):
 
     # A hard alignment failure is the mirror image and carries real weight.
     if state == "failed":
-        seen = baseline["auth_seen"].get(dom, 0)
-        passed = baseline["auth_pass"].get(dom, 0)
+        seen = (baseline.get("auth_seen") or {}).get(dom, 0)
+        passed = (baseline.get("auth_pass") or {}).get(dom, 0)
         if seen >= CONFIG.get("baseline_enforce_min", 3) and passed / max(1, seen) >= 0.5:
             add(f"Authentication failed for {dom}, which normally authenticates",
                 6, category="auth", source="authentication_results",
@@ -3146,7 +3196,8 @@ def apply_baseline_modifiers(record, score, baseline, add):
         bump = min(max(1, score // 3), CONFIG.get("novelty_bump_cap", 6))
         add("First and only message from this sender domain in the corpus",
             bump, category="sender", source="corpus:baseline",
-            matched=f"{dom}: 1 of {baseline['message_count']} message(s)")
+            matched="%s: 1 of %s message(s)"
+                    % (dom, baseline.get("message_count", "?")))
         delta += bump
     elif familiarity == "established" and state != "failed":
         # Long-standing correspondent with nothing wrong at the transport
@@ -3172,6 +3223,9 @@ def calculate_score(
     `baseline` is the corpus model from corpus_baseline(). It is optional so
     every existing caller keeps working unchanged; without it the baseline
     modifiers (C1/C3) simply do not apply and scoring is as it was.
+
+    A "term_scale" key, when present, damps phishing terms that select too
+    much of this corpus; absent, every term scores at its configured weight.
     """
  
     score = 0
@@ -3236,6 +3290,7 @@ def calculate_score(
     # B7: whole words, and a term that is being *discussed* rather than used
     # does not count. A security-awareness bulletin quoting "reset your
     # password" is not a phishing message.
+    _term_scale = (baseline or {}).get("term_scale") or {}
     about_phishing = discussing_not_doing(text)
     _hits = terms_present(text, PHISHING_TERMS)
     for phrase, points in PHISHING_TERMS.items():
@@ -3246,8 +3301,16 @@ def calculate_score(
                     "context, not scored)", 0,
                     category="language", source="body", matched=phrase)
                 continue
-            add(f"Contains phrase: {phrase!r}", points,
-                category="language", source="subject+body", matched=phrase)
+            _scaled = _term_scale.get(phrase)
+            if _scaled:
+                _factor, _share = _scaled
+                _pts = max(0, int(round(points * _factor)))
+                add(f"Contains phrase: {phrase!r} (common here - "
+                    f"{_share:.0%} of the corpus, weight reduced)", _pts,
+                    category="language", source="subject+body", matched=phrase)
+            else:
+                add(f"Contains phrase: {phrase!r}", points,
+                    category="language", source="subject+body", matched=phrase)
 
     # ------------------------------------------------------------------
     # URLs
