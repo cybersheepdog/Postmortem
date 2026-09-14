@@ -971,6 +971,17 @@ def main():
              "Repeatable/comma-separated.",
     )
     anchor_group.add_argument(
+        "--attacker-subject",
+        action="append",
+        metavar="SUBJECT",
+        help="Exact subject of mail the attacker is KNOWN to have sent after "
+             "the compromise (the mass-mail subject). Ground truth, not a "
+             "guess: matched exactly rather than by keyword, exempt from the "
+             "rule-keyword corpus cap, and used to seed attacker addresses "
+             "from the Send/SendAs events that carry it. Repeatable; NOT "
+             "comma-split, so a subject may contain commas.",
+    )
+    anchor_group.add_argument(
         "--rule-keyword",
         action="append",
         metavar="TERM",
@@ -1947,6 +1958,7 @@ def main():
                 args.audit_log,
                 extra_attacker_ips=(signin_summary or {}).get('attacker_ips', ()),
                 anchor_dt=(signin_summary or {}).get('_earliest_token_dt'),
+                attacker_subjects=anchors.attacker_subjects,
             )
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"[!] Could not parse --audit-log {args.audit_log}: {exc}",

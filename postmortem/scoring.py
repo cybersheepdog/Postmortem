@@ -348,6 +348,11 @@ def build_anchors(args) -> Anchors:
         attacker_ips=flatten(getattr(args, "attacker_ip", None)),
         attacker_addresses=[normalize_email(a) for a in flatten(getattr(args, "attacker_address", None))],
         rule_keywords=[k.lower() for k in flatten(getattr(args, "rule_keyword", None))],
+        # NOT flattened on commas: a subject line legitimately contains them,
+        # and splitting "Invoice 4471, revised" into two anchors would match
+        # neither. Repeat the flag instead.
+        attacker_subjects=[s for s in (getattr(args, "attacker_subject", None) or [])
+                           if str(s).strip()],
         victim_domains=[d.lower() for d in flatten(getattr(args, "victim_domain", None))],
         lookback_days=int(getattr(args, "lookback_days", 90) or 90),
         scenario=getattr(args, "scenario", "auto") or "auto",
@@ -839,6 +844,10 @@ def annotate_forensic_signals(
     # Computed once by the caller, which has the audit summary.
     _rule_kw_fields = (rule_policy or {}).get("fields") or {}
     _rule_kw_over_cap = (rule_policy or {}).get("over_cap") or set()
+    # Normalised once: the comparison is per record, the vocabulary is not.
+    _attacker_subjects = {normalize_subject(s)
+                          for s in (getattr(anchors, "attacker_subjects", None) or [])
+                          if str(s).strip()}
     established_domains = baselines["established_domains"]
     first_contact_domains = baselines["first_contact_domains"]
     allow = {str(d).lower() for d in (allowlist or [])}
@@ -1035,6 +1044,32 @@ def annotate_forensic_signals(
         attach_notes, _ = attachment_threat_summary(r)
         r.attachment_threat = bool(attach_notes)
         r.attachment_threat_note = "; ".join(attach_notes[:4])
+
+        # A known attacker subject is ground truth, not a hypothesis: the
+        # investigator is saying these messages ARE the attack. So it is
+        # matched exactly (modulo reply prefixes and case) rather than by
+        # keyword, and it is exempt from the corpus cap that damps guesses.
+        #
+        # It still is not proof on its own. Attackers hijack threads and reuse
+        # the stolen subject verbatim, so the genuine correspondence they
+        # cloned carries the identical string. A match only becomes an
+        # attribution when the message also went OUT from the organisation
+        # after the compromise; otherwise it is reported as related, for the
+        # analyst to look at, and attributes nothing.
+        r.attacker_subject_match = False
+        r.attacker_subject_sent = False
+        if _attacker_subjects and normalize_subject(r.subject) in _attacker_subjects:
+            r.attacker_subject_match = True
+            outbound = bool(r.sender_domain and r.sender_domain in internal_domains)
+            after = True
+            if anchors.compromise_date:
+                _dt = message_arrival_dt(r)
+                after = bool(_dt and _dt >= anchors.compromise_date)
+            r.attacker_subject_sent = bool(outbound and after)
+            matches.append(
+                "attacker-sent message (known subject)"
+                if r.attacker_subject_sent
+                else "known attacker subject, not outbound/in-window")
 
         r.anchor_matches = matches
 
@@ -2071,7 +2106,14 @@ def assign_tiers(records, scenario, anchors: Anchors):
         # that basis alone -- not inbound-only, not window-bounded, not
         # dependent on its wording. It is the one signal here that is observed
         # rather than inferred, so nothing about the message can outweigh it.
-        if getattr(r, "audit_confirmed", False):
+        # Mail the investigator named, that this organisation sent, after the
+        # compromise. Checked before everything else because every other
+        # branch below is gated on is_inbound -- and the attacker's own
+        # outbound mass-mail is by definition not inbound, so without this it
+        # lands in Tier 3 no matter what the analyst supplied.
+        if getattr(r, "attacker_subject_sent", False):
+            r.tier = 1
+        elif getattr(r, "audit_confirmed", False):
             r.tier = 1
         elif r.is_inbound and r.anchor_matches:
             r.tier = 1

@@ -193,6 +193,13 @@ class EmailRecord:
     attachment_threat: bool = False
     attachment_threat_note: str = ""
     anchor_matches: list[str] = field(default_factory=list)
+    # Investigator ground truth: this subject was named as the attacker's.
+    # _match says the string matched; _sent says it also went OUT from the
+    # organisation after the compromise, which is what turns a match into an
+    # attribution. Kept apart because a hijacked thread carries the attacker's
+    # subject on the victim's own genuine mail too.
+    attacker_subject_match: bool = False
+    attacker_subject_sent: bool = False
     scenario_score: int = 0
     # Recorded attacker actions against THIS message, joined from the audit log
     # by InternetMessageId. Facts, not heuristics: they carry no score and
@@ -256,6 +263,14 @@ class Anchors:
     attacker_ips: list[str] = field(default_factory=list)      # attacker sending IPs
     attacker_addresses: list[str] = field(default_factory=list)  # attacker emails
     rule_keywords: list[str] = field(default_factory=list)     # malicious-rule terms
+    # Subjects of mail the attacker is KNOWN to have sent after the
+    # compromise. Deliberately not rule_keywords: a rule keyword is a
+    # hypothesis about what the attacker filtered on, and is corpus-capped
+    # because investigator guesses were carrying 44% of the score mass at
+    # 1.16x lift. This is not a guess -- it is a fact about which messages
+    # ARE the attack -- so it is exempt from that cap and is used as a label
+    # rather than as evidence.
+    attacker_subjects: list[str] = field(default_factory=list)
     victim_domains: list[str] = field(default_factory=list)    # victim org's domains
     scenario: str = "auto"                                     # auto|ato|impersonation
 
@@ -273,5 +288,6 @@ class Anchors:
             or self.attacker_domains
             or self.attacker_ips
             or self.attacker_addresses
+            or self.attacker_subjects
             or self.rule_keywords
         )

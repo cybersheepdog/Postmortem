@@ -571,6 +571,17 @@ def print_audit_summary(audit: dict, warnings=None):
         print(f"  Compromise (earliest):  {d['compromise_date']}")
     if d.get("attacker_ips"):
         print(f"  Attacker IP(s):         {', '.join(d['attacker_ips'])}")
+    # Which addresses came from where. Two independent derivations of the same
+    # fact are worth more than one merged list, and the rule-only route names
+    # nothing at all against an intruder who mass-mailed but built no rule.
+    _sub_ips = d.get("attacker_ips_from_subject") or []
+    if _sub_ips:
+        print(term.c(f"    from a known attacker subject: {', '.join(_sub_ips)}"
+                     f"   ({d.get('attacker_send_count', 0)} send event(s))",
+                     "red"))
+        _rule_only = [ip for ip in d["attacker_ips"] if ip not in _sub_ips]
+        print(f"    from malicious rule events:    "
+              f"{', '.join(_rule_only) if _rule_only else '(none)'}")
     if d.get("attacker_addresses"):
         print(f"  Forwarding address(es): {', '.join(d['attacker_addresses'])}")
     if d.get("attacker_domains"):

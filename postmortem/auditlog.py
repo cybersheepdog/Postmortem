@@ -23,7 +23,7 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 
-from postmortem.utils import normalize_message_id
+from postmortem.utils import normalize_message_id, normalize_subject
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[0-9A-Fa-f:]{3,}:[0-9A-Fa-f:]+\b")
@@ -287,6 +287,56 @@ def _walk_message_ids(node, out, depth=0):
             _walk_message_ids(value, out, depth + 1)
 
 
+# Operations that mean this account SENT the message, as opposed to reading or
+# filing one that carries the same subject. A known attacker subject only
+# attributes an address when it appears on one of these.
+_SEND_OPS = {"send", "sendas", "sendonbehalf"}
+
+
+def attacker_ips_from_subjects(events, subjects, compromise_dt=None):
+    """Addresses that SENT a message the investigator says was the attacker's.
+
+    attacker_ips is otherwise seeded only from malicious rule operations, so
+    an intruder who mass-mailed but never built a rule contributes nothing and
+    every attribution downstream inherits that silence. A known subject on a
+    Send/SendAs event is independent evidence of the same fact.
+
+    Deliberately narrow. A subject is not proof on its own -- attackers reuse
+    stolen thread subjects, and the genuine correspondence they were cloned
+    from carries the identical string -- so a match only names an address when
+    the operation is a send AND, where a compromise date is known, it happened
+    after it.
+    """
+    wanted = {normalize_subject(s) for s in (subjects or ()) if str(s).strip()}
+    if not wanted:
+        return set(), []
+
+    ips, matches = set(), []
+    for e in events:
+        if e["op_lower"] not in _SEND_OPS:
+            continue
+        ts = e["timestamp"]
+        if compromise_dt and ts and ts < compromise_dt:
+            continue
+        found = []
+        _walk_message_ids(e["audit"], found)
+        for mid, subject, _folder in found:
+            if normalize_subject(subject) not in wanted:
+                continue
+            row = {
+                "time": ts.strftime("%Y-%m-%dT%H:%M:%SZ") if ts else "",
+                "operation": e["operation"], "user": e["user"],
+                "client_ip": e["client_ip"], "subject": subject,
+                "message_id": mid,
+            }
+            matches.append(row)
+            if e["client_ip"]:
+                ips.add(e["client_ip"])
+            break
+    matches.sort(key=lambda r: r["time"])
+    return ips, matches
+
+
 def build_message_index(events, attacker_ips=(), compromise_dt=None):
     """Map normalized Message-ID -> the audit events that touched that message.
 
@@ -522,7 +572,8 @@ def coverage_warnings(audit_summary, corpus_first=None, corpus_last=None,
     return out
 
 
-def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None):
+def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
+                      attacker_subjects=()):
     """Parse a UAL export and derive anchors + confirmed attacker events.
 
     Returns a summary dict with `derived` anchors and human-readable findings,
@@ -588,6 +639,13 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None):
         if _extra:
             attacker_ips.add(str(_extra))
 
+    # Addresses that sent a message the investigator named as the attacker's.
+    # Seeded here for the same reason as the block above: everything below
+    # reads the set once, so a late addition would be invisible to it.
+    subject_ips, subject_sends = attacker_ips_from_subjects(
+        events, attacker_subjects, anchor_dt)
+    attacker_ips |= subject_ips
+
     # Any sign-in from an attacker IP is an attacker session -- and so is
     # every other operation from it. Stopping at UserLoggedIn meant an
     # attacker could create a rule, read a hundred messages and delete a dozen
@@ -624,6 +682,12 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None):
         "attacker_addresses": sorted(attacker_addresses),
         "attacker_domains": sorted(attacker_domains),
         "rule_keywords": sorted(rule_keywords),
+        # Kept separate from attacker_ips so a reader can tell which addresses
+        # the subject established and which the rules did. Two independent
+        # derivations of the same fact are worth more than one merged list.
+        "attacker_ips_from_subject": sorted(subject_ips),
+        "attacker_sends": subject_sends,
+        "attacker_send_count": len(subject_sends),
     }
     # Built last: it needs the attacker IPs and the compromise date derived
     # above in order to say who did each thing, not merely that it happened.

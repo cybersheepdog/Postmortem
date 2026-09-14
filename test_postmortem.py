@@ -5602,3 +5602,177 @@ def test_scoring_without_a_term_policy_is_unchanged(tmp_path):
         found = [f for f in r.provenance if "confidential" in f["signal"]]
         assert found[0]["weight"] == PHISHING_TERMS["confidential"]
         assert "common here" not in found[0]["signal"]
+
+
+# --------------------------------------------------------------------------
+# A known attacker subject is ground truth, not a hypothesis. attacker_ips was
+# seeded only from malicious rule operations, so an intruder who mass-mailed
+# but never built a rule contributed nothing and every attribution downstream
+# inherited that silence -- on a real corpus, 1,383 Send and 113 SendAs events
+# with zero attributed to anyone.
+# --------------------------------------------------------------------------
+def _send_events(subject, ip, user="ap@acme.com", op="Send",
+                 when="2026-08-27T10:00:00"):
+    return [{
+        "CreationDate": when, "Operation": op, "UserIds": user,
+        "AuditData": json.dumps({
+            "Operation": op, "ClientIP": ip, "UserId": user,
+            "Item": {"InternetMessageId": "<m1@acme.com>", "Subject": subject},
+        }),
+    }]
+
+
+def _audit_file(tmp_path, rows, name="ual.json"):
+    p = tmp_path / name
+    p.write_text(json.dumps(rows), encoding="utf-8")
+    return str(p)
+
+
+def test_a_known_subject_names_the_address_that_sent_it(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    path = _audit_file(tmp_path, _send_events(
+        "Updated remittance instructions", "45.147.230.88"))
+    out = analyze_audit_log(path,
+                            attacker_subjects=["Updated remittance instructions"])
+    d = out["derived"]
+    assert "45.147.230.88" in d["attacker_ips"]
+    assert d["attacker_ips_from_subject"] == ["45.147.230.88"]
+    assert d["attacker_send_count"] == 1
+
+
+def test_the_subject_match_ignores_reply_prefixes_and_case(tmp_path):
+    # A hijacked thread carries the stolen subject with a prefix chain in
+    # front of it. Failing to match a subject against itself is the whole
+    # failure mode this normalisation exists to prevent.
+    from postmortem.auditlog import analyze_audit_log
+
+    path = _audit_file(tmp_path, _send_events(
+        "RE: FW:  Updated Remittance Instructions", "45.147.230.88"))
+    out = analyze_audit_log(path,
+                            attacker_subjects=["updated remittance instructions"])
+    assert out["derived"]["attacker_ips_from_subject"] == ["45.147.230.88"]
+
+
+def test_reading_a_message_with_that_subject_attributes_nothing(tmp_path):
+    # The dangerous false positive. Attackers reuse stolen thread subjects, so
+    # the victim's own genuine correspondence carries the identical string --
+    # and so does every read, move and delete of it. Only a SEND attributes.
+    from postmortem.auditlog import analyze_audit_log
+
+    path = _audit_file(tmp_path, _send_events(
+        "Updated remittance instructions", "203.0.113.10", op="MailItemsAccessed"))
+    out = analyze_audit_log(path,
+                            attacker_subjects=["Updated remittance instructions"])
+    assert out["derived"]["attacker_ips_from_subject"] == []
+    assert "203.0.113.10" not in out["derived"]["attacker_ips"]
+
+
+def test_a_send_before_the_compromise_attributes_nothing(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = _send_events("Weekly numbers", "203.0.113.10",
+                        when="2026-08-01T09:00:00")
+    rows += _send_events("Weekly numbers", "45.147.230.88",
+                         when="2026-08-27T10:00:00")
+    path = _audit_file(tmp_path, rows)
+    out = analyze_audit_log(path, attacker_subjects=["Weekly numbers"],
+                            anchor_dt=_dt(2026, 8, 27, 0, 0, tzinfo=_tz.utc))
+    assert out["derived"]["attacker_ips_from_subject"] == ["45.147.230.88"]
+
+
+def test_no_subject_supplied_changes_nothing(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    path = _audit_file(tmp_path, _send_events("Anything", "45.147.230.88"))
+    for subjects in ((), None, [""]):
+        out = analyze_audit_log(path, attacker_subjects=subjects)
+        assert out["derived"]["attacker_ips_from_subject"] == []
+        assert out["derived"]["attacker_send_count"] == 0
+
+
+def _annotate(records, anchors, internal=("acme.com",)):
+    """Minimal wiring for annotate_forensic_signals, which takes ten arguments."""
+    from postmortem.scoring import annotate_forensic_signals, build_baselines
+
+    internal = set(internal)
+    freq_domains, freq_senders, sender_ips, baselines = build_baselines(records)
+    annotate_forensic_signals(
+        records, internal, freq_domains, {}, sender_ips, freq_senders,
+        anchors, baselines, set(anchors.victim_domains) or internal,
+        None, {}, {},
+    )
+    return records
+
+
+def _subject_record(subject, domain, path, date="Thu, 27 Aug 2026 10:00:00 +0000"):
+    r = make_record(sender_email="ap@%s" % domain, sender_domain=domain,
+                    subject=subject, path=path, date=date)
+    r.body = "See attached."
+    r.urls = []; r.url_domains = []; r.url_analysis = []
+    r.attachments = []; r.attachment_details = []
+    r.authentication_results = {}
+    return r
+
+
+def test_outbound_mail_with_the_known_subject_is_tier_1(tmp_path):
+    # Every other tiering branch is gated on is_inbound, and the attacker's
+    # own mass-mail is by definition not inbound -- so without an explicit
+    # branch it lands in Tier 3 no matter what the analyst supplied.
+    from postmortem.models import Anchors
+    from postmortem.scoring import annotate_forensic_signals, assign_tiers
+
+    sent = _subject_record("Updated remittance instructions", "acme.com",
+                           "/m/sent.eml")
+    other = _subject_record("Weekly numbers", "acme.com", "/m/other.eml")
+    records = [sent, other]
+    anchors = Anchors(attacker_subjects=["Updated remittance instructions"],
+                      victim_domains=["acme.com"])
+    _annotate(records, anchors)
+    assign_tiers(records, "ato", anchors)
+
+    assert sent.attacker_subject_match is True
+    assert sent.attacker_subject_sent is True
+    assert sent.tier == 1, sent.anchor_matches
+    assert other.attacker_subject_match is False
+
+
+def test_an_inbound_copy_of_the_same_subject_is_flagged_not_attributed(tmp_path):
+    # The clone case: the genuine correspondence the attacker stole the
+    # subject from. It is worth surfacing and it is not the attack.
+    from postmortem.models import Anchors
+
+    inbound = _subject_record("Updated remittance instructions",
+                              "supplier.example", "/m/in.eml")
+    anchors = Anchors(attacker_subjects=["Updated remittance instructions"],
+                      victim_domains=["acme.com"])
+    _annotate([inbound], anchors)
+
+    assert inbound.attacker_subject_match is True
+    assert inbound.attacker_subject_sent is False
+    assert any("not outbound" in m for m in inbound.anchor_matches)
+
+
+def test_an_outbound_match_before_the_compromise_is_not_attacker_sent(tmp_path):
+    from postmortem.models import Anchors
+
+    early = _subject_record("Updated remittance instructions", "acme.com",
+                            "/m/early.eml", date="Mon, 03 Aug 2026 09:00:00 +0000")
+    anchors = Anchors(attacker_subjects=["Updated remittance instructions"],
+                      victim_domains=["acme.com"],
+                      compromise_date=_dt(2026, 8, 27, tzinfo=_tz.utc))
+    _annotate([early], anchors)
+    assert early.attacker_subject_match is True
+    assert early.attacker_subject_sent is False
+
+
+def test_a_subject_anchor_is_not_comma_split(tmp_path):
+    # rule_keywords are comma-split; a subject legitimately contains commas,
+    # and splitting one would produce two anchors that match nothing.
+    from postmortem.scoring import build_anchors
+
+    class A:
+        attacker_subject = ["Invoice 4471, revised"]
+    a = build_anchors(A())
+    assert a.attacker_subjects == ["Invoice 4471, revised"]
+    assert a.active() is True
