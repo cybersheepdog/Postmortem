@@ -6955,3 +6955,120 @@ def test_a_user_with_no_history_is_not_rare_everywhere(tmp_path):
     out2 = analyze_signin_logs(_si_export(tmp_path, rows, "t"))
     assert out2["aitm_indicated"] == 0, "token alone is 5, still below the floor"
     assert out2["aitm"] and out2["aitm"][0]["score"] == 5
+
+
+# --------------------------------------------------------------------------
+# Attachment substituted on a thread: the same invoice, on the same thread,
+# sent twice -- and the second copy has different bank details. No single
+# message looks wrong. The change is the finding.
+# --------------------------------------------------------------------------
+def _att_msg(path, name, sha, date, sender="ap@vendor.example",
+             domain="vendor.example", subject="Invoice 4471", body="See attached.",
+             thread="subject:invoice 4471"):
+    r = make_record(sender_email=sender, sender_domain=domain, subject=subject,
+                    path=path, date=date)
+    r.body = body
+    r.thread_id = thread
+    r.attachments = [name]
+    r.attachment_details = [{"filename": name, "sha256": sha}]
+    r.urls = []; r.url_domains = []; r.url_analysis = []
+    r.authentication_results = {}
+    return r
+
+
+def test_the_same_invoice_resent_with_different_bytes_is_a_substitution(tmp_path):
+    from datetime import datetime as D, timezone as TZ
+    from postmortem.models import Anchors
+    from postmortem.scoring import thread_attachment_diffs
+
+    orig = _att_msg("/m/1.eml", "Invoice-4471.pdf", "a" * 64,
+                    "Mon, 10 Aug 2026 09:00:00 +0000")
+    swap = _att_msg("/m/2.eml", "Invoice-4471.pdf", "b" * 64,
+                    "Fri, 28 Aug 2026 09:00:00 +0000",
+                    sender="ap@vendor-billing.example",
+                    domain="vendor-billing.example",
+                    body="Please note our bank details have changed. Updated "
+                         "invoice attached.")
+    out = thread_attachment_diffs(
+        [orig, swap], Anchors(compromise_date=D(2026, 8, 27, tzinfo=TZ.utc)))
+    assert out["count"] == 1 and out["indicated_count"] == 1
+    e = out["substitutions"][0]
+    assert e["replacement_path"] == "/m/2.eml"
+    assert any("after the compromise" in r for r in e["reasons"])
+    assert any("different domain" in r for r in e["reasons"])
+    assert any("bank-change" in r for r in e["reasons"])
+    assert swap.attachment_substituted is True
+    assert any("substituted" in f["signal"] for f in swap.provenance)
+
+
+def test_a_genuine_revision_from_the_same_vendor_before_anything_happened_is_not(tmp_path):
+    # Same name, different bytes -- and that is all. A revised quote.
+    from datetime import datetime as D, timezone as TZ
+    from postmortem.models import Anchors
+    from postmortem.scoring import thread_attachment_diffs
+
+    a = _att_msg("/m/1.eml", "Quote.pdf", "a" * 64, "Mon, 03 Aug 2026 09:00:00 +0000",
+                 subject="Quote", thread="subject:quote")
+    b = _att_msg("/m/2.eml", "Quote.pdf", "b" * 64, "Tue, 04 Aug 2026 09:00:00 +0000",
+                 subject="Quote", thread="subject:quote",
+                 body="Revised quote as discussed.")
+    out = thread_attachment_diffs(
+        [a, b], Anchors(compromise_date=D(2026, 8, 27, tzinfo=TZ.utc)))
+    assert out["count"] == 1, "it is reported"
+    assert out["indicated_count"] == 0, "but not as fraud"
+    assert b.attachment_substituted is False
+
+
+def test_identical_bytes_resent_are_not_a_substitution(tmp_path):
+    from postmortem.scoring import thread_attachment_diffs
+
+    a = _att_msg("/m/1.eml", "Invoice.pdf", "a" * 64, "Mon, 10 Aug 2026 09:00:00 +0000")
+    b = _att_msg("/m/2.eml", "Invoice.pdf", "a" * 64, "Tue, 11 Aug 2026 09:00:00 +0000")
+    out = thread_attachment_diffs([a, b])
+    assert out["available"] and out["count"] == 0
+
+
+def test_the_copy_suffix_a_mail_client_adds_is_the_same_name(tmp_path):
+    from postmortem.scoring import _att_key
+
+    assert _att_key("Invoice-4471 (1).pdf") == _att_key("invoice-4471.pdf")
+    assert _att_key("Invoice-4471 - Copy.pdf") == _att_key("Invoice-4471.pdf")
+    assert _att_key("Invoice-4471.pdf") != _att_key("Invoice-4472.pdf")
+
+
+def test_different_threads_are_never_compared(tmp_path):
+    from postmortem.scoring import thread_attachment_diffs
+
+    a = _att_msg("/m/1.eml", "Invoice.pdf", "a" * 64, "Mon, 10 Aug 2026 09:00:00 +0000",
+                 thread="subject:a")
+    b = _att_msg("/m/2.eml", "Invoice.pdf", "b" * 64, "Tue, 11 Aug 2026 09:00:00 +0000",
+                 thread="subject:b")
+    assert thread_attachment_diffs([a, b])["count"] == 0
+
+
+def test_a_substituted_attachment_is_tier_1(tmp_path):
+    from datetime import datetime as D, timezone as TZ
+    from postmortem.models import Anchors
+    from postmortem.scoring import thread_attachment_diffs, assign_tiers
+
+    orig = _att_msg("/m/1.eml", "Invoice-4471.pdf", "a" * 64,
+                    "Mon, 10 Aug 2026 09:00:00 +0000")
+    swap = _att_msg("/m/2.eml", "Invoice-4471.pdf", "b" * 64,
+                    "Fri, 28 Aug 2026 09:00:00 +0000",
+                    sender="ap@vendor-billing.example", domain="vendor-billing.example",
+                    body="Updated bank details attached.")
+    anchors = Anchors(compromise_date=D(2026, 8, 27, tzinfo=TZ.utc))
+    thread_attachment_diffs([orig, swap], anchors)
+    for r in (orig, swap):
+        r.is_inbound = True
+    assign_tiers([orig, swap], "impersonation", anchors)
+    assert swap.tier == 1
+
+
+def test_the_case_page_reports_a_substitution_as_money_movement(tmp_path):
+    from postmortem.casepage import case_answers
+
+    v = {"audit_log": {"derived": {}}, "attachment_diffs": {"indicated_count": 1}}
+    a = {x["question"]: x for x in case_answers(v, [], None)}["Was money moved"]
+    assert "substituted" in a["answer"]
+    assert a["provenance"] == "observed"

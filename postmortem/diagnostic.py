@@ -377,6 +377,11 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
         "config_deltas": _config_deltas(config),
     }
 
+    # Corpus-only: needs no log, so it sits outside the audit block.
+    _ad = (verdict or {}).get("attachment_diffs") or {}
+    doc["attachment_diffs"] = {k: v for k, v in _ad.items()
+                               if isinstance(v, (int, bool))}
+
     if audit_summary:
         cov = audit_summary.get("coverage") or {}
         idx = audit_summary.get("message_index") or {}

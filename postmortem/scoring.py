@@ -2135,6 +2135,10 @@ def assign_tiers(records, scenario, anchors: Anchors):
         # lands in Tier 3 no matter what the analyst supplied.
         if getattr(r, "attacker_subject_sent", False):
             r.tier = 1
+        elif getattr(r, "attachment_substituted", False):
+            # The change is observed in the corpus, not inferred from
+            # wording: same name, different bytes, after the compromise.
+            r.tier = 1
         elif getattr(r, "audit_confirmed", False):
             r.tier = 1
         elif r.is_inbound and r.anchor_matches:
@@ -2576,6 +2580,8 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
         records, signin_summary, signin_window_minutes)
     signin_lures["aitm"] = aitm_lure_window(
         records, signin_summary, signin_window_minutes)
+    # Must also run before tiering: a substituted attachment promotes.
+    attachment_diffs = thread_attachment_diffs(records, anchors)
 
     for r in records:
         score_initial_email(r, scenario, anchors)
@@ -2587,6 +2593,7 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     verdict["attacker_authorship"] = authorship
     verdict["exposure_scope"] = exposure
     verdict["rule_replay"] = rule_replay
+    verdict["attachment_diffs"] = attachment_diffs
     verdict["signin_lures"] = signin_lures
     verdict["victim_address"] = victim_address
     verdict["attack_narrative"] = reconstruct_attack_narrative(
@@ -2665,6 +2672,140 @@ _DEVICE_LOGIN_URL_RE = re.compile(
 _DEVICE_CODE_LABELLED_RE = re.compile(
     r"\bcode\b[^A-Za-z0-9]{0,12}([A-Z0-9]{4}[\s-]?[A-Z0-9]{3,5})\b")
 _DEVICE_CODE_BARE_RE = re.compile(r"\b(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,9}\b")
+
+
+# --------------------------------------------------------------------------
+# Attachment diffing across a thread
+#
+# The fraud, in the form it most often takes: the same invoice, on the same
+# thread, sent twice -- and the second copy has different bank details. Same
+# filename, different hash, and the second one arrives after the compromise
+# on a thread that has started talking about payment. No single message
+# looks wrong; the CHANGE is the finding, and only a comparison sees it.
+# --------------------------------------------------------------------------
+
+_DIFF_DOC_EXT = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".rtf", ".odt",
+                 ".ods", ".csv", ".txt", ".png", ".jpg", ".jpeg")
+
+
+def _att_key(name):
+    """Compare attachment names the way a person would: case, spacing, and
+    the "(1)" / " - Copy" suffixes mail clients add on resend."""
+    n = str(name or "").strip().lower()
+    n = re.sub(r"\s*\(\d+\)(?=\.[a-z0-9]{2,5}$)", "", n)
+    n = re.sub(r"\s*-\s*copy(?=\.[a-z0-9]{2,5}$)", "", n)
+    n = re.sub(r"\s+", " ", n)
+    return n
+
+
+def thread_attachment_diffs(records, anchors=None, limit=40):
+    """Attachments re-sent on a thread with the same name and different bytes.
+
+    Ranked by what makes a substitution the fraud rather than a revision: the
+    replacement arrives after the compromise, from a different sender or
+    domain than the original, and the thread carries bank-change or payment
+    language around it. A genuine revised quote from the same vendor two
+    weeks before anything happened scores nothing here.
+    """
+    compromise = getattr(anchors, "compromise_date", None) if anchors else None
+    compromise = _as_utc(compromise) if compromise else None
+
+    # (thread, name) -> [(arrival, record, detail)]
+    seen = {}
+    for r in records:
+        tid = getattr(r, "thread_id", "") or ""
+        if not tid:
+            continue
+        dt = _as_utc(message_arrival_dt(r))
+        for d in (getattr(r, "attachment_details", None) or []):
+            if not isinstance(d, dict):
+                continue
+            name = str(d.get("filename") or "")
+            sha = str(d.get("sha256") or "")
+            if not (name and sha):
+                continue
+            if not name.lower().endswith(_DIFF_DOC_EXT):
+                continue
+            seen.setdefault((tid, _att_key(name)), []).append((dt, r, d, sha))
+
+    out = []
+    for (tid, key), items in seen.items():
+        hashes = {sha for _dt, _r, _d, sha in items}
+        if len(hashes) < 2:
+            continue
+        dated = sorted((i for i in items if i[0] is not None), key=lambda i: i[0])
+        if len(dated) < 2:
+            continue
+        first = dated[0]
+        # every later copy whose bytes differ from the first
+        for later in dated[1:]:
+            if later[3] == first[3]:
+                continue
+            f_dt, f_r, f_d, f_sha = first
+            l_dt, l_r, l_d, l_sha = later
+            reasons, score = [], 0
+            if compromise and l_dt >= compromise and (f_dt < compromise):
+                reasons.append("replacement arrived after the compromise; the "
+                               "original before it")
+                score += 3
+            elif compromise and l_dt >= compromise:
+                reasons.append("replacement arrived after the compromise")
+                score += 2
+            f_from = (getattr(f_r, "sender_email", "") or "").lower()
+            l_from = (getattr(l_r, "sender_email", "") or "").lower()
+            f_dom = (getattr(f_r, "sender_domain", "") or "").lower()
+            l_dom = (getattr(l_r, "sender_domain", "") or "").lower()
+            if f_dom and l_dom and f_dom != l_dom:
+                reasons.append("replacement from a different domain (%s, was %s)"
+                               % (l_dom, f_dom))
+                score += 3
+            elif f_from and l_from and f_from != l_from:
+                reasons.append("replacement from a different address")
+                score += 1
+            if getattr(l_r, "reply_to_mismatch", False):
+                reasons.append("replacement carries a divergent Reply-To")
+                score += 2
+            text = ("%s\n%s" % (getattr(l_r, "subject", "") or "",
+                                scoring_text(l_r) or "")).lower()
+            bank = [w for w in _BANK_CHANGE_TERMS if w in text]
+            pay = [w for w in _PAYMENT_TERMS if w in text]
+            if bank:
+                reasons.append("bank-change language with the replacement: %s"
+                               % ", ".join(bank[:2]))
+                score += 3
+            elif pay:
+                reasons.append("payment language with the replacement")
+                score += 1
+            if l_d.get("ext_mismatch") or l_d.get("macro") or l_d.get("html_form"):
+                reasons.append("replacement content inspection flagged it")
+                score += 2
+            out.append({
+                "thread_id": tid, "attachment": l_d.get("filename") or key,
+                "original_path": f_r.path, "original_sha256": f_sha,
+                "original_from": f_from,
+                "original_arrival": f_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "replacement_path": l_r.path, "replacement_sha256": l_sha,
+                "replacement_from": l_from,
+                "replacement_arrival": l_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "subject": getattr(l_r, "subject", "") or "",
+                "score": score, "reasons": reasons,
+                "indicated": score >= 5,
+            })
+            if score >= 5:
+                l_r.provenance = list(l_r.provenance) + [make_finding(
+                    "Attachment substituted on the thread: %r re-sent with "
+                    "different contents (%s)" % (l_d.get("filename") or key,
+                                                  "; ".join(reasons[:2])),
+                    category="attachment", source="corpus:thread",
+                    matched="%s -> %s" % (f_sha[:12], l_sha[:12]),
+                    weight=0, severity="high")]
+                l_r.indicators = list(dict.fromkeys(
+                    list(l_r.indicators) + ["Attachment substituted on thread"]))
+                l_r.attachment_substituted = True
+    out.sort(key=lambda e: (-e["score"], e["replacement_arrival"]))
+    return {"available": bool(seen), "pairs_compared": len(seen),
+            "substitutions": out[:limit], "count": len(out),
+            "indicated_count": sum(1 for e in out if e["indicated"])}
 
 
 def aitm_lure_window(records, signin_summary, window_minutes=20):

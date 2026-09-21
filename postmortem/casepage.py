@@ -255,6 +255,16 @@ def _money(v, a, records):
                        or "payment" in str(f.get("signal", "")).lower()
                        for f in (getattr(r, "provenance", None) or [])))
     total_sent = max(sent, subj, subject_sends)
+    subs = (v.get("attachment_diffs") or {}).get("indicated_count", 0)
+    if subs and not total_sent:
+        return _a("Was money moved",
+                  "%d attachment%s substituted on a thread" % (subs, "" if subs == 1 else "s"),
+                  OBSERVED,
+                  "The same document re-sent by name with different contents, "
+                  "after the compromise, alongside payment or bank-change "
+                  "language. The tool cannot see a payment; this is the "
+                  "instruction being swapped. Compare the two copies.",
+                  hit=True)
     if not total_sent:
         if a:
             return _a("Was money moved", "No attacker-sent mail attributed", NA,
@@ -267,6 +277,8 @@ def _money(v, a, records):
     ans = "%d message%s sent by the attacker" % (total_sent, "" if total_sent == 1 else "s")
     if bank:
         ans += ", %d carrying payment or bank-change language" % bank
+    if subs:
+        ans += "; %d attachment%s substituted on a thread" % (subs, "" if subs == 1 else "s")
     return _a("Was money moved", ans,
               OBSERVED if (sent or subject_sends) else INFERRED,
               "The tool cannot see a payment. It can see the instruction. "
