@@ -7145,3 +7145,67 @@ def test_the_case_page_leads_with_infrastructure_over_a_scored_email(tmp_path):
     a = case_answers(v, [], None)[0]
     assert "Purpose-built lookalike" in a["answer"]
     assert a["provenance"] == "observed"
+
+
+# --------------------------------------------------------------------------
+# Provenance on every finding: observed (the service recorded it), inferred
+# (the tool derived it), assumed (the analyst supplied it). A reader can tell
+# at a glance which rows are the record and which are judgement about it.
+# --------------------------------------------------------------------------
+def test_every_finding_carries_a_provenance_grade(tmp_path):
+    from postmortem.scoring import make_finding, provenance_grade
+
+    for src, grade in (("audit:MailItemsAccessed", "observed"),
+                       ("entra:signin_log", "observed"),
+                       ("rdap", "observed"),
+                       ("corpus:thread", "observed"),
+                       ("corpus:lookalike+rdap", "observed"),
+                       ("investigator_anchor", "assumed"),
+                       ("body", "inferred"),
+                       ("subject+body", "inferred"),
+                       ("authentication_results", "inferred"),
+                       ("corpus:baseline", "inferred"),
+                       ("header:From", "inferred"),
+                       ("url_analysis", "inferred"),
+                       ("yara", "inferred")):
+        assert provenance_grade(src) == grade, src
+        f = make_finding("x", category="c", source=src)
+        assert f["provenance"] == grade
+
+
+def test_a_call_site_can_override_the_grade(tmp_path):
+    from postmortem.scoring import make_finding
+
+    f = make_finding("x", category="c", source="body", provenance="observed")
+    assert f["provenance"] == "observed"
+
+
+def test_every_scored_record_has_graded_findings(tmp_path):
+    # The guard: nothing constructs a finding without the grade, because
+    # every constructor is make_finding and make_finding always sets it.
+    from postmortem.scoring import calculate_score
+
+    r = _attach_record("invoice.pdf", {"ext_mismatch": True,
+                                       "sniffed_type": "pe_executable"})
+    r.body = "Urgent: wire transfer needed, keep this confidential. Click here."
+    calculate_score(r, {"acme.com"}, set())
+    assert r.provenance
+    for f in r.provenance:
+        assert f.get("provenance") in ("observed", "inferred", "assumed"), f
+
+
+def test_remediation_actions_carry_existence_and_attribution_grades(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.persistence import remediation_plan
+
+    out = analyze_audit_log(
+        _audit_file(tmp_path, [
+            _named_rule(UAL_ATK, ".", DeleteMessage="True",
+                        SubjectContainsWords="wire")]),
+        current_rules=[])
+    acts = {a["kind"]: a for a in remediation_plan(None, out)}
+    live = acts["inbox_rule"]
+    assert live["provenance"] == "observed"
+    assert live["attribution_grade"] == "observed"     # "created from <address>"
+    gone = acts["inbox_rule_removed"]
+    assert gone["provenance"] == "inferred"            # known only by absence

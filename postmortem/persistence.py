@@ -1017,6 +1017,25 @@ def remediation_plan(persistence, audit_summary=None, drift=None):
     ))
     for i, a in enumerate(actions, 1):
         a["priority"] = i
+        # Every action here comes from an export the service produced, so
+        # the mechanism's EXISTENCE is observed. The one exception is a rule
+        # known only by its absence: created in the log, gone from the
+        # configuration, removal never recorded -- that is inferred.
+        if not a.get("provenance"):
+            if a["kind"] == "inbox_rule_removed" and a.get("not_fixed_by"):
+                a["provenance"] = "inferred"
+            else:
+                a["provenance"] = "observed"
+        # Attribution to the attacker is a separate claim from existence,
+        # and it is the one a client will be asked to defend.
+        if a.get("by_attacker"):
+            why = str(a.get("attribution") or "")
+            # Named address = recorded by the service. "Inside the window,
+            # by the compromised account" = the tool's inference from timing.
+            a["attribution_grade"] = (
+                "observed" if (re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", why)
+                               or "address" in why)
+                else "inferred")
     return actions
 
 

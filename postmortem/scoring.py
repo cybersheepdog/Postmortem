@@ -35,7 +35,38 @@ def _severity_for(weight: int) -> str:
     return "high" if weight >= 6 else "medium" if weight >= 3 else "low"
 
 
-def make_finding(signal, *, category, source, matched="", weight=0, severity=None):
+# Where a finding's evidence came from, in three grades. Every finding carries
+# one, so a reader can tell at a glance which rows are the service's own
+# record and which are the tool's judgement about it.
+#
+#   observed   the service recorded it -- an audit event, a sign-in, a trace
+#              row, a registration date, a hash comparison of actual bytes.
+#              The strongest claim the report makes.
+#   inferred   the tool derived it -- a term matched, a baseline deviated
+#              from, a domain resembled another. Defensible; needs workings.
+#   assumed    the analyst supplied it -- an anchor. True by assertion.
+#
+# Assigned from the source by default; a call site that knows better passes
+# it explicitly.
+OBSERVED, INFERRED, ASSUMED = "observed", "inferred", "assumed"
+
+_OBSERVED_SOURCES = ("audit", "entra:", "rdap", "geoip", "persistence",
+                     "mailbox_metadata", "corpus:thread",
+                     "corpus:lookalike+rdap", "messagetrace")
+_ASSUMED_SOURCES = ("investigator_anchor",)
+
+
+def provenance_grade(source):
+    s = str(source or "")
+    if any(s == a or s.startswith(a) for a in _ASSUMED_SOURCES):
+        return ASSUMED
+    if any(s == o or s.startswith(o) for o in _OBSERVED_SOURCES):
+        return OBSERVED
+    return INFERRED
+
+
+def make_finding(signal, *, category, source, matched="", weight=0, severity=None,
+                 provenance=None):
     """Build one evidence-provenance record for a single named finding.
 
     Each finding an analyst reads back is tied to *where* its evidence was
@@ -59,6 +90,7 @@ def make_finding(signal, *, category, source, matched="", weight=0, severity=Non
         "matched": (str(matched)[:200] if matched not in ("", None) else ""),
         "weight": int(weight),
         "severity": severity or _severity_for(weight),
+        "provenance": provenance or provenance_grade(source),
     }
 
 
