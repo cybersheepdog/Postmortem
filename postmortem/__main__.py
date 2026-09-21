@@ -128,6 +128,7 @@ from postmortem.signin import (
     analyze_signin_logs, resolve_single_groups, find_token_replay,
 )
 from postmortem.mes import collect as collect_mes
+from postmortem.casepage import case_answers, write_exposure_csv  # noqa: E402
 from postmortem.persistence import (
     analyze_persistence, remediation_plan, strip_private,
 )
@@ -536,6 +537,7 @@ from postmortem.reporting import (  # noqa: E402
     print_persistence, print_remediation, print_mes_manifest,
     print_directory, print_message_trace, print_notification_scope,
     print_token_replay, print_file_activity, print_delegate_access,
+    print_case_answers,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -798,6 +800,15 @@ def main():
         help="Write a per-message CSV with all timestamps converted to UTC",
     )
 
+    parser.add_argument(
+        "--exposure-csv",
+        type=Path,
+        metavar="FILE",
+        help="Write every message the attacker is recorded as having read, one "
+             "per row: first access, Sync or Bind, throttled, address, "
+             "session, subject, sender, attachment. The list a "
+             "breach-notification decision rests on; distinct from --ioc.",
+    )
     parser.add_argument(
         "--ioc",
         type=Path,
@@ -2387,6 +2398,11 @@ def main():
             initial_verdict['notification_scope'] = trace_scope
         initial_verdict['remediation'] = remediation
 
+    # The first page. Computed here, once everything that feeds it is in the
+    # verdict, and carried into the JSON and HTML so the three agree.
+    initial_verdict["case_answers"] = case_answers(initial_verdict, records, anchors)
+    print_case_answers(initial_verdict["case_answers"])
+
     print_initial_compromise(initial_verdict)
 
     print_attack_narrative(initial_verdict.get("attack_narrative"))
@@ -2458,6 +2474,12 @@ def main():
             write_csv(records, args.csv)
 
         print(term.c(f"CSV (UTC) written to: {args.csv}", "green"))
+
+    if getattr(args, "exposure_csv", None):
+        with timed("exposure inventory"):
+            _n = write_exposure_csv(initial_verdict, args.exposure_csv)
+        print(term.c(f"Exposure inventory ({_n} message(s) read) written to: "
+                     f"{args.exposure_csv}", "green"))
 
     if args.ioc:
 

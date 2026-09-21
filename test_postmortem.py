@@ -6429,3 +6429,109 @@ def test_the_message_index_carries_access_type_and_session(tmp_path):
     idx = analyze_audit_log(_audit_file(tmp_path, rows))["message_index"]["by_message_id"]
     hit = idx["<m1@acme.com>"][0]
     assert hit["access_type"] == "sync" and hit["session_id"] == "sess-9"
+
+
+# --------------------------------------------------------------------------
+# The first page. Nine questions a client asks, each answered or explicitly
+# not assessed, each labelled by where the answer came from.
+# --------------------------------------------------------------------------
+def _answers(**verdict):
+    from postmortem.casepage import case_answers
+    return {a["question"]: a for a in case_answers(verdict, records=[], anchors=None)}
+
+
+def test_there_are_always_nine_answers_in_a_fixed_order(tmp_path):
+    from postmortem.casepage import case_answers
+
+    qs = [a["question"] for a in case_answers({}, [], None)]
+    assert qs == ["How did they get in", "When did it start", "When did it end",
+                  "Which accounts", "What was exposed", "What was taken",
+                  "Was money moved", "Who must be notified", "What persists"]
+
+
+def test_an_empty_run_says_not_assessed_and_names_the_export(tmp_path):
+    # Silence reads as "nothing found". A named gap reads as a gap.
+    A = _answers()
+    for q, a in A.items():
+        assert a["provenance"] == "not assessed", q
+        assert a["gap"], q
+    assert "Get-GraphEntraSignInLogs" in A["How did they get in"]["gap"]
+    assert "--containment-date" in A["When did it end"]["gap"]
+    assert "Get-MessageTraceLog" in A["Who must be notified"]["gap"]
+    assert "--mes-dir" in A["What persists"]["gap"]
+
+
+def test_each_answer_carries_the_strength_of_its_evidence(tmp_path):
+    from datetime import datetime as D, timezone as TZ
+    from postmortem.models import Anchors
+    from postmortem.casepage import case_answers
+
+    v = {
+        "signin_log": {"available": True, "attack_groups": 1,
+                       "earliest_token": "2026-08-27T09:14:00Z",
+                       "affected_users": ["ap@acme.com"]},
+        "audit_log": {"containment_date": "2026-08-29T12:00:00Z",
+                      "response_events": 3,
+                      "ip_activity": [{"is_attacker": True, "users": ["ap@acme.com"]}]},
+        "exposure_scope": {"available": True, "messages_read": 140,
+                           "read_by_sync": 100, "read_by_bind": 40,
+                           "read_with_attachments": 58, "scope_is_lower_bound": True},
+    }
+    A = {a["question"]: a for a in case_answers(v, [], Anchors(
+        compromise_date=D(2026, 8, 27, tzinfo=TZ.utc)))}
+    assert A["How did they get in"]["provenance"] == "observed"
+    # earliest token outranks the analyst's anchor
+    assert A["When did it start"]["provenance"] == "observed"
+    assert A["When did it start"]["answer"].startswith("2026-08-27 09:14")
+    assert A["When did it end"]["provenance"] == "assumed"
+    assert A["Which accounts"]["provenance"] == "observed"
+    assert "LOWER BOUND" in A["What was exposed"]["answer"]
+
+
+def test_a_scored_initial_email_is_inferred_not_observed(tmp_path):
+    A = _answers(initial_email={"subject": "Verify", "sender": "x@y", "timestamp": "t"},
+                 confidence="medium")
+    assert A["How did they get in"]["provenance"] == "inferred"
+
+
+def test_money_moved_is_framed_as_what_was_sent(tmp_path):
+    # The tool cannot see a payment. Claiming one would be a lie the client
+    # repeats to their bank.
+    A = _answers(audit_log={"derived": {"attacker_send_count": 37}},
+                 attacker_authorship={"attributed_count": 37})
+    a = A["Was money moved"]
+    assert "37 messages sent by the attacker" in a["answer"]
+    assert "cannot see a payment" in a["detail"]
+    assert a["provenance"] == "observed"
+
+
+def test_tenant_wide_persistence_leads_the_answer(tmp_path):
+    A = _answers(persistence={"available": True, "tenant_wide_count": 1,
+                              "survives_both_count": 2},
+                 remediation=[{"kind": "federation"}, {"kind": "oauth_consent"},
+                              {"kind": "mfa_method"}])
+    assert "TENANT-WIDE" in A["What persists"]["answer"]
+
+
+def test_the_exposure_csv_is_one_row_per_message_read(tmp_path):
+    from postmortem.casepage import write_exposure_csv, EXPOSURE_COLUMNS
+    import csv as _csv
+
+    v = {"exposure_scope": {"available": True, "read": [
+        {"first_access": "2026-08-27T10:00:00Z", "accesses": 2,
+         "access_type": "sync", "throttled": True, "client_ip": "45.147.230.88",
+         "session_id": "s1", "subject": "Wire, revised", "sender": "cfo@acme.com",
+         "has_attachment": True, "in_corpus": True,
+         "message_id": "<m1@acme.com>", "path": "/m/1.eml"},
+        {"first_access": "2026-08-27T10:01:00Z", "accesses": 1,
+         "access_type": "bind", "throttled": False, "client_ip": "45.147.230.88",
+         "session_id": "s1", "subject": "Lunch", "sender": "a@acme.com",
+         "has_attachment": False, "in_corpus": False, "message_id": "<m2@acme.com>",
+         "path": ""}]}}
+    out = tmp_path / "exp.csv"
+    assert write_exposure_csv(v, out) == 2
+    rows = list(_csv.DictReader(out.open(encoding="utf-8-sig")))
+    assert [r["subject"] for r in rows] == ["Wire, revised", "Lunch"]
+    assert rows[0]["throttled"] == "yes" and rows[0]["access_type"] == "sync"
+    assert rows[1]["in_corpus"] == "no"
+    assert list(rows[0].keys()) == EXPOSURE_COLUMNS
