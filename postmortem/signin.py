@@ -866,6 +866,10 @@ def analyze_signin_logs(path):
         "forged_events": forged[:50],
         "forged_count": len(forged),
         "forged_veto_ips": sorted(forged_veto_ips),
+        # Addresses the affected accounts sign in from interactively, with
+        # forged records already excluded. The audit side uses this the same
+        # way this module does: an owner address never seeds attribution.
+        "owner_ips": sorted(victim_ips),
         # Every address that authenticated at all, device code or not. The
         # token-replay test needs the full set, not the device code subset.
         "all_signin_ips": sorted({str(get(f, "ip", "")) for _s, f in records

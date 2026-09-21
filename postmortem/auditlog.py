@@ -31,6 +31,31 @@ _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[0-9A-Fa-f:]{3,}:[0-9A-Fa-f:
 # Inbox-rule / forwarding operations that establish attacker persistence.
 _RULE_OPS = {"new-inboxrule", "set-inboxrule", "updateinboxrules", "set-mailbox"}
 _LOGIN_OPS = {"userloggedin"}
+
+# SharePoint and OneDrive. These carry no InternetMessageId, so they never
+# reach the message index -- which is why an attacker who synced the victim's
+# entire OneDrive was invisible to a tool that only walked the mail verbs. On
+# a real 117k-message corpus: 803 FileDownloaded, 889 FileAccessed, 234
+# FileSyncUploadedFull, none of them attributed.
+_FILE_OPS = {
+    "fileaccessed", "fileaccessedextended", "filepreviewed", "filedownloaded",
+    "filesyncdownloadedfull", "filesyncdownloadedpartial", "fileuploaded",
+    "filesyncuploadedfull", "filesyncuploadedpartial", "filemodified",
+    "filemodifiedextended", "filecopied", "filemoved", "filedeleted",
+    "filerecycled", "filerenamed", "sharingset", "sharinglinkcreated",
+    "anonymouslinkcreated", "anonymouslinkused", "companylinkcreated",
+    "secureLinkCreated".lower(), "addedtosecurelink",
+}
+# The subset that means data left the tenant's control.
+_EXFIL_OPS = {"filedownloaded", "filesyncdownloadedfull",
+              "filesyncdownloadedpartial"}
+# The subset that means data was made reachable from outside.
+_SHARE_OPS = {"sharingset", "sharinglinkcreated", "anonymouslinkcreated",
+              "companylinkcreated", "securelinkcreated", "addedtosecurelink"}
+
+# Turning the log off. The loudest thing an attacker can do, and until this
+# was modelled the tool did not notice.
+_AUDIT_DISABLE_OPS = {"set-mailboxauditbypassassociation"}
 _DELETE_OPS = {"harddelete", "softdelete", "movetodeleteditems"}
 # Rule conditions that hide mail; matching these marks a rule as concealment.
 _KEYWORD_PARAMS = {
@@ -155,13 +180,57 @@ def _normalize(record):
     if ip:
         m = _IP_RE.search(str(ip))
         ip = m.group(0) if m else str(ip).strip("[]")
+    ad = audit if isinstance(audit, dict) else {}
+
+    # MailItemsAccessed carries its meaning in OperationProperties, not in
+    # the operation name. MailAccessType=Sync means the client pulled the
+    # whole folder, so every item in it is exposed rather than the ones
+    # enumerated; IsThrottled=True means Exchange STOPPED RECORDING after a
+    # thousand accesses in a day, and everything after it is invisible. A
+    # count of read events that ignores both is not a scope, it is a floor
+    # presented as a ceiling.
+    props = {}
+    for p in (ad.get("OperationProperties") or []):
+        if isinstance(p, dict) and p.get("Name"):
+            props[str(p["Name"]).lower()] = p.get("Value")
+    access_type = str(props.get("mailaccesstype") or "").strip().lower()
+    throttled = str(props.get("isthrottled") or "").strip().lower() in ("true", "1")
+    folders = []
+    for f in (ad.get("Folders") or []):
+        if isinstance(f, dict) and f.get("Path"):
+            folders.append(str(f["Path"]))
+
+    logon = ad.get("LogonType")
+    try:
+        logon = int(logon) if logon not in (None, "") else None
+    except (TypeError, ValueError):
+        logon = None
+
     return {
         "timestamp": ts,
         "operation": str(op),
         "op_lower": str(op).lower(),
         "user": str(user or ""),
         "client_ip": ip or "",
-        "audit": audit if isinstance(audit, dict) else {},
+        "audit": ad,
+        # Ties every operation in one authenticated session together, even
+        # when a residential proxy rotated the address between them.
+        "session_id": str(ad.get("SessionId") or ""),
+        "client_info": str(ad.get("ClientInfoString") or ad.get("ClientAppId")
+                           or ad.get("UserAgent") or ""),
+        # 0 owner, 1 admin, 2 delegate. A delegate logon by a principal that
+        # holds no delegation is persistence being USED.
+        "logon_type": logon,
+        "mailbox_owner": str(ad.get("MailboxOwnerUPN") or ""),
+        "access_type": access_type,
+        "throttled": throttled,
+        "folders": folders,
+        # File workloads name the object rather than a message.
+        "object_id": str(ad.get("ObjectId") or ""),
+        "file_name": str(ad.get("SourceFileName") or ad.get("DestinationFileName")
+                         or ""),
+        "site_url": str(ad.get("SiteUrl") or ""),
+        "workload": str(ad.get("Workload") or ""),
     }
 
 
@@ -382,6 +451,11 @@ def build_message_index(events, attacker_ips=(), compromise_dt=None):
                 "by_attacker": by_attacker,
                 "deliberate": e["op_lower"] in _DELIBERATE_OPS,
                 "post_compromise": post,
+                "access_type": e.get("access_type", ""),
+                "throttled": e.get("throttled", False),
+                "session_id": e.get("session_id", ""),
+                "client_info": e.get("client_info", "")[:80],
+                "logon_type": e.get("logon_type"),
             })
 
     for key in index:
@@ -392,6 +466,176 @@ def build_message_index(events, attacker_ips=(), compromise_dt=None):
         "events_with_message_id": matched_events,
     }
 
+
+
+def access_profile(events, attacker_ips):
+    """How the mailbox was read, not just how many times.
+
+    Sync and Bind are different claims. A Bind is one message opened. A Sync
+    is a folder pulled down whole -- every item in that folder is exposed,
+    including the ones the event does not enumerate. And a throttled event
+    is the log saying it gave up: after roughly a thousand accesses in
+    twenty-four hours Exchange stops writing MailItemsAccessed at all, so
+    every count from that point is a lower bound and the honest scope is
+    "everything the session could reach".
+    """
+    attacker_ips = set(attacker_ips or ())
+    out = {"available": False}
+    reads = [e for e in events if e["op_lower"] == "mailitemsaccessed"]
+    if not reads:
+        return out
+
+    def _bucket(subset):
+        sync = [e for e in subset if e.get("access_type") == "sync"]
+        bind = [e for e in subset if e.get("access_type") == "bind"]
+        thr = [e for e in subset if e.get("throttled")]
+        folders = Counter()
+        for e in sync:
+            for f in e.get("folders") or []:
+                folders[f] += 1
+        return {
+            "events": len(subset),
+            "sync": len(sync), "bind": len(bind),
+            "untyped": len(subset) - len(sync) - len(bind),
+            "throttled": len(thr),
+            "throttled_first": min((e["timestamp"] for e in thr if e["timestamp"]),
+                                   default=None),
+            "synced_folders": folders.most_common(12),
+        }
+
+    all_ = _bucket(reads)
+    atk = _bucket([e for e in reads if e["client_ip"] in attacker_ips])
+    for b in (all_, atk):
+        tf = b.pop("throttled_first")
+        b["throttled_first"] = tf.strftime("%Y-%m-%dT%H:%M:%SZ") if tf else ""
+
+    out.update({
+        "available": True,
+        "all": all_,
+        "attacker": atk,
+        "scope_is_lower_bound": bool(atk["throttled"]),
+        "note": (
+            "Throttling was recorded on %d attacker read event(s), the first "
+            "at %s. Exchange stops logging MailItemsAccessed after about a "
+            "thousand accesses in a day, so the count of messages read is a "
+            "FLOOR: from that point the honest scope is every message the "
+            "session could reach."
+            % (atk["throttled"], atk["throttled_first"] or "?")
+        ) if atk["throttled"] else (
+            "%d of the attacker's read events were folder Syncs, exposing the "
+            "whole of each folder named rather than the items enumerated."
+            % atk["sync"] if atk["sync"] else ""),
+    })
+    return out
+
+
+def file_activity(events, attacker_ips, compromise_dt=None, limit=60):
+    """SharePoint and OneDrive operations from attacker addresses.
+
+    The mail verbs answer "what did they read". These answer "what did they
+    TAKE" -- a FileSyncDownloadedFull from an attacker address is the entire
+    drive leaving in one event, and until this existed the tool did not see
+    it because a file has no InternetMessageId to index on.
+    """
+    attacker_ips = set(attacker_ips or ())
+    rows = [e for e in events if e["op_lower"] in _FILE_OPS]
+    if not rows:
+        return {"available": False}
+
+    mine = [e for e in rows if e["client_ip"] and e["client_ip"] in attacker_ips]
+    exfil = [e for e in mine if e["op_lower"] in _EXFIL_OPS]
+    shared = [e for e in mine if e["op_lower"] in _SHARE_OPS]
+
+    def _row(e):
+        return {
+            "time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ") if e["timestamp"] else "",
+            "operation": e["operation"],
+            "file": e.get("file_name") or e.get("object_id", "").rsplit("/", 1)[-1],
+            "path": e.get("object_id", ""),
+            "site": e.get("site_url", ""),
+            "workload": e.get("workload", ""),
+            "client_ip": e["client_ip"],
+            "user": e["user"],
+        }
+
+    exfil_rows = sorted((_row(e) for e in exfil), key=lambda r: r["time"])
+    share_rows = sorted((_row(e) for e in shared), key=lambda r: r["time"])
+    ops = Counter(e["operation"] for e in mine)
+    files = {r["path"] for r in exfil_rows if r["path"]}
+
+    return {
+        "available": True,
+        "total_file_events": len(rows),
+        "attacker_file_events": len(mine),
+        "operations": ops.most_common(10),
+        "exfil_count": len(exfil),
+        "exfil_distinct_files": len(files),
+        "exfil": exfil_rows[:limit],
+        "shared_count": len(shared),
+        "shared": share_rows[:limit],
+        "full_sync": sum(1 for e in exfil
+                         if e["op_lower"] == "filesyncdownloadedfull"),
+    }
+
+
+def delegate_access(events, known_delegates=(), attacker_ips=()):
+    """Mail operations performed as a DELEGATE by a principal that holds none.
+
+    LogonType 2 is someone acting on the mailbox under delegated rights.
+    Staff with FullAccess do this all day, so the list of who legitimately
+    holds delegation (Get-MailboxPermissions) is what separates an assistant
+    from an attacker using a permission they granted themselves.
+    """
+    known = {str(d).lower() for d in (known_delegates or ()) if d}
+    attacker_ips = set(attacker_ips or ())
+    by_principal = {}
+    for e in events:
+        if e.get("logon_type") != 2:
+            continue
+        actor = str(e["user"] or "").lower()
+        owner = str(e.get("mailbox_owner") or "").lower()
+        if not actor or actor == owner:
+            continue
+        p = by_principal.setdefault(actor, {
+            "principal": actor, "mailboxes": set(), "events": 0,
+            "operations": Counter(), "ips": set(), "first": None, "last": None,
+            "known_delegate": actor in known,
+            "from_attacker_ip": False,
+        })
+        p["events"] += 1
+        p["operations"][e["operation"]] += 1
+        if owner:
+            p["mailboxes"].add(owner)
+        if e["client_ip"]:
+            p["ips"].add(e["client_ip"])
+            if e["client_ip"] in attacker_ips:
+                p["from_attacker_ip"] = True
+        ts = e["timestamp"]
+        if ts:
+            p["first"] = ts if p["first"] is None or ts < p["first"] else p["first"]
+            p["last"] = ts if p["last"] is None or ts > p["last"] else p["last"]
+
+    out = []
+    for p in by_principal.values():
+        out.append({
+            "principal": p["principal"],
+            "mailboxes": sorted(p["mailboxes"])[:5],
+            "events": p["events"],
+            "operations": p["operations"].most_common(6),
+            "ips": sorted(p["ips"])[:6],
+            "first": p["first"].strftime("%Y-%m-%dT%H:%M:%SZ") if p["first"] else "",
+            "last": p["last"].strftime("%Y-%m-%dT%H:%M:%SZ") if p["last"] else "",
+            "known_delegate": p["known_delegate"],
+            "from_attacker_ip": p["from_attacker_ip"],
+        })
+    out.sort(key=lambda r: (r["known_delegate"] and not r["from_attacker_ip"],
+                            -r["events"]))
+    return {
+        "available": bool(out),
+        "delegates_known": bool(known),
+        "principals": out,
+        "unknown_count": sum(1 for r in out if not r["known_delegate"]),
+    }
 
 
 def _ip_activity(events, attacker_ips):
@@ -573,7 +817,8 @@ def coverage_warnings(audit_summary, corpus_first=None, corpus_last=None,
 
 
 def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
-                      attacker_subjects=()):
+                      attacker_subjects=(), containment_dt=None,
+                      known_delegates=(), owner_ips=()):
     """Parse a UAL export and derive anchors + confirmed attacker events.
 
     Returns a summary dict with `derived` anchors and human-readable findings,
@@ -599,8 +844,28 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
     rule_keywords = set()
     action_times = []
 
+    # Everything after containment is, by default, the client's response:
+    # the admin creating a quarantine rule, forcing a forward to a review
+    # mailbox, resetting things. Without a closing anchor all of it was
+    # attributed to the attacker whenever it came from an address the
+    # attacker had also touched -- a shared VPN egress or a jump host is
+    # enough -- and the report then told the client their own IR was the
+    # intrusion.
+    response_events = 0
+    if containment_dt:
+        for e in events:
+            e["after_containment"] = bool(e["timestamp"]
+                                          and e["timestamp"] >= containment_dt)
+            if e["after_containment"]:
+                response_events += 1
+    else:
+        for e in events:
+            e["after_containment"] = False
+
     for e in events:
         if e["op_lower"] in _RULE_OPS:
+            if e.get("after_containment"):
+                continue
             f = _rule_findings(e)
             if not f["suspicious"]:
                 continue
@@ -638,6 +903,15 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
     for _extra in (extra_attacker_ips or ()):
         if _extra:
             attacker_ips.add(str(_extra))
+
+    # Addresses the mailbox owner demonstrably signs in from interactively,
+    # per the sign-in log. A rule event from one of these is still a rule
+    # event and is still reported -- but it does not seed attribution, or
+    # the owner's own laptop labels their whole history as the intruder's.
+    # Same principle as the sign-in module's veto, applied to the audit side.
+    _owner = {str(i) for i in (owner_ips or ()) if i}
+    owner_vetoed = sorted(attacker_ips & _owner)
+    attacker_ips -= _owner
 
     # Addresses that sent a message the investigator named as the attacker's.
     # Seeded here for the same reason as the block above: everything below
@@ -709,6 +983,27 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
         "attacker_operation_counts": Counter(
             x["operation"] for x in attacker_operations).most_common(),
         "ip_activity": _ip_activity(events, attacker_ips),
+        "access_profile": access_profile(events, attacker_ips),
+        "file_activity": file_activity(events, attacker_ips, compromise_dt),
+        "delegate_access": delegate_access(events, known_delegates,
+                                           attacker_ips),
+        "containment_date": (containment_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                             if containment_dt else ""),
+        "response_events": response_events,
+        "owner_vetoed_ips": owner_vetoed,
+        "audit_disabled_events": [
+            {"time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
+             if e["timestamp"] else "",
+             "operation": e["operation"], "user": e["user"],
+             "client_ip": e["client_ip"],
+             "by_attacker": e["client_ip"] in attacker_ips}
+            for e in events
+            if e["op_lower"] in _AUDIT_DISABLE_OPS
+            or (e["op_lower"] == "set-mailbox"
+                and "auditenabled" in json.dumps(e["audit"]).lower()
+                and "false" in json.dumps(
+                    _params_to_dict(e["audit"]).get("auditenabled", "")).lower())
+        ],
         "deletions": deletions,
         "derived": derived,
         "_compromise_dt": compromise_dt,

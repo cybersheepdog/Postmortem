@@ -6248,3 +6248,184 @@ def test_a_tenant_wide_mechanism_sorts_above_everything_else(tmp_path):
     assert out["tenant_wide_count"] == 1
     acts = remediation_plan(out)
     assert acts and acts[0]["kind"] == "federation"
+
+
+# --------------------------------------------------------------------------
+# UAL fidelity. MailItemsAccessed carries its meaning in OperationProperties:
+# Sync means a folder was pulled down whole, IsThrottled means Exchange
+# stopped logging. A count that ignores both is a floor presented as a ceiling
+# and it goes straight into a breach-notification decision.
+# --------------------------------------------------------------------------
+UAL_ATK = "45.147.230.88"
+UAL_OWNER = "203.0.113.10"
+
+
+def _uev(op, ip, when="2026-08-27T10:00:00", user="ap@acme.com", **ad):
+    data = {"Operation": op, "ClientIPAddress": ip, "UserId": user,
+            "MailboxOwnerUPN": user}
+    data.update(ad)
+    return {"CreationDate": when, "Operation": op, "UserIds": user,
+            "AuditData": json.dumps(data)}
+
+
+def _uread(ip, mid, access="Bind", throttled=False, folder="\\Inbox",
+          when="2026-08-27T10:00:00", session="s1", **kw):
+    return _uev("MailItemsAccessed", ip, when=when,
+                OperationProperties=[
+                    {"Name": "MailAccessType", "Value": access},
+                    {"Name": "IsThrottled", "Value": str(throttled)}],
+                Folders=[{"Path": folder,
+                          "FolderItems": [{"InternetMessageId": mid}]}],
+                SessionId=session, **kw)
+
+
+def _urule(ip, when="2026-08-27T09:00:00"):
+    return _uev("New-InboxRule", ip, when=when, Parameters=[
+        {"Name": "Name", "Value": "."},
+        {"Name": "SubjectContainsWords", "Value": "invoice"},
+        {"Name": "DeleteMessage", "Value": "True"}])
+
+
+def test_the_normaliser_reads_the_fields_that_scope_a_breach(tmp_path):
+    from postmortem.auditlog import _normalize
+
+    e = _normalize(_uread(UAL_ATK, "<m1@acme.com>", access="Sync",
+                         throttled=True, folder="\\Inbox",
+                         ClientInfoString="Client=REST;Client=RESTSystem",
+                         LogonType=2))
+    assert e["access_type"] == "sync"
+    assert e["throttled"] is True
+    assert e["folders"] == ["\\Inbox"]
+    assert e["session_id"] == "s1"
+    assert e["logon_type"] == 2
+    assert "RESTSystem" in e["client_info"]
+
+
+def test_a_throttled_read_makes_the_scope_a_lower_bound(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import exposure_scope
+
+    rows = [_urule(UAL_ATK)] + [
+        _uread(UAL_ATK, "<m%d@acme.com>" % i, throttled=(i > 5),
+              when="2026-08-27T10:%02d:00" % i) for i in range(10)]
+    out = analyze_audit_log(_audit_file(tmp_path, rows))
+    prof = out["access_profile"]
+    assert prof["available"] and prof["scope_is_lower_bound"] is True
+    assert prof["attacker"]["throttled"] == 4
+
+    scope = exposure_scope([], out)
+    assert scope["scope_is_lower_bound"] is True
+    assert "FLOOR" in scope["scope_note"]
+
+
+def test_sync_and_bind_are_reported_apart(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.scoring import exposure_scope
+
+    rows = [_urule(UAL_ATK),
+            _uread(UAL_ATK, "<a@acme.com>", access="Sync", folder="\\Inbox"),
+            _uread(UAL_ATK, "<b@acme.com>", access="Sync", folder="\\Inbox"),
+            _uread(UAL_ATK, "<c@acme.com>", access="Bind")]
+    out = analyze_audit_log(_audit_file(tmp_path, rows))
+    scope = exposure_scope([], out)
+    assert scope["read_by_sync"] == 2 and scope["read_by_bind"] == 1
+    assert scope["scope_is_lower_bound"] is False
+    assert scope["synced_folders"][0][0] == "\\Inbox"
+    assert "whole of each folder" in scope["scope_note"]
+
+
+def test_file_downloads_from_an_attacker_address_are_exfil(tmp_path):
+    # 803 FileDownloaded and 234 FileSyncUploadedFull on a real corpus, none
+    # attributed, because a file has no InternetMessageId to index on.
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uev("FileDownloaded", UAL_ATK, ObjectId="https://t/x/Q3-invoices.xlsx",
+                 SourceFileName="Q3-invoices.xlsx", Workload="OneDrive"),
+            _uev("FileSyncDownloadedFull", UAL_ATK, ObjectId="https://t/x/Documents",
+                 Workload="OneDrive"),
+            _uev("AnonymousLinkCreated", UAL_ATK, ObjectId="https://t/x/board.pdf",
+                 SourceFileName="board.pdf"),
+            _uev("FileDownloaded", UAL_OWNER, ObjectId="https://t/y/mine.docx",
+                 SourceFileName="mine.docx")]           # the owner: not counted
+    fa = analyze_audit_log(_audit_file(tmp_path, rows))["file_activity"]
+    assert fa["available"]
+    assert fa["attacker_file_events"] == 3
+    assert fa["exfil_count"] == 2 and fa["full_sync"] == 1
+    assert fa["shared_count"] == 1
+    assert "Q3-invoices.xlsx" in {r["file"] for r in fa["exfil"]}
+
+
+def test_a_rule_created_after_containment_is_response_not_intrusion(tmp_path):
+    # The client's admin creates a quarantine rule during IR from the jump
+    # host the attacker also used. Without a closing anchor the report told
+    # the client their own response was the intrusion.
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK, when="2026-08-27T09:00:00"),          # attacker
+            _urule("198.51.100.5", when="2026-08-29T15:00:00")]   # admin, later
+    out = analyze_audit_log(
+        _audit_file(tmp_path, rows),
+        containment_dt=_dt(2026, 8, 28, 12, 0, tzinfo=_tz.utc))
+    assert out["derived"]["attacker_ips"] == [UAL_ATK]
+    assert "198.51.100.5" not in out["derived"]["attacker_ips"]
+    assert out["response_events"] == 1
+    assert out["containment_date"].startswith("2026-08-28")
+
+    # And without the anchor the old behaviour stands: both are seeded.
+    out2 = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert "198.51.100.5" in out2["derived"]["attacker_ips"]
+
+
+def test_an_owner_address_never_seeds_attribution(tmp_path):
+    # Same principle as the sign-in veto, applied to the audit side: a rule
+    # event from the laptop the owner signs in from interactively is still a
+    # rule event and still reported, but the owner is not the intruder.
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_OWNER), _urule(UAL_ATK)]
+    out = analyze_audit_log(_audit_file(tmp_path, rows), owner_ips=[UAL_OWNER])
+    assert out["derived"]["attacker_ips"] == [UAL_ATK]
+    assert out["owner_vetoed_ips"] == [UAL_OWNER]
+    assert len(out["malicious_rules"]) == 2, "the rule is still reported"
+
+
+def test_a_delegate_logon_by_an_unknown_principal_is_flagged(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [
+        _uread(UAL_ATK, "<m1@acme.com>", user="mallory@acme.com", LogonType=2,
+              MailboxOwnerUPN="ap@acme.com"),
+        _uread(UAL_OWNER, "<m2@acme.com>", user="assistant@acme.com", LogonType=2,
+              MailboxOwnerUPN="ap@acme.com"),
+    ]
+    da = analyze_audit_log(_audit_file(tmp_path, rows),
+                           known_delegates=["assistant@acme.com"])["delegate_access"]
+    assert da["available"] and da["delegates_known"]
+    by = {p["principal"]: p for p in da["principals"]}
+    assert by["mallory@acme.com"]["known_delegate"] is False
+    assert by["assistant@acme.com"]["known_delegate"] is True
+    assert da["unknown_count"] == 1
+    # unknown sorts first
+    assert da["principals"][0]["principal"] == "mallory@acme.com"
+
+
+def test_turning_the_audit_log_off_is_reported(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uev("Set-MailboxAuditBypassAssociation", UAL_ATK,
+                 when="2026-08-27T10:30:00")]
+    out = analyze_audit_log(_audit_file(tmp_path, rows))
+    ev = out["audit_disabled_events"]
+    assert len(ev) == 1 and ev[0]["by_attacker"] is True
+
+
+def test_the_message_index_carries_access_type_and_session(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uread(UAL_ATK, "<m1@acme.com>", access="Sync", session="sess-9")]
+    idx = analyze_audit_log(_audit_file(tmp_path, rows))["message_index"]["by_message_id"]
+    hit = idx["<m1@acme.com>"][0]
+    assert hit["access_type"] == "sync" and hit["session_id"] == "sess-9"

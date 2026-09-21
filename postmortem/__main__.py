@@ -535,7 +535,7 @@ from postmortem.reporting import (  # noqa: E402
     print_signin_analysis, print_signin_lures,
     print_persistence, print_remediation, print_mes_manifest,
     print_directory, print_message_trace, print_notification_scope,
-    print_token_replay,
+    print_token_replay, print_file_activity, print_delegate_access,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -908,6 +908,17 @@ def main():
             "phish before the compromise); 'impersonation' = external fraud/vendor "
             "compromise (hunt the fraudulent request). 'auto' infers it (default)."
         ),
+    )
+    anchor_group.add_argument(
+        "--containment-date",
+        metavar="CONTAINMENT_DATE",
+        help="When the account was contained: password reset, sessions "
+             "revoked, access cut. ISO 8601 or an email Date. Audit events "
+             "after this are treated as the client's RESPONSE rather than the "
+             "attacker's -- without it, a quarantine rule or a forced forward "
+             "the administrator created during IR is attributed to the "
+             "intruder whenever it shares an address the attacker also "
+             "touched.",
     )
     anchor_group.add_argument(
         "--compromise-date",
@@ -1952,6 +1963,17 @@ def main():
             print(f"[!] No sign-in records found under {_signin_path}",
                   file=sys.stderr)
 
+    _containment_dt = parse_anchor_datetime(
+        getattr(args, "containment_date", "") or "")
+    # Who legitimately holds delegation, from the permissions export when
+    # --mes-dir found one. A delegate read by anyone else is flagged.
+    _known_delegates = []
+    if mes_bundle and (mes_bundle.get('sources') or {}).get('mailbox_permissions'):
+        _known_delegates = sorted({
+            str(r.get('trustee') or '').lower()
+            for r in mes_bundle['sources']['mailbox_permissions']
+            if r.get('trustee')})
+
     audit_summary = None
     # The dispatcher recognises the unified audit log and reports it in the
     # manifest, but nothing consumed it: --mes-dir picked up the sign-in log
@@ -1972,6 +1994,9 @@ def main():
                 extra_attacker_ips=(signin_summary or {}).get('attacker_ips', ()),
                 anchor_dt=(signin_summary or {}).get('_earliest_token_dt'),
                 attacker_subjects=anchors.attacker_subjects,
+                containment_dt=_containment_dt,
+                known_delegates=_known_delegates,
+                owner_ips=(signin_summary or {}).get('owner_ips', ()),
             )
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"[!] Could not parse audit log {_audit_path}: {exc}",
@@ -2004,6 +2029,9 @@ def main():
                                 signin_summary.get('attacker_ips', ())) + _replay,
                             anchor_dt=signin_summary.get('_earliest_token_dt'),
                             attacker_subjects=anchors.attacker_subjects,
+                            containment_dt=_containment_dt,
+                            known_delegates=_known_delegates,
+                            owner_ips=signin_summary.get('owner_ips', ()),
                         )
                         audit_summary['attacker_ips_from_replay'] = sorted(_replay)
                     except Exception as exc:  # noqa: BLE001 - keep the first
@@ -2025,6 +2053,8 @@ def main():
             for _k in ("_first_dt", "_last_dt"):
                 (audit_summary.get("coverage") or {}).pop(_k, None)
             print_audit_summary(audit_summary, audit_warnings)
+            print_file_activity(audit_summary.get('file_activity'))
+            print_delegate_access(audit_summary.get('delegate_access'))
 
     # Second pass, now that both sides have named addresses: a device code
     # group with one recorded leg is unresolved, and the audit log's own

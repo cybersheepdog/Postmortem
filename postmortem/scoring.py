@@ -1975,6 +1975,14 @@ def exposure_scope(records, audit_summary, audit_coverage=None):
             "message_id": mid,
             "first_access": accesses[0]["time"],
             "accesses": len(accesses),
+            # Sync and Bind are different claims about the same message: one
+            # says it was opened, the other says the folder it sits in was
+            # pulled down whole. Recorded per message so the inventory can
+            # say which.
+            "access_type": next((h.get("access_type") for h in accesses
+                                 if h.get("access_type")), ""),
+            "throttled": any(h.get("throttled") for h in accesses),
+            "session_id": accesses[0].get("session_id", ""),
             "client_ip": accesses[0]["client_ip"],
             "subject": (accesses[0]["subject"]
                         or (getattr(record, "subject", "") if record else "")),
@@ -1985,12 +1993,26 @@ def exposure_scope(records, audit_summary, audit_coverage=None):
         })
     read.sort(key=lambda e: e["first_access"])
 
+    profile = summary.get("access_profile") or {}
+    atk = profile.get("attacker") or {}
+    lower_bound = bool(profile.get("scope_is_lower_bound"))
+
     return {
         "available": True,
         "has_operation": has_operation,
         "messages_read": len(read),
         "read_and_in_corpus": sum(1 for e in read if e["in_corpus"]),
         "read_with_attachments": sum(1 for e in read if e["has_attachment"]),
+        "read_by_sync": sum(1 for e in read if e["access_type"] == "sync"),
+        "read_by_bind": sum(1 for e in read if e["access_type"] == "bind"),
+        # The number above is a floor whenever the log was throttled. Stated
+        # here, next to the number, because a scope that goes into a breach
+        # notification decision must carry its own caveat.
+        "scope_is_lower_bound": lower_bound,
+        "throttled_events": atk.get("throttled", 0),
+        "throttled_first": atk.get("throttled_first", ""),
+        "synced_folders": atk.get("synced_folders", []),
+        "scope_note": profile.get("note", ""),
         "read": read,
     }
 

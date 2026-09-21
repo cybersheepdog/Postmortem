@@ -397,6 +397,27 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
                                 if x.get("is_attacker")),
             "attacker_operations": (
                 audit_summary.get("attacker_operation_counts") or [])[:20],
+            # Scope fidelity. Counts only -- whether the log throttled, and
+            # how the mailbox was read, decide whether the exposure number
+            # in the report is a ceiling or a floor.
+            "access_profile": {
+                k: v for k, v in ((audit_summary.get("access_profile") or {})
+                                  .get("attacker") or {}).items()
+                if isinstance(v, (int, bool))},
+            "scope_is_lower_bound": bool((audit_summary.get("access_profile")
+                                          or {}).get("scope_is_lower_bound")),
+            "file_activity": {
+                k: v for k, v in (audit_summary.get("file_activity") or {}).items()
+                if isinstance(v, (int, bool))},
+            "delegate_principals": len((audit_summary.get("delegate_access")
+                                        or {}).get("principals") or []),
+            "delegate_unknown": (audit_summary.get("delegate_access")
+                                 or {}).get("unknown_count", 0),
+            "containment_supplied": bool(audit_summary.get("containment_date")),
+            "response_events": audit_summary.get("response_events", 0),
+            "owner_vetoed": len(audit_summary.get("owner_vetoed_ips") or []),
+            "audit_disabled_events": len(
+                audit_summary.get("audit_disabled_events") or []),
         }
         for key, section in (("join", "audit_join"),
                              ("completeness", "deletion_completeness"),

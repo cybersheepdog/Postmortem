@@ -362,12 +362,29 @@ def print_exposure_scope(verdict: dict, limit: int = 12):
         print("  accessed from a known attacker address.")
         return
 
-    print(f"  Messages read from an attacker address:  {x['messages_read']}")
+    lb = x.get("scope_is_lower_bound")
+    head = f"  Messages read from an attacker address:  {x['messages_read']}"
+    print(term.c(head + "   (LOWER BOUND - log was throttled)", "red", "bold")
+          if lb else head)
     print(f"    present in this export:                {x['read_and_in_corpus']}")
     print(f"    carrying an attachment:                {x['read_with_attachments']}")
+    if x.get("read_by_sync") or x.get("read_by_bind"):
+        print(f"    via folder Sync (whole folder exposed): {x.get('read_by_sync', 0)}")
+        print(f"    via Bind (opened individually):         {x.get('read_by_bind', 0)}")
+    for folder, n in (x.get("synced_folders") or [])[:6]:
+        print(f"      synced: {folder}  (x{n})")
     print()
+    if lb:
+        print(term.c("  " + _wrap_indent(x.get("scope_note", ""), 2), "red"))
+        print()
+    elif x.get("scope_note"):
+        print("  " + _wrap_indent(x["scope_note"], 2))
+        print()
     print("  This is the set a breach-notification decision rests on: mail the")
     print("  intruder is recorded as having opened, not mail they could have.")
+    if lb:
+        print(term.c("  Where the log was throttled, that distinction collapses: the", "red"))
+        print(term.c("  honest scope is everything the session could reach.", "red"))
     print()
     for e in x["read"][:limit]:
         print(f"    {e['first_access'] or '(no time)':20} "
@@ -569,6 +586,22 @@ def print_audit_summary(audit: dict, warnings=None):
               f"{idx['messages_referenced']} distinct message(s)")
     if d.get("compromise_date"):
         print(f"  Compromise (earliest):  {d['compromise_date']}")
+    if audit.get("containment_date"):
+        print(f"  Containment:            {audit['containment_date'][:19]}"
+              f"   ({audit.get('response_events', 0)} event(s) after it "
+              "treated as response, not intrusion)")
+    if audit.get("owner_vetoed_ips"):
+        print(term.c("  " + _wrap_indent(
+            "%d address(es) appeared on a rule event but are ones the mailbox "
+            "owner signs in from interactively, so they were NOT seeded as "
+            "the attacker's: %s" % (len(audit["owner_vetoed_ips"]),
+                                     ", ".join(audit["owner_vetoed_ips"])), 2),
+            "yellow"))
+    for e in (audit.get("audit_disabled_events") or [])[:4]:
+        print(term.c(f"  [!] AUDITING TURNED OFF: {e['operation']} at "
+                     f"{e['time'][:19]} by {e['user']} from {e['client_ip']}"
+                     + ("   (attacker address)" if e.get("by_attacker") else ""),
+                     "red", "bold"))
     if d.get("attacker_ips"):
         print(f"  Attacker IP(s):         {', '.join(d['attacker_ips'])}")
     # Which addresses came from where. Two independent derivations of the same
@@ -1201,6 +1234,63 @@ def print_notification_scope(scope: dict):
     print()
     print("  " + _wrap_indent(s.get("note", ""), 2))
 
+
+
+def print_file_activity(fa: dict, limit: int = 10):
+    """What the attacker took from SharePoint and OneDrive."""
+    f = fa or {}
+    if not f.get("available") or not f.get("attacker_file_events"):
+        return
+    print()
+    _hdr("FILE ACTIVITY (SharePoint / OneDrive) FROM ATTACKER ADDRESSES")
+    print(f"  File events from attacker addresses: {f['attacker_file_events']} "
+          f"of {f['total_file_events']} in the log")
+    ops = ", ".join(f"{o} x{n}" for o, n in (f.get("operations") or [])[:5])
+    if ops:
+        print(f"  Operations:                          {ops}")
+    if f.get("exfil_count"):
+        print(term.c(f"  DOWNLOADED / SYNCED OUT:             {f['exfil_count']} "
+                     f"event(s), {f['exfil_distinct_files']} distinct file(s)"
+                     + (f", {f['full_sync']} full-drive sync(s)"
+                        if f.get("full_sync") else ""), "red", "bold"))
+        for r in (f.get("exfil") or [])[:limit]:
+            print(f"    {r['time'][:19]:<20} {r['operation'][:22]:<22} "
+                  f"{(r['file'] or r['path'])[:36]}")
+        if f["exfil_count"] > limit:
+            print(f"    ... {f['exfil_count'] - limit} more in the JSON report")
+    if f.get("shared_count"):
+        print(term.c(f"  SHARED OUTWARD:                      {f['shared_count']} "
+                     "sharing/link event(s)", "yellow"))
+        for r in (f.get("shared") or [])[:6]:
+            print(f"    {r['time'][:19]:<20} {r['operation'][:22]:<22} "
+                  f"{(r['file'] or r['path'])[:36]}")
+
+
+def print_delegate_access(da: dict):
+    """Delegate logons by principals that hold no delegation."""
+    d = da or {}
+    if not d.get("available"):
+        return
+    unknown = [p for p in d["principals"] if not p["known_delegate"]]
+    if not unknown and not any(p["from_attacker_ip"] for p in d["principals"]):
+        return
+    print()
+    _hdr("DELEGATE ACCESS")
+    if not d.get("delegates_known"):
+        print("  " + _wrap_indent(
+            "No mailbox-permissions export was supplied, so every delegate "
+            "logon below is unverified rather than unauthorised. Supply "
+            "Get-MailboxPermissions to separate staff from an attacker using "
+            "a permission they granted themselves.", 2))
+        print()
+    for p in d["principals"][:8]:
+        tag = ("KNOWN delegate" if p["known_delegate"] else "NOT a known delegate")
+        line = (f"  {p['principal'][:34]:<34} {tag:<22} {p['events']:>5} op(s) "
+                f"on {', '.join(p['mailboxes'])[:30]}")
+        if p["from_attacker_ip"]:
+            line += "   FROM ATTACKER ADDRESS"
+        print(term.c(line, "red", "bold")
+              if (not p["known_delegate"] or p["from_attacker_ip"]) else line)
 
 def print_summary(
     records: list[EmailRecord],
@@ -2325,6 +2415,7 @@ th.sortable{cursor:pointer;user-select:none}th.sortable::after{content:" \2195";
 <h2>Initial Compromise (scenario-anchored)</h2><div id="initial" class="verdict"></div>
 <h2>Entry Point: Device Code Flow</h2><div id="entrypoint" class="verdict"></div>
 <h2>Remediation Required</h2><div id="remediation" class="verdict"></div>
+<h2>Exposure Scope (what the attacker read and took)</h2><div id="exposure" class="verdict"></div>
 <h2>Third-Party Notification Scope</h2><div id="notify" class="verdict"></div>
 <h2>Unexplained Configuration</h2><div id="drift" class="verdict"></div>
 <h2>Attack Narrative (reconstructed)</h2><div id="narrative" class="verdict"></div>
@@ -2346,7 +2437,7 @@ const DATA=__DATA__;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const js=s=>JSON.stringify(String(s??''));
 function rec(path){return DATA.records.find(r=>r.path===path)||{path};}
-function render(){dashboard();execSummary();initialPanel();entryPointPanel();remediationPanel();notifyPanel();driftPanel();narrativePanel();verdict();timeline();graph();networkGraph();topDomains();campaigns();candidates();toggleEdges();}
+function render(){dashboard();execSummary();initialPanel();entryPointPanel();exposurePanel();remediationPanel();notifyPanel();driftPanel();narrativePanel();verdict();timeline();graph();networkGraph();topDomains();campaigns();candidates();toggleEdges();}
 function topDomains(){const el=document.getElementById('topDomains');if(!el)return;const rows=DATA.top_domains||[];if(!rows.length){el.innerHTML='<div class="empty">No flagged domains.</div>';return;}el.innerHTML=`<table><thead><tr><th class="sortable">Domain</th><th class="sortable">Messages</th><th class="sortable">Highest tier</th><th class="sortable">Total score</th><th>Senders</th></tr></thead><tbody>${rows.map(r=>`<tr><td data-pivot="${esc(r.domain)}" style="cursor:pointer"><b>${esc(r.domain)}</b></td><td data-sort-value="${r.messages}">${r.messages}</td><td data-sort-value="${r.highest_tier}"><span class="badge${r.highest_tier===1?' precursor':''}">T${r.highest_tier}</span></td><td data-sort-value="${r.total_score}">${r.total_score}</td><td class="small">${(r.senders||[]).map(esc).join(', ')}${r.sender_count>(r.senders||[]).length?` (+${r.sender_count-(r.senders||[]).length})`:''}</td></tr>`).join('')}</tbody></table>`;el.querySelectorAll('td[data-pivot]').forEach(c=>c.addEventListener('click',()=>pivot(c.getAttribute('data-pivot'))));makeSortable(el.querySelector('table'));}
 const NET_COLORS={sender:'#175cd3',domain:'#b54708',hash:'#6941c6',campaign:'#027a48',asn:'#b42318',country:'#475467'};
 function networkGraph(){const el=document.getElementById('network');if(!el)return;const g=DATA.network||{nodes:[],links:[]};const nodes=(g.nodes||[]).map(n=>Object.assign({},n));const rawlinks=g.links||[];if(!nodes.length){el.innerHTML='<div class="empty">No entity relationships to graph.</div>';document.getElementById('netLegend').innerHTML='';return;}const W=1100,H=520,idx={};nodes.forEach((n,i)=>{idx[n.id]=i;const a=2*Math.PI*i/nodes.length;n.x=W/2+Math.cos(a)*Math.min(W,H)*0.35;n.y=H/2+Math.sin(a)*Math.min(W,H)*0.35;});const L=rawlinks.map(e=>({s:idx[e.source],t:idx[e.target]})).filter(e=>e.s!=null&&e.t!=null);const k=Math.sqrt((W*H)/nodes.length)*0.5;let temp=W/8;for(let it=0;it<200;it++){for(const n of nodes){n.dx=0;n.dy=0;}for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){let dx=nodes[i].x-nodes[j].x,dy=nodes[i].y-nodes[j].y,d=Math.hypot(dx,dy)||0.01;const f=k*k/d,ux=dx/d,uy=dy/d;nodes[i].dx+=ux*f;nodes[i].dy+=uy*f;nodes[j].dx-=ux*f;nodes[j].dy-=uy*f;}for(const e of L){let dx=nodes[e.s].x-nodes[e.t].x,dy=nodes[e.s].y-nodes[e.t].y,d=Math.hypot(dx,dy)||0.01;const f=d*d/k,ux=dx/d,uy=dy/d;nodes[e.s].dx-=ux*f;nodes[e.s].dy-=uy*f;nodes[e.t].dx+=ux*f;nodes[e.t].dy+=uy*f;}for(const n of nodes){let d=Math.hypot(n.dx,n.dy)||0.01;n.x+=(n.dx/d)*Math.min(d,temp);n.y+=(n.dy/d)*Math.min(d,temp);n.x-=(n.x-W/2)*0.012;n.y-=(n.y-H/2)*0.012;n.x=Math.max(18,Math.min(W-18,n.x));n.y=Math.max(18,Math.min(H-18,n.y));}temp*=0.97;}const maxw=Math.max(1,...nodes.map(n=>n.weight||1));const out=[`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">`];for(const e of L){out.push(`<line x1="${nodes[e.s].x.toFixed(1)}" y1="${nodes[e.s].y.toFixed(1)}" x2="${nodes[e.t].x.toFixed(1)}" y2="${nodes[e.t].y.toFixed(1)}"/>`);}for(const n of nodes){const r=4+6*Math.sqrt((n.weight||1)/maxw),c=NET_COLORS[n.type]||'#98a2b3';out.push(`<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${c}" data-pivot="${esc(n.label)}"><title>${esc(n.type)}: ${esc(n.label)} (${n.weight})</title></circle>`);if((n.weight||1)>=2||nodes.length<=40)out.push(`<text class="nlabel" x="${(n.x+r+2).toFixed(1)}" y="${(n.y+3).toFixed(1)}">${esc(String(n.label).slice(0,28))}</text>`);}out.push('</svg>');el.innerHTML=out.join('');el.querySelectorAll('circle[data-pivot]').forEach(c=>c.addEventListener('click',()=>pivot(c.getAttribute('data-pivot'))));const types=[...new Set(nodes.map(n=>n.type))];document.getElementById('netLegend').innerHTML=types.map(t=>`<span class="badge" style="background:${NET_COLORS[t]||'#98a2b3'};color:#fff">${esc(t)}</span>`).join('');}
@@ -2355,6 +2446,7 @@ function makeSortable(table){if(!table||!table.tHead)return;const ths=table.tHea
 function narrativePanel(){const n=(DATA.initial||{}).attack_narrative||{};const el=document.getElementById('narrative');if(!el)return;if(!(n.phases||[]).length){el.innerHTML='<span class="muted">No narrative reconstructed.</span>';return;}let body=`<p>${esc(n.summary||'')}</p>`;body+=(n.phases||[]).map((p,i)=>`<div class="event"><div class="card"><div class="top"><span class="badge">Phase ${i+1}</span><b>${esc(p.title||'')}</b>${p.timestamp?`<span class="badge">${esc(p.timestamp)}</span>`:''}<span class="badge">confidence ${esc(p.confidence||'low')}</span></div><p class="small">${esc(p.description||'')}</p>${(p.messages||[]).map(m=>`<div class="small"><button class="small" onclick="focusPath(${js(m.path)})">${esc(m.timestamp||'')} · ${esc(m.sender||'')} · ${esc(m.subject||'(no subject)')}</button></div>`).join('')}</div></div>`).join('');if((n.timeline||[]).length){body+=`<b>Chronological key events (UTC)</b><div class="graph">${(n.timeline||[]).map(e=>`<div class="edge contextual"><span>${esc(e.timestamp_utc||'')}</span><span class="edge-label">${esc(e.phase||'')}</span><span>${esc(e.subject||'')}</span></div>`).join('')}</div>`;}body+=`<p class="small muted">Note: ${esc(n.disclaimer||'')}</p>`;el.innerHTML=body;}
 function entryPointPanel(){const el=document.getElementById('entrypoint');if(!el)return;const v=DATA.initial||{};const s=v.signin_log||{};const L=v.signin_lures||{};if(!s.available){el.innerHTML='<div class="empty">No Entra sign-in log was supplied. Device code flow phishing leaves no trace in the mail itself, so this cannot be assessed from the corpus.</div>';return;}const cov=s.coverage||{};if(cov.blind){el.innerHTML='<div class="verdict-title">CANNOT BE ASSESSED</div>'+'<p class="small">This export carries neither originalTransferMethod nor '+'authenticationProtocol, so it cannot answer the device code question. A '+'clean result here is not a negative.</p>';return;}let b='';const fg=s.forged_events||[];if(fg.length){b+='<div class="remed hit"><b>'+(s.forged_count||fg.length)+' sign-in record(s) carry the markers of a FORGED event.</b> Events can be injected into this log through the Azure AD Connect Health pipeline \u2014 from a compromised AD FS server, or a fake health agent registered by a global administrator, which works on a cloud-only tenant. The injected timestamp, account and IP are all attacker-chosen, so every conclusion below is provisional until AD FS Event ID 1200 is compared against it \u2014 on address, not on time.'+((s.forged_veto_ips||[]).length?'<br><span class="small">'+s.forged_veto_ips.length+' address(es) were kept out of the victim-address veto as a result, so a fabricated event cannot exempt the attacker\u2019s own address from attribution.</span>':'')+'</div>';}b+='<div class="stats">'+stat(s.device_code_records||0,'device code sign-ins')+stat(s.attack_groups||0,'location splits',(s.attack_groups||0)>0)+stat(s.device_code_successes||0,'succeeded')+stat(s.indicated_count||0,'match phishing profile',(s.indicated_count||0)>0)+stat(s.tokens_issued||0,'attributed to attacker',(s.tokens_issued||0)>0)+stat((s.attacker_ips||[]).length,'attacker addresses',(s.attacker_ips||[]).length>0)+'</div>';if(s.earliest_token)b+=`<p class="small"><b>First token issued:</b> <code class="inline">${esc(s.earliest_token)}</code> \u2014 the true compromise T0, earlier than the first recorded action.</p>`;(L.confirmed||[]).forEach(e=>{b+=`<div class="remed hit">`+`<b>Lure:</b> ${esc(e.subject||'(no subject)')}<br>`+`<span class="small muted">from ${esc(e.sender||'')} \u00b7 arrived `+`${esc(e.arrival||'')}</span><br>`+`<span class="small">Token issued ${esc(e.token_time||'')} `+`(${Number(e.delta_seconds||0)}s later) from ${esc(e.attacker_ip||'')}`+(e.code?` \u00b7 code <code class="inline">${esc(e.code)}</code>`:'')+`</span>`+`</div>`;});if(!(L.confirmed||[]).length&&(L.tokens_without_lure||[]).length)b+='<p class="small" style="color:#d13438">A token was issued but no message '+'in the corpus carries a device login URL in the window before it. The lure '+'was most likely delivered outside email \u2014 Teams chat is the common '+'channel \u2014 and that data should be requested.</p>';(s.groups||[]).filter(g=>g.verdict==='attack').forEach(g=>{b+=`<div class="remed hit"><b>${esc(g.user||'')}</b> `+`<span class="small muted">differs by ${esc((g.differs||[]).join(', '))}</span>`+'<table class="tbl"><tr><th>time</th><th>address</th><th>location</th><th>leg</th></tr>'+(g.legs||[]).map(l=>`<tr class="${l.interactive?'':'hit'}"><td>${esc(l.time||'')}</td><td><code>${esc(l.ip||'')}</code></td><td>${esc(l.location||'')}</td><td>${l.interactive?'victim (interactive)':'polling client'}</td></tr>`).join('')+'</table></div>';});const all=s.single_leg_findings||[];const lone=all.filter(r=>r.indicated);const rep=s.token_replay||{};if(rep.assessed&&(rep.replay||[]).length){b+='<p class="small"><b>'+rep.replay.length+' address(es) acted on the mailbox without ever authenticating.</b> A token obtained by refreshing an earlier one is invisible to the sign-in log: the access happens and Entra records nothing. The gap is the evidence.</p>'+'<div class="scroller"><table class="tbl"><tr><th>address</th><th>events</th><th>first seen</th><th>operations</th></tr>'+rep.replay.map(r=>`<tr class="hit"><td><code>${esc(r.ip||'')}</code></td><td>${Number(r.events||0)}</td><td>${esc((r.first||'').slice(0,19))}</td><td>${esc((r.operations||[]).slice(0,3).map(o=>o[0]).join(', '))}</td></tr>`).join('')+'</table></div>';}if(lone.length){b+='<p class="small"><b>'+lone.length+' device code sign-in(s) match the single-record profile for device code phishing.</b> Entra records a sign-in where the authentication was initiated, so a phished flow can be one record carrying the attacker\u2019s address with no second leg to compare. These are assessed on their own fields \u2014 an indication, not a confirmation.</p>'+'<div class="scroller"><table class="tbl"><tr><th>time</th><th>account</th><th>address</th><th>location</th><th>score</th><th>why</th></tr>'+lone.map(r=>`<tr class="hit"><td>${esc(r.time||'')}</td><td>${esc(r.user||'')}</td><td><code>${esc(r.ip||'')}</code></td><td>${esc(r.location||'')}</td><td>${Number(r.score||0)}</td><td>${esc((r.reasons||[]).join('; '))}</td></tr>`).join('')+'</table></div>';}(s.warnings||[]).forEach(w=>{b+=`<p class="small" style="color:#b26a00">${esc(w)}</p>`;});el.innerHTML=b;}
 function stat(n,label,hit){return `<div class="stat ${hit?'hit':''}"><b>${esc(String(n))}</b><span>${esc(label)}</span></div>`;}
+function exposurePanel(){const el=document.getElementById('exposure');if(!el)return;const v=DATA.initial||{};const x=v.exposure_scope||{};const a=v.audit_log||{};const fa=a.file_activity||{};const da=a.delegate_access||{};if(!x.available&&!fa.available){el.innerHTML='<div class="empty">'+esc(x.reason||'No audit log was supplied, so what the attacker read cannot be established.')+'</div>';return;}let b='';if(x.scope_is_lower_bound){b+='<div class="remed hit"><b>The read count below is a LOWER BOUND.</b> '+esc(x.scope_note||'')+'</div>';}b+='<div class="stats">'+stat(x.messages_read||0,'messages read'+(x.scope_is_lower_bound?' (floor)':''),(x.messages_read||0)>0)+stat(x.read_by_sync||0,'via folder Sync',(x.read_by_sync||0)>0)+stat(x.read_by_bind||0,'opened individually')+stat(x.read_with_attachments||0,'with attachment')+stat(x.throttled_events||0,'throttled events',(x.throttled_events||0)>0)+stat(fa.exfil_count||0,'files downloaded',(fa.exfil_count||0)>0)+stat(fa.shared_count||0,'shared outward',(fa.shared_count||0)>0)+'</div>';if((x.synced_folders||[]).length){b+='<p class="small"><b>Folders pulled down whole:</b> '+esc(x.synced_folders.map(f=>f[0]+' (x'+f[1]+')').join(', '))+' &mdash; every item in each is exposed, not only the ones enumerated.</p>';}else if(x.scope_note&&!x.scope_is_lower_bound){b+='<p class="small">'+esc(x.scope_note)+'</p>';}if((x.read||[]).length){b+='<div class="scroller"><table class="tbl"><tr><th>first access</th><th>how</th><th>subject</th><th>from</th></tr>'+x.read.slice(0,200).map(r=>`<tr class="hit"><td>${esc((r.first_access||'').slice(0,19))}</td><td>${esc(r.access_type||'')}${r.throttled?' <b>throttled</b>':''}</td><td>${esc(r.subject||'(subject not recorded)')}${r.has_attachment?' \ud83d\udcce':''}</td><td>${esc(r.sender||'')}</td></tr>`).join('')+'</table></div>';if(x.read.length>200)b+='<p class="small muted">'+(x.read.length-200)+' more in the JSON report.</p>';}if(fa.available&&(fa.exfil_count||fa.shared_count)){b+='<p class="small" style="margin-top:14px"><b>SharePoint / OneDrive from attacker addresses:</b> '+Number(fa.attacker_file_events||0)+' event(s)'+(fa.full_sync?', <b>'+fa.full_sync+' full-drive sync(s)</b>':'')+'.</p>'+'<div class="scroller"><table class="tbl"><tr><th>time</th><th>operation</th><th>file</th></tr>'+(fa.exfil||[]).concat(fa.shared||[]).map(r=>`<tr class="hit"><td>${esc((r.time||'').slice(0,19))}</td><td>${esc(r.operation||'')}</td><td>${esc(r.file||r.path||'')}</td></tr>`).join('')+'</table></div>';}const unk=(da.principals||[]).filter(p=>!p.known_delegate||p.from_attacker_ip);if(unk.length){b+='<p class="small" style="margin-top:14px"><b>Delegate access by principals holding no known delegation:</b>'+(da.delegates_known?'':' <span class="muted">(no permissions export supplied \u2014 unverified, not unauthorised)</span>')+'</p>'+'<table class="tbl"><tr><th>principal</th><th>on</th><th>events</th><th>from attacker IP</th></tr>'+unk.map(p=>`<tr class="hit"><td>${esc(p.principal)}</td><td>${esc((p.mailboxes||[]).join(', '))}</td><td>${Number(p.events||0)}</td><td>${p.from_attacker_ip?'yes':''}</td></tr>`).join('')+'</table>';}el.innerHTML=b;}
 function notifyPanel(){const el=document.getElementById('notify');if(!el)return;const v=DATA.initial||{};const t=v.message_trace||{};const n=v.notification_scope||{};if(!t.available){el.innerHTML='<div class="empty">No message trace was supplied. What the account sent that is not in this export cannot be established from a PST alone.</div>';return;}let b='<div class="stats">'+stat(n.external_domains||0,'external organisations',(n.external_domains||0)>0)+stat(n.external_recipients||0,'external recipients',(n.external_recipients||0)>0)+stat(t.delivered||0,'delivered in window')+stat(t.absent_count||0,'recorded but missing',(t.absent_count||0)>0)+'</div>';if(n.note)b+=`<p class="small">${esc(n.note)}</p>`;const doms=(t.recipients||[]).filter(r=>r.external);if(doms.length){b+='<div class="scroller"><table class="tbl"><tr><th>recipient domain</th><th>addresses</th><th>messages</th><th>most common subject</th></tr>'+doms.map(r=>`<tr class="hit"><td>${esc(r.domain)}</td><td>${Number(r.recipient_count||0)}</td><td>${Number(r.messages||0)}</td><td>${esc((r.top_subjects&&r.top_subjects[0]?r.top_subjects[0][0]:''))}</td></tr>`).join('')+'</table></div>';}const gone=t.absent_from_corpus||[];if(gone.length){b+=`<p class="small"><b>${gone.length} message(s) the service recorded are not in this export</b> (${Number(t.absent_delivered_count||0)} of them delivered). These existed and are gone.</p>`+'<div class="scroller"><table class="tbl"><tr><th>sent</th><th>recipient</th><th>subject</th><th>status</th></tr>'+gone.map(e=>`<tr><td>${esc((e.time||'').slice(0,19))}</td><td>${esc(e.recipient||'')}</td><td>${esc(e.subject||'(no subject)')}</td><td>${esc(e.status||'')}</td></tr>`).join('')+'</table></div>';}(t.warnings||[]).forEach(w=>{b+=`<p class="small" style="color:#b26a00">${esc(w)}</p>`;});el.innerHTML=b;}
 function driftPanel(){const el=document.getElementById('drift');if(!el)return;const d=((DATA.initial||{}).directory||{});const k=d.drift||{};if(!k.available){el.innerHTML='<div class="empty">No mailbox configuration export was supplied. Rules, forwarding and delegation that predate the audit window cannot be seen from the log alone.</div>';return;}const rules=k.unexplained_rules||[];const tr=k.unexplained_transport_rules||[];const del=(k.delegations||[]).filter(x=>x.external);let b='<div class="stats">'+stat(k.rules_seen||0,'inbox rules')+stat(rules.length,'unexplained rules',rules.length>0)+stat(tr.length,'transport rules',tr.length>0)+stat(del.length,'external delegations',del.length>0)+'</div>';if(!rules.length&&!tr.length&&!del.length){b+='<p class="small">Nothing in the current configuration is unaccounted for.</p>';el.innerHTML=b;return;}b+='<table class="tbl"><tr><th>kind</th><th>what</th><th>detail</th></tr>'+rules.map(r=>`<tr class="hit"><td>rule</td><td>${esc(r.name||'')}`+(r.mailbox?` <span class="small muted">on ${esc(r.mailbox)}</span>`:'')+`</td>`+`<td>${esc((r.external_forwards||[]).length?'forwards to '+(r.external_forwards||[]).join(', '):(r.delete?'deletes matching mail':('moves to '+(r.move_to||''))))}</td></tr>`).join('')+tr.map(x=>`<tr class="hit"><td>transport</td><td>${esc(x.name||'')}</td><td>redirects to ${esc((x.redirects_to||[]).join(', '))}</td></tr>`).join('')+del.map(x=>`<tr class="hit"><td>delegation</td><td>${esc(x.trustee||'')}</td><td>${esc(x.rights||'')} on ${esc(x.mailbox||'')}</td></tr>`).join('')+'</table>';if(k.note)b+=`<p class="small muted">${esc(k.note)}</p>`;el.innerHTML=b;}
 function remediationPanel(){const el=document.getElementById('remediation');if(!el)return;const v=DATA.initial||{};const acts=v.remediation||[];const p=v.persistence||{};if(!acts.length){const w=(p.warnings||[]);el.innerHTML=w.length?`<div class="verdict-title">NOT ASSESSED</div>`+w.map(x=>`<p class="small">${esc(x)}</p>`).join(''):'<div class="empty">No persistence mechanism was identified. '+'Supply --mes-dir to assess whether the attacker retains access: an '+'OAuth consent grant leaves no trace in mail or sign-in data.</div>';return;}const both=acts.filter(a=>a.survives_password_reset==='survives'&&a.survives_token_revocation==='survives').length;const tw=(p.tenant_wide||[]);let body=tw.length?('<div class="remed hit"><b>'+tw.length+' TENANT-WIDE mechanism(s): '+esc(tw.map(x=>String(x.kind).replace(/_/g," ")).join(', '))+'.</b> These are not scoped to an account. A password reset, a token revocation, MFA re-registration and deleting the compromised user all leave them working.</div>'):'';body+=`<div class="verdict-title">${acts.length} ACTION(S) REQUIRED`+(both?` \u00b7 ${both} NOT fixed by a password reset or token revocation`:'')+`</div>`;body+='<p class="small muted">Ordered by what survives the response most '+'clients have already made.</p>';body+=acts.map(a=>`<div class="remed ${a.by_attacker?'hit':''}">`+`<b>${a.priority}. ${esc(String(a.kind).replace(/_/g,' '))}:</b> ${esc(a.target||'')}`+(a.when?`<br><span class="small muted">${esc(a.when)}`+(a.attribution?` \u2014 ${esc(a.attribution)}`:'')+`</span>`:'')+(a.detail?`<br><span class="small">${esc(a.detail)}</span>`:'')+(a.grants?`<br><span class="small">${esc(a.grants)}</span>`:'')+`<br><code class="small">${esc(a.action||'')}</code>`+(a.not_fixed_by?`<span class="warn small">${esc(a.not_fixed_by)}</span>`:'')+`</div>`).join('');el.innerHTML=body;}
