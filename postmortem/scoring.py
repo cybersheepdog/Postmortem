@@ -2698,6 +2698,110 @@ def _att_key(name):
     return n
 
 
+# --------------------------------------------------------------------------
+# Lookalike infrastructure
+#
+# Two of the strongest signals in the corpus fire separately and never meet.
+# "Registered N days before this message" carried 1449x lift and
+# "resembles a known domain" is weighted 9 -- but a look-alike of the
+# victim's or a vendor's domain, registered inside the compromise window, is
+# not two findings. It is the attacker's infrastructure, purpose-built for
+# this case, and it belongs at the top of the report as one thing.
+# --------------------------------------------------------------------------
+
+def lookalike_infrastructure(records, anchors=None, window_days=90):
+    """Sender domains that resemble a known domain AND were registered recently.
+
+    Both facts are already on the record: lookalike_of from the corpus
+    comparison, sender_domain_age_days from RDAP. This joins them, per
+    domain, and ranks by how close to the compromise the registration fell
+    and what the domain resembles -- the victim's own domain outranks a
+    vendor's, which outranks any other known domain.
+    """
+    from postmortem.utils import registered_domain_approx
+
+    victim = {d.lower() for d in (getattr(anchors, "victim_domains", None) or [])}
+    compromise = getattr(anchors, "compromise_date", None) if anchors else None
+    compromise = _as_utc(compromise) if compromise else None
+
+    by_domain = {}
+    for r in records:
+        target = (getattr(r, "lookalike_of", "") or "").lower()
+        age = getattr(r, "sender_domain_age_days", -1)
+        if not target or age is None or age < 0:
+            continue
+        dom = registered_domain_approx(getattr(r, "sender_domain", "") or "")
+        if not dom:
+            continue
+        dt = _as_utc(message_arrival_dt(r))
+        g = by_domain.setdefault(dom, {
+            "domain": dom, "resembles": target, "age_days": age,
+            "messages": 0, "first_seen": None, "paths": [],
+            "resembles_victim": target in victim,
+            "senders": set(), "subjects": [],
+        })
+        g["messages"] += 1
+        g["age_days"] = min(g["age_days"], age)
+        if dt and (g["first_seen"] is None or dt < g["first_seen"]):
+            g["first_seen"] = dt
+        if len(g["paths"]) < 6:
+            g["paths"].append(r.path)
+        if getattr(r, "sender_email", ""):
+            g["senders"].add(r.sender_email.lower())
+        if len(g["subjects"]) < 3 and getattr(r, "subject", ""):
+            g["subjects"].append(r.subject)
+
+    out = []
+    for g in by_domain.values():
+        reasons, score = [], 0
+        if g["age_days"] < window_days:
+            reasons.append("registered %d day(s) before first contact"
+                           % g["age_days"])
+            score += 4 if g["age_days"] < 30 else 2
+        if g["resembles_victim"]:
+            reasons.append("resembles the victim's own domain %s" % g["resembles"])
+            score += 4
+        else:
+            reasons.append("resembles %s" % g["resembles"])
+            score += 2
+        if compromise and g["first_seen"]:
+            # registered inside the window: the domain was made for this case
+            reg = g["first_seen"] - timedelta(days=g["age_days"])
+            if compromise - timedelta(days=window_days) <= reg <= compromise + timedelta(days=window_days):
+                reasons.append("registration falls inside the compromise window")
+                score += 3
+        g["first_seen"] = (g["first_seen"].strftime("%Y-%m-%dT%H:%M:%SZ")
+                           if g["first_seen"] else "")
+        g["senders"] = sorted(g["senders"])[:4]
+        g["score"] = score
+        g["reasons"] = reasons
+        g["indicated"] = score >= 6
+        out.append(g)
+    out.sort(key=lambda g: (-g["score"], g["age_days"]))
+
+    # Mark the records so the finding travels with the message.
+    indicated = {g["domain"] for g in out if g["indicated"]}
+    for r in records:
+        dom = registered_domain_approx(getattr(r, "sender_domain", "") or "")
+        if dom in indicated and getattr(r, "lookalike_of", ""):
+            r.lookalike_infrastructure = True
+            sig = ("Lookalike infrastructure: %s resembles %s and was "
+                   "registered %d day(s) before this message"
+                   % (dom, r.lookalike_of, r.sender_domain_age_days))
+            r.indicators = list(dict.fromkeys(list(r.indicators) + [sig]))
+            r.provenance = list(r.provenance) + [make_finding(
+                sig, category="identity", source="corpus:lookalike+rdap",
+                matched="%s ~ %s, %dd" % (dom, r.lookalike_of,
+                                            r.sender_domain_age_days),
+                weight=0, severity="high")]
+            r.tier = 1
+
+    return {"available": any(getattr(r, "sender_domain_age_days", -1) >= 0
+                             for r in records),
+            "domains": out[:20], "count": len(out),
+            "indicated_count": sum(1 for g in out if g["indicated"])}
+
+
 def thread_attachment_diffs(records, anchors=None, limit=40):
     """Attachments re-sent on a thread with the same name and different bytes.
 

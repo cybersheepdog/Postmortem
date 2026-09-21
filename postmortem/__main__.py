@@ -176,6 +176,7 @@ class AnalysisCache:
 from postmortem.scoring import (  # noqa: E402
     calculate_score, candidate_score, identify_internal_domains, corpus_baseline,
     build_term_policy,
+    lookalike_infrastructure,
     identify_known_contacts, calculate_thread_ids, analyze_temporal_signals,
     detect_possible_impersonation, build_attack_timeline,
     earliest_malicious_precursor_verdict,
@@ -2240,6 +2241,19 @@ def main():
             print(f"    {dom}  registered {days}d before first contact "
                   f"({msgs} message(s))")
         enriched = enriched or bool(n)
+        # The two strongest signals in the corpus, joined: a look-alike that
+        # was ALSO registered recently is purpose-built infrastructure.
+        infra = lookalike_infrastructure(records, anchors)
+        initial_verdict["lookalike_infrastructure"] = infra
+        if infra.get("indicated_count"):
+            print(term.c(f"Lookalike infrastructure: {infra['indicated_count']} "
+                         "domain(s) both resemble a known domain and were "
+                         "registered recently", "red", "bold"))
+            for g in infra["domains"]:
+                if g["indicated"]:
+                    print(term.c(f"    {g['domain']}  ~ {g['resembles']}  "
+                                 f"{g['age_days']}d old  {g['messages']} message(s)",
+                                 "red"))
     # YARA and QR share one decode of each suspect's attachments, so running
     # both costs one sweep rather than two. Either can be enabled alone.
     want_yara = bool(getattr(args, "yara_rules", None))

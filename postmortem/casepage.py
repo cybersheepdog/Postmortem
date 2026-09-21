@@ -102,6 +102,23 @@ def _entry(v, s):
                   OBSERVED,
                   "A refreshed token leaves no sign-in record. The access is in "
                   "the audit log; the authentication is not.", hit=True)
+    li = v.get("lookalike_infrastructure") or {}
+    if li.get("indicated_count"):
+        g = (li.get("domains") or [{}])[0]
+        return _a("How did they get in",
+                  "Purpose-built lookalike domain: %s (resembles %s, registered "
+                  "%d day%s before first contact)"
+                  % (g.get("domain", "?"), g.get("resembles", "?"),
+                     g.get("age_days", 0), "" if g.get("age_days") == 1 else "s")
+                  + (", %d more" % (li["indicated_count"] - 1)
+                     if li["indicated_count"] > 1 else ""),
+                  OBSERVED,
+                  "Registration date from RDAP; resemblance to %s from the "
+                  "corpus. Infrastructure made for this case, not a compromised "
+                  "account -- the fraud arrives from outside."
+                  % ("the victim's own domain" if g.get("resembles_victim")
+                     else "a known correspondent"),
+                  hit=True)
     if v.get("initial_email"):
         e = v["initial_email"]
         return _a("How did they get in",

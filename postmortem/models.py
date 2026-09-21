@@ -203,6 +203,9 @@ class EmailRecord:
     # An attachment on this message re-sends one earlier in the thread by the
     # same name with different bytes, in circumstances that read as fraud.
     attachment_substituted: bool = False
+    # Sender domain resembles a known domain AND was registered recently:
+    # purpose-built infrastructure, one finding rather than two.
+    lookalike_infrastructure: bool = False
     scenario_score: int = 0
     # Recorded attacker actions against THIS message, joined from the audit log
     # by InternetMessageId. Facts, not heuristics: they carry no score and

@@ -7072,3 +7072,76 @@ def test_the_case_page_reports_a_substitution_as_money_movement(tmp_path):
     a = {x["question"]: x for x in case_answers(v, [], None)}["Was money moved"]
     assert "substituted" in a["answer"]
     assert a["provenance"] == "observed"
+
+
+# --------------------------------------------------------------------------
+# Lookalike infrastructure: two of the strongest signals in the corpus
+# (registered N days before: 1449x lift; resembles a known domain: weight 9)
+# fired separately and never met. Joined, they are one thing -- the
+# attacker's purpose-built domain -- and belong at the top of the report.
+# --------------------------------------------------------------------------
+def _la(path, domain, resembles, age, date="Fri, 28 Aug 2026 09:00:00 +0000"):
+    r = make_record(sender_email="ap@" + domain, sender_domain=domain,
+                    subject="Updated remittance", path=path, date=date)
+    r.body = "x"; r.urls = []; r.url_domains = []; r.url_analysis = []
+    r.attachments = []; r.attachment_details = []; r.authentication_results = {}
+    r.lookalike_of = resembles
+    r.sender_domain_age_days = age
+    return r
+
+
+def test_a_recent_lookalike_of_the_victim_domain_is_infrastructure(tmp_path):
+    from datetime import datetime as D, timezone as TZ
+    from postmortem.models import Anchors
+    from postmortem.scoring import lookalike_infrastructure
+
+    r = _la("/m/1.eml", "acme-corp.example", "acme.example", 12)
+    out = lookalike_infrastructure(
+        [r], Anchors(victim_domains=["acme.example"],
+                     compromise_date=D(2026, 8, 27, tzinfo=TZ.utc)))
+    assert out["indicated_count"] == 1
+    g = out["domains"][0]
+    assert g["resembles_victim"] is True
+    assert any("victim" in x for x in g["reasons"])
+    assert any("inside the compromise window" in x for x in g["reasons"])
+    assert r.lookalike_infrastructure is True and r.tier == 1
+    assert any("Lookalike infrastructure" in f["signal"] for f in r.provenance)
+
+
+def test_an_old_lookalike_is_not_infrastructure(tmp_path):
+    # A vendor whose name happens to be one letter off, registered in 2009.
+    from postmortem.scoring import lookalike_infrastructure
+
+    r = _la("/m/1.eml", "acme-corp.example", "acme.example", 6000)
+    out = lookalike_infrastructure([r])
+    assert out["count"] == 1 and out["indicated_count"] == 0
+    assert r.lookalike_infrastructure is False
+
+
+def test_a_recent_domain_that_resembles_nothing_is_not_here(tmp_path):
+    # The domain-age pass already scores it. This is only for the JOIN.
+    from postmortem.scoring import lookalike_infrastructure
+
+    r = _la("/m/1.eml", "totally-new.example", "", 3)
+    out = lookalike_infrastructure([r])
+    assert out["count"] == 0
+
+
+def test_without_an_rdap_pass_nothing_is_claimed(tmp_path):
+    from postmortem.scoring import lookalike_infrastructure
+
+    r = _la("/m/1.eml", "acme-corp.example", "acme.example", -1)
+    out = lookalike_infrastructure([r])
+    assert out["available"] is False and out["count"] == 0
+
+
+def test_the_case_page_leads_with_infrastructure_over_a_scored_email(tmp_path):
+    from postmortem.casepage import case_answers
+
+    v = {"initial_email": {"subject": "x", "sender": "y", "timestamp": "t"},
+         "lookalike_infrastructure": {"indicated_count": 1, "domains": [
+             {"domain": "acme-corp.example", "resembles": "acme.example",
+              "age_days": 12, "resembles_victim": True}]}}
+    a = case_answers(v, [], None)[0]
+    assert "Purpose-built lookalike" in a["answer"]
+    assert a["provenance"] == "observed"

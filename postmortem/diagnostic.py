@@ -378,6 +378,9 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
     }
 
     # Corpus-only: needs no log, so it sits outside the audit block.
+    _li = (verdict or {}).get("lookalike_infrastructure") or {}
+    doc["lookalike_infrastructure"] = {k: v for k, v in _li.items()
+                                       if isinstance(v, (int, bool))}
     _ad = (verdict or {}).get("attachment_diffs") or {}
     doc["attachment_diffs"] = {k: v for k, v in _ad.items()
                                if isinstance(v, (int, bool))}
