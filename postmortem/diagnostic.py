@@ -449,6 +449,7 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "rule_cleanup": {
                 k: v for k, v in (audit_summary.get("rule_cleanup") or {}).items()
                 if isinstance(v, (int, bool))},
+            "rules_republished": audit_summary.get("republished_count", 0),
             "attacker_ips_from_session": len(
                 (audit_summary.get("derived") or {}).get(
                     "attacker_ips_from_session") or []),
@@ -484,6 +485,8 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "owner_device_ips": len(signin_summary.get("owner_device_ips") or []),
             "devices_excluded_too_new": (signin_summary.get("owner_device_evidence")
                                          or {}).get("_devices_excluded_as_too_new", 0),
+            "users_with_country_baseline": len(
+                signin_summary.get("user_countries") or {}),
             "aitm_indicated": signin_summary.get("aitm_indicated", 0),
             "aitm_candidates": len(signin_summary.get("aitm") or []),
             "legacy_auth": {

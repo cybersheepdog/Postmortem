@@ -7514,3 +7514,168 @@ def test_without_a_permissions_export_no_send_is_staff(tmp_path):
     a = analyze_audit_log(_audit_file(tmp_path, rows))
     hit = a["message_index"]["by_message_id"]["<a@acme.com>"][0]
     assert hit["delegate_send"] is True and hit["staff_send"] is False
+
+
+# --------------------------------------------------------------------------
+# Outlook re-publishing the rule set is not a person creating a rule
+# --------------------------------------------------------------------------
+def _uupdate(ip, when, name=".", keyword="invoice", forward=None,
+             client="Client=MSExchangeRPC"):
+    params = [{"Name": "Name", "Value": name}]
+    if keyword:
+        params.append({"Name": "SubjectContainsWords", "Value": keyword})
+        params.append({"Name": "DeleteMessage", "Value": "True"})
+    if forward:
+        params.append({"Name": "ForwardTo", "Value": forward})
+    return _uev("UpdateInboxRules", ip, when=when, Parameters=params,
+                ClientInfoString=client)
+
+
+def test_an_updateinboxrules_restating_an_earlier_rule_does_not_seed(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK, when="2026-08-27T09:00:00"),
+            # Owner opens the Rules dialog the next day; Outlook re-publishes
+            # the attacker's rule under the owner's own address.
+            _uupdate(UAL_OWNER, "2026-08-28T08:00:00")]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert UAL_ATK in a["derived"]["attacker_ips"]
+    assert UAL_OWNER not in a["derived"]["attacker_ips"], \
+        "the re-publish must not make the owner the attacker"
+    assert len(a["malicious_rules"]) == 1
+    assert a["republished_count"] == 1
+    rp = a["republished_rules"][0]
+    assert rp["client_ip"] == UAL_OWNER
+    assert rp["client"] == "desktop"
+    assert rp["name"] == "."
+
+
+def test_an_updateinboxrules_with_new_content_is_a_creation(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK, when="2026-08-27T09:00:00"),
+            _uupdate("198.51.100.7", "2026-08-27T09:30:00", name="..",
+                     keyword=None, forward="drop@evil.example")]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert "198.51.100.7" in a["derived"]["attacker_ips"]
+    assert a["republished_count"] == 0
+    assert "drop@evil.example" in a["derived"]["attacker_addresses"]
+
+
+def test_a_republish_is_judged_by_time_not_by_record_order(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    # Same two events, the re-publish listed FIRST in the export. Walking in
+    # time order still finds the New-InboxRule to be the original.
+    rows = [_uupdate(UAL_OWNER, "2026-08-28T08:00:00"),
+            _urule(UAL_ATK, when="2026-08-27T09:00:00")]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert UAL_ATK in a["derived"]["attacker_ips"]
+    assert UAL_OWNER not in a["derived"]["attacker_ips"]
+    assert a["republished_count"] == 1
+
+
+def test_a_lone_updateinboxrules_still_counts(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    # With no earlier rule in the log there is nothing to re-publish; the
+    # first sight of suspicious content is the creation, whichever op it is.
+    a = analyze_audit_log(_audit_file(
+        tmp_path, [_uupdate(UAL_ATK, "2026-08-27T09:00:00")]))
+    assert UAL_ATK in a["derived"]["attacker_ips"]
+    assert len(a["malicious_rules"]) == 1
+    assert a["republished_count"] == 0
+
+
+# --------------------------------------------------------------------------
+# GeoIP judged against the account's own history before the org-wide set
+# --------------------------------------------------------------------------
+class _GeoStub:
+    def __init__(self, table):
+        self.table = table
+
+    def available(self):
+        return True
+
+    def lookup(self, ip):
+        return self.table.get(ip, {})
+
+
+def _geo_summary(*entries):
+    return {"ip_activity": [
+        {"ip": ip, "users": list(users), "events": 1, "is_attacker": False,
+         "country": "", "asn": "", "org": "", "unexpected_country": False}
+        for ip, users in entries]}
+
+
+def test_a_country_in_the_users_own_history_is_not_unexpected():
+    from postmortem.auditlog import annotate_audit_geoip
+
+    # Remote worker in Portugal; org expects US only. Global set alone would
+    # flag every mailbox operation she makes.
+    s = _geo_summary(("198.51.100.20", ["Ana@acme.com"]))
+    r = annotate_audit_geoip(
+        s, _GeoStub({"198.51.100.20": {"country": "PT", "asn": "AS1"}}),
+        ["US"], user_countries={"ana@acme.com": {"PT": 40, "US": 2, "_n": 42}})
+    assert r == {"resolved": 1, "unexpected": 0, "by_user_baseline": 1}
+    assert s["ip_activity"][0]["unexpected_country"] is False
+    assert s["ip_activity"][0]["baseline"] == "user"
+
+
+def test_a_country_absent_from_the_users_history_is_unexpected_even_if_org_wide():
+    from postmortem.auditlog import annotate_audit_geoip
+
+    # The org has an office in Germany, so DE is in the global set -- but
+    # THIS user has never signed in from there. Per-user history wins.
+    s = _geo_summary(("198.51.100.21", ["bob@acme.com"]))
+    r = annotate_audit_geoip(
+        s, _GeoStub({"198.51.100.21": {"country": "DE", "asn": "AS1"}}),
+        ["US", "DE"], user_countries={"bob@acme.com": {"US": 30, "_n": 30}})
+    assert r["unexpected"] == 1 and r["by_user_baseline"] == 1
+    assert s["ip_activity"][0]["unexpected_country"] is True
+    assert s["ip_activity"][0]["baseline"] == "user"
+
+
+def test_without_history_geoip_falls_back_to_the_global_set():
+    from postmortem.auditlog import annotate_audit_geoip
+
+    s = _geo_summary(("198.51.100.22", ["new@acme.com"]),
+                     ("198.51.100.23", ["new@acme.com"]))
+    r = annotate_audit_geoip(
+        s, _GeoStub({"198.51.100.22": {"country": "US", "asn": "AS1"},
+                     "198.51.100.23": {"country": "NG", "asn": "AS2"}}),
+        ["US"], user_countries={"someone_else@acme.com": {"US": 9, "_n": 9}})
+    assert r == {"resolved": 2, "unexpected": 1, "by_user_baseline": 0}
+    by_ip = {e["ip"]: e for e in s["ip_activity"]}
+    assert by_ip["198.51.100.22"]["unexpected_country"] is False
+    assert by_ip["198.51.100.23"]["unexpected_country"] is True
+    assert by_ip["198.51.100.23"]["baseline"] == "global"
+
+
+def test_one_users_history_explains_a_shared_address():
+    from postmortem.auditlog import annotate_audit_geoip
+
+    s = _geo_summary(("198.51.100.24", ["ana@acme.com", "bob@acme.com"]))
+    r = annotate_audit_geoip(
+        s, _GeoStub({"198.51.100.24": {"country": "PT", "asn": "AS1"}}),
+        ["US"], user_countries={"ana@acme.com": {"PT": 12, "_n": 12},
+                                "bob@acme.com": {"US": 12, "_n": 12}})
+    assert r["unexpected"] == 0
+    assert s["ip_activity"][0]["unexpected_country"] is False
+
+
+def test_signin_summary_exposes_per_user_countries(tmp_path):
+    from postmortem.signin import analyze_signin_logs, _MIN_HISTORY
+
+    rows = [_si("ana@acme.com", "198.51.100.30", f"2026-08-0{i}T09:00:00",
+                country="PT") for i in range(1, _MIN_HISTORY + 1)]
+    rows.append(_si("ana@acme.com", "203.0.113.5", "2026-08-09T09:00:00",
+                    country="US"))
+    rows.append(_si("newbie@acme.com", "203.0.113.6", "2026-08-09T10:00:00"))
+    p = _si_export(tmp_path, rows)
+    s = analyze_signin_logs(str(p))
+    uc = s["user_countries"]
+    assert uc["ana@acme.com"]["PT"] == _MIN_HISTORY
+    assert uc["ana@acme.com"]["US"] == 1
+    assert uc["ana@acme.com"]["_n"] == _MIN_HISTORY + 1
+    assert "newbie@acme.com" not in uc, "too little history to be a baseline"

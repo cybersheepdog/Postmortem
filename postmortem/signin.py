@@ -1271,6 +1271,13 @@ def analyze_signin_logs(path, devices=None):
         "single_leg_findings": single_leg,
         "single_leg_count": len(single_leg),
         "indicated_count": sum(1 for r in single_leg if r["indicated"]),
+        # Where each account normally signs in from, by the account's own
+        # record. The audit-log GeoIP pass uses this ahead of the global
+        # --expected-countries: a user who works from two countries is not
+        # an anomaly in either of them.
+        "user_countries": {
+            u: dict(p["country"], _n=p["n"])
+            for u, p in profiles.items() if p["n"] >= _MIN_HISTORY},
         "aitm": [{k: v for k, v in r.items() if not k.startswith("_")}
                  for r in aitm],
         "aitm_indicated": sum(1 for r in aitm if r["indicated"]),

@@ -662,6 +662,19 @@ def print_audit_summary(audit: dict, warnings=None):
             for tell in r.get("name_tells") or []:
                 print(term.c(f"        ^ {tell}", "red", "bold"))
 
+    rp = audit.get("republished_rules") or []
+    if rp:
+        print()
+        print(f"  Rule re-publishes ignored ({len(rp)}):")
+        print("    " + _wrap_indent(
+            "Outlook re-publishes the whole rule set as UpdateInboxRules when "
+            "the Rules dialog is opened or the client resyncs. These restate "
+            "a rule already recorded above and did not seed an attacker "
+            "address.", 4))
+        for r in rp[:6]:
+            print(f"    {r.get('time', ''):20} from {r.get('client_ip', '?')} "
+                  f"({r.get('client', 'unknown')})  name={r.get('name', '')!r}")
+
     cu = audit.get("rule_cleanup") or {}
     if cu.get("removed") or cu.get("created_then_gone"):
         print()

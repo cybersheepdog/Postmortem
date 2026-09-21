@@ -2322,7 +2322,9 @@ def main():
                 # message header, a ClientIP is recorded by the service rather
                 # than asserted by the sender, so an unexpected country here is
                 # a much stronger signal than the same country in a Received.
-                audit_geo = annotate_audit_geoip(audit_summary, resolver, expected)
+                audit_geo = annotate_audit_geoip(
+                    audit_summary, resolver, expected,
+                    user_countries=(signin_summary or {}).get('user_countries'))
                 resolver.close()
         if resolver.available():
             print(f"GeoIP: {geo_n} suspicious-geography, {host_n} "
@@ -2330,9 +2332,11 @@ def main():
             if audit_geo.get("resolved"):
                 print(f"GeoIP (audit log): {audit_geo['resolved']} client IP(s) "
                       f"located"
-                      + (f", {audit_geo['unexpected']} outside "
-                         f"--expected-countries"
-                         if audit_geo.get("unexpected") else ""))
+                      + (f", {audit_geo['unexpected']} outside the expected set"
+                         if audit_geo.get("unexpected") else "")
+                      + (f" ({audit_geo['by_user_baseline']} judged against the "
+                         "account's own sign-in history)"
+                         if audit_geo.get("by_user_baseline") else ""))
             enriched = enriched or bool(geo_n or host_n)
     if enriched:
         initial_verdict["tier_counts"] = {

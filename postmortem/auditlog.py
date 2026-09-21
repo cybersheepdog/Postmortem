@@ -1033,7 +1033,8 @@ def _ip_activity(events, attacker_ips):
     return out
 
 
-def annotate_audit_geoip(audit_summary, resolver, expected_countries=()):
+def annotate_audit_geoip(audit_summary, resolver, expected_countries=(),
+                         user_countries=None):
     """Geolocate audit client IPs and flag sessions outside the expected set.
 
     ``--geoip-db`` was already wired for message headers and never applied to
@@ -1044,7 +1045,16 @@ def annotate_audit_geoip(audit_summary, resolver, expected_countries=()):
     if not audit_summary or not resolver or not resolver.available():
         return {"resolved": 0, "unexpected": 0}
     expected = {c.strip().upper() for c in (expected_countries or []) if c.strip()}
+    # Per-user history from the sign-in log, keyed by lowercased UPN. A
+    # global expected set says where the ORGANISATION is; this says where
+    # THIS person is, which is the question a split-tunnel VPN or a remote
+    # worker keeps answering differently. Used first; the global set is the
+    # fallback for an address whose users have no history.
+    per_user = {str(u).lower(): {str(c).upper(): n for c, n in v.items()
+                                 if not str(c).startswith("_")}
+                for u, v in (user_countries or {}).items()}
     resolved = unexpected = 0
+    by_user_baseline = 0
     for entry in audit_summary.get("ip_activity") or []:
         info = resolver.lookup(entry["ip"])
         if not info.get("country") and not info.get("asn"):
@@ -1053,10 +1063,29 @@ def annotate_audit_geoip(audit_summary, resolver, expected_countries=()):
         entry["country"] = info.get("country", "")
         entry["asn"] = info.get("asn", "")
         entry["org"] = info.get("org", "")
-        if expected and entry["country"] and entry["country"].upper() not in expected:
+        country = entry["country"].upper() if entry["country"] else ""
+        if not country:
+            continue
+        users = [str(u).lower() for u in (entry.get("users") or []) if u]
+        histories = [per_user[u] for u in users if u in per_user]
+        if histories:
+            # Unexpected only if NONE of the users on this address has ever
+            # signed in from this country. One user's history is enough to
+            # explain the address for everyone sharing it.
+            known = any(country in h for h in histories)
+            entry["baseline"] = "user"
+            by_user_baseline += 1
+            if not known:
+                entry["unexpected_country"] = True
+                unexpected += 1
+        elif expected and country not in expected:
+            entry["baseline"] = "global"
             entry["unexpected_country"] = True
             unexpected += 1
-    return {"resolved": resolved, "unexpected": unexpected}
+        elif expected:
+            entry["baseline"] = "global"
+    return {"resolved": resolved, "unexpected": unexpected,
+            "by_user_baseline": by_user_baseline}
 
 
 def _coverage(events):
@@ -1272,13 +1301,41 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
         for e in events:
             e["after_containment"] = False
 
-    for e in events:
+    # Outlook desktop re-publishes the WHOLE rule set as UpdateInboxRules
+    # whenever the user opens the Rules dialog or the client resyncs. That is
+    # the client restating what already exists, not a person creating a
+    # rule -- and it happens from the owner's own machine, so it seeded the
+    # owner's address as the attacker's whenever any existing rule looked
+    # suspicious. An UpdateInboxRules whose suspicious content matches a rule
+    # this log has already recorded is a re-publish: reported, never seeding.
+    # One whose content is NEW is a creation in disguise and is treated as
+    # one. Events are walked in time order so "already recorded" means
+    # earlier, not merely elsewhere.
+    def _fingerprint(f):
+        return (tuple(sorted(f["forwards"])), (f["move_to"] or "").lower(),
+                bool(f["delete"]), tuple(sorted(w.lower() for w in f["keywords"])))
+    seen_fingerprints = set()
+    republished = []
+
+    for e in sorted(events, key=lambda x: (x["timestamp"] is None, x["timestamp"])):
         if e["op_lower"] in _RULE_OPS:
             if e.get("after_containment"):
                 continue
             f = _rule_findings(e)
             if not f["suspicious"]:
                 continue
+            fp = _fingerprint(f)
+            if e["op_lower"] == "updateinboxrules":
+                if fp in seen_fingerprints:
+                    republished.append({
+                        "time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if e["timestamp"] else "",
+                        "user": e["user"], "client_ip": e["client_ip"],
+                        "client": classify_client(e.get("client_info")),
+                        "name": f["name"],
+                    })
+                    continue
+            seen_fingerprints.add(fp)
             entry = {
                 "time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ") if e["timestamp"] else "",
                 "operation": e["operation"], "user": e["user"], "client_ip": e["client_ip"],
@@ -1418,6 +1475,8 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
         "response_events": response_events,
         "owner_vetoed_ips": owner_vetoed,
         "searches": search_queries(events, attacker_ips, compromise_dt),
+        "republished_rules": republished,
+        "republished_count": len(republished),
         "audit_disabled_events": [
             {"time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
              if e["timestamp"] else "",
