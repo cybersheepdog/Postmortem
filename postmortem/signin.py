@@ -334,6 +334,71 @@ def _leg_row(f):
     }
 
 
+# --------------------------------------------------------------------------
+# Forged events
+#
+# A sign-in log is trusted here as the record of what the identity provider
+# did. That trust has a limit: an attacker with a compromised AD FS server --
+# or, on a cloud-only tenant, a Global Administrator who registers a FAKE
+# health agent -- can inject events into it through the Azure AD Connect
+# Health pipeline, controlling the timestamp, the account and THE IP ADDRESS
+# (inversecos, "Detecting Fake Events in Azure Sign-in Logs").
+#
+# That last field is aimed squarely at the attribution below. _victim_
+# addresses() treats every address seen on an interactive sign-in for a
+# compromised account as the owner's and vetoes it, so that the mailbox
+# owner is never labelled the intruder. An attacker who forges ONE
+# interactive sign-in for the victim from their own address puts that address
+# in the veto set and the tool then refuses to name it: the conservatism
+# becomes the bypass. Forged records are therefore kept out of the veto.
+#
+# The tells are cheap and specific -- a forged event cannot populate the
+# application and resource fields the real pipeline fills in.
+_FORGED_APP = {"notapplicable", "not applicable", "notset", "not set", ""}
+_FORGED_RESOURCE_ID = "urn:federation:microsoftonline"
+_FORGED_AUTH_METHOD = "forms authentication"
+_FORGED_ISSUER = "federated (adfs)"
+
+
+def forged_markers(flat):
+    """(strong, weak) published indicators that this record was injected.
+
+    The split matters. A genuine AD FS sign-in IS issued by AD FS and DOES
+    use forms authentication, so those two together describe every federated
+    tenant on earth -- a first cut counted them as two markers and flagged a
+    legitimate record as forged. They are corroboration only.
+
+    The decisive ones are the fields the forging pipeline cannot populate:
+    an event injected through Connect Health has no application or resource
+    to name, so it arrives as NotApplicable / NotSet with the federation
+    resource id standing in.
+    """
+    strong, weak = [], []
+    app = str(get(flat, "app", "")).strip().lower()
+    res = str(get(flat, "resource", "")).strip().lower()
+    if app in _FORGED_APP:
+        strong.append("application is %s" % (app or "empty"))
+    if res in _FORGED_APP:
+        strong.append("resource is %s" % (res or "empty"))
+    if resource_id_of(flat) == _FORGED_RESOURCE_ID:
+        strong.append("resource id urn:federation:MicrosoftOnline")
+    for key in ("tokenissuertype", "issuertype"):
+        if str(flat.get(key, "")).strip().lower() == _FORGED_ISSUER:
+            weak.append("token issuer type Federated (ADFS)")
+            break
+    for key in ("authenticationmethod", "authmethod"):
+        if str(flat.get(key, "")).strip().lower() == _FORGED_AUTH_METHOD:
+            weak.append("forms authentication")
+            break
+    return strong, weak
+
+
+def looks_forged(flat):
+    """At least one decisive marker, and at least two in total."""
+    strong, weak = forged_markers(flat)
+    return bool(strong) and (len(strong) + len(weak)) >= 2
+
+
 def _victim_addresses(records, affected_users):
     """Every IP seen on an interactive sign-in for an affected account.
 
@@ -341,15 +406,22 @@ def _victim_addresses(records, affected_users):
     interactively is the user's own, whatever leg of a device code group it
     later turns up on.
     """
-    out = set()
+    out, forged = set(), set()
     lowered = {u.lower() for u in affected_users if u}
     for _src, f in records:
         user = str(get(f, "user", "")).lower()
         if user and user in lowered and truthy(get(f, "interactive", "")):
             ip = str(get(f, "ip", ""))
-            if ip:
-                out.add(ip)
-    return out
+            if not ip:
+                continue
+            # An injected event's IP is attacker-chosen. Letting it into the
+            # veto would let the attacker exempt their own address from every
+            # attribution in the report.
+            if looks_forged(f):
+                forged.add(ip)
+                continue
+            out.add(ip)
+    return out, forged
 
 
 # --------------------------------------------------------------------------
@@ -598,7 +670,7 @@ def analyze_signin_logs(path):
 
     affected_users = sorted({str(get(f, "user", "")) for _s, f in hits
                              if get(f, "user", "")})
-    victim_ips = _victim_addresses(records, affected_users)
+    victim_ips, forged_veto_ips = _victim_addresses(records, affected_users)
 
     groups = []
     attacker_ips = set()
@@ -673,6 +745,17 @@ def analyze_signin_logs(path):
     dated = [e["_dt"] for e in token_events if e["_dt"]]
     earliest = min(dated) if dated else None
 
+    forged = []
+    for _s, f in records:
+        if not looks_forged(f):
+            continue
+        _strong, _weak = forged_markers(f)
+        row = _leg_row(f)
+        row.update({"user": str(get(f, "user", "")) or "(unknown)",
+                    "markers": _strong + _weak})
+        forged.append(row)
+    forged.sort(key=lambda r: r.get("time") or "")
+
     single_leg = _single_leg_findings(buckets, victim_ips, hits)
 
     times = sorted(str(get(f, "time", "")) for _s, f in records
@@ -711,6 +794,27 @@ def analyze_signin_logs(path):
             "Device code sign-ins are present but none shows a location split, "
             "so no attacker address was derived. A residential proxy in the "
             "victim's own country produces exactly this picture.")
+    if forged:
+        warnings.append(
+            "%d sign-in record(s) carry the published markers of a FORGED "
+            "event -- an application of NotApplicable, a resource of NotSet, "
+            "or the urn:federation:MicrosoftOnline resource id. Events can be "
+            "injected into this log through the Azure AD Connect Health "
+            "pipeline, from a compromised AD FS server or a fake health agent "
+            "registered by a global administrator, and the injected record's "
+            "timestamp, account and IP are all attacker-chosen. Treat every "
+            "conclusion drawn from this export as provisional until the AD FS "
+            "Security event log (Event ID 1200) is compared against it -- and "
+            "compare on ADDRESS, not on time, because time is spoofed."
+            % len(forged))
+    if forged_veto_ips:
+        warnings.append(
+            "%d address(es) were kept OUT of the victim-address veto because "
+            "the interactive sign-in asserting them looks forged. A single "
+            "injected event naming the attacker's own address as the victim's "
+            "would otherwise exempt it from attribution for the whole report."
+            % len(forged_veto_ips))
+
     _indicated = [r for r in single_leg if r["indicated"]]
     if _indicated:
         warnings.append(
@@ -759,6 +863,9 @@ def analyze_signin_logs(path):
         "token_events": token_events,
         "tokens_issued": len(token_events),
         "device_code_successes": successes,
+        "forged_events": forged[:50],
+        "forged_count": len(forged),
+        "forged_veto_ips": sorted(forged_veto_ips),
         # Every address that authenticated at all, device code or not. The
         # token-replay test needs the full set, not the device code subset.
         "all_signin_ips": sorted({str(get(f, "ip", "")) for _s, f in records

@@ -6040,3 +6040,211 @@ def test_the_signin_window_is_compared_as_time_not_as_text(tmp_path):
                              last="2026-08-27T13:00:00Z")]))
     assert out["outside_window"] == 0, "a space-separated window must still compare"
     assert [r["ip"] for r in out["replay"]] == ["45.147.230.88"]
+
+
+# --------------------------------------------------------------------------
+# Forged sign-in events (inversecos, "Detecting Fake Events in Azure Sign-in
+# Logs"). Events can be injected through the Azure AD Connect Health pipeline
+# from a compromised AD FS server, or from a FAKE health agent registered by a
+# global administrator -- which works on a cloud-only tenant. The injected
+# record's timestamp, account and IP are all attacker-chosen.
+# --------------------------------------------------------------------------
+def test_a_forged_event_is_recognised(tmp_path):
+    from postmortem.signin import _flatten, looks_forged
+
+    assert looks_forged(_flatten({
+        "appDisplayName": "NotApplicable", "resourceDisplayName": "NotSet",
+        "resourceId": "urn:federation:MicrosoftOnline"}))
+
+
+def test_a_genuine_adfs_signin_is_not_forged(tmp_path):
+    # The false positive a first cut actually produced: a real federated
+    # sign-in IS issued by AD FS and DOES use forms authentication, so
+    # counting those as two markers flags every federated tenant on earth.
+    from postmortem.signin import _flatten, looks_forged, forged_markers
+
+    f = _flatten({"appDisplayName": "Office 365",
+                  "resourceDisplayName": "Exchange Online",
+                  "tokenIssuerType": "Federated (ADFS)",
+                  "authenticationMethod": "Forms Authentication"})
+    assert looks_forged(f) is False
+    strong, weak = forged_markers(f)
+    assert strong == [] and len(weak) == 2
+
+
+def test_one_marker_alone_is_not_enough(tmp_path):
+    from postmortem.signin import _flatten, looks_forged
+
+    assert looks_forged(_flatten({"appDisplayName": "NotApplicable",
+                                  "resourceDisplayName": "Exchange"})) is False
+
+
+def test_a_forged_event_cannot_veto_the_attackers_own_address(tmp_path):
+    # The bypass this exists to close. _victim_addresses treats every address
+    # on an interactive sign-in for a compromised account as the owner's and
+    # refuses to attribute it. One injected interactive event naming the
+    # attacker's own address would exempt it from the whole report.
+    import json
+    from postmortem.signin import analyze_signin_logs
+
+    ATTACKER = "45.147.230.88"
+    rows = [
+        # the real device code activity, from the attacker
+        {"id": "r1", "correlationId": "c1",
+         "createdDateTime": "2026-08-27T10:00:00Z",
+         "userPrincipalName": "ap@acme.com", "ipAddress": ATTACKER,
+         "originalTransferMethod": "deviceCodeFlow", "isInteractive": False,
+         "appId": OFFICE_CLIENT, "status": {"errorCode": 0},
+         "authenticationRequirement": "singleFactorAuthentication"},
+        # the injected event: same address, claimed as the victim's own
+        # interactive sign-in, so the veto would swallow it
+        {"id": "r2", "correlationId": "c2",
+         "createdDateTime": "2026-08-27T09:00:00Z",
+         "userPrincipalName": "ap@acme.com", "ipAddress": ATTACKER,
+         "isInteractive": True, "appDisplayName": "NotApplicable",
+         "resourceDisplayName": "NotSet",
+         "resourceId": "urn:federation:MicrosoftOnline",
+         "status": {"errorCode": 0}},
+    ]
+    d = tmp_path / "s"
+    d.mkdir()
+    (d / "s.json").write_text(json.dumps(rows), encoding="utf-8")
+    out = analyze_signin_logs(str(d))
+
+    assert out["forged_count"] == 1
+    assert out["forged_veto_ips"] == [ATTACKER]
+    # and the address is still assessable rather than vetoed into silence
+    assert [r["ip"] for r in out["single_leg_findings"]] == [ATTACKER]
+    joined = " ".join(out["warnings"])
+    assert "FORGED" in joined
+    assert "kept OUT of the victim-address veto" in joined
+    assert "not on time" in joined
+
+
+def test_a_clean_log_reports_no_forgery(tmp_path):
+    import json
+    from postmortem.signin import analyze_signin_logs
+
+    d = tmp_path / "s2"
+    d.mkdir()
+    (d / "s.json").write_text(json.dumps([_dc_record()]), encoding="utf-8")
+    out = analyze_signin_logs(str(d))
+    assert out["forged_count"] == 0 and out["forged_veto_ips"] == []
+    assert not any("FORGED" in w for w in out["warnings"])
+
+
+# --------------------------------------------------------------------------
+# Tenant-wide persistence: a federated domain is not scoped to an account, so
+# resetting the password, revoking every token and DELETING the account all
+# leave it working.
+# --------------------------------------------------------------------------
+def test_a_federation_backdoor_outranks_an_oauth_consent(tmp_path):
+    from postmortem.persistence import parse_entra_audit, _SEVERITY_ORDER
+
+    rows = [
+        {"activityDisplayName": "Consent to application",
+         "activityDateTime": "2026-08-27T10:00:00Z",
+         "initiatedBy": {"user": {"userPrincipalName": "ap@acme.com",
+                                  "ipAddress": "45.147.230.88"}}},
+        {"activityDisplayName": "Set domain authentication",
+         "activityDateTime": "2026-08-27T11:00:00Z",
+         "initiatedBy": {"user": {"userPrincipalName": "ap@acme.com",
+                                  "ipAddress": "45.147.230.88"}}},
+    ]
+    from postmortem.persistence import _flatten
+    parsed = {e["kind"]: e for e in parse_entra_audit(
+        [_flatten(r) for r in rows])}
+    assert "federation" in parsed, list(parsed)
+    fed, consent = parsed["federation"], parsed["oauth_consent"]
+    assert fed["survives_password_reset"] == "tenant"
+    assert (_SEVERITY_ORDER[fed["survives_password_reset"]]
+            < _SEVERITY_ORDER[consent["survives_password_reset"]])
+
+
+def test_federation_remediation_says_account_level_fixes_do_nothing(tmp_path):
+    from postmortem.persistence import _REMEDIATION
+
+    fix, ineffective = _REMEDIATION["federation"]
+    assert "Get-MgDomain" in fix
+    assert "deleting the account" in ineffective
+    assert "any.sts" in ineffective
+
+
+def test_cross_tenant_synchronisation_is_recognised(tmp_path):
+    from postmortem.persistence import parse_entra_audit
+
+    rows = [{"activityDisplayName":
+             "Add a partner cross-tenant access setting",
+             "activityDateTime": "2026-08-27T10:00:00Z",
+             "initiatedBy": {"user": {"userPrincipalName": "ap@acme.com"}}},
+            {"activityDisplayName": "Invite external user",
+             "activityDateTime": "2026-08-27T10:05:00Z",
+             "initiatedBy": {"user": {"userPrincipalName": "ap@acme.com"}}}]
+    from postmortem.persistence import _flatten
+    kinds = {e["kind"] for e in parse_entra_audit([_flatten(r) for r in rows])}
+    assert "cross_tenant" in kinds and "external_identity" in kinds
+
+
+def test_token_lifetimes_are_stated_when_there_is_anything_to_revoke(tmp_path):
+    # "Revoke tokens" reads as a checklist item without them. A refresh token
+    # is three months of access that never touches the sign-in log.
+    from postmortem.persistence import analyze_persistence
+
+    rows = [{"activityDisplayName": "Consent to application",
+             "activityDateTime": "2026-08-27T10:00:00Z",
+             "initiatedBy": {"user": {"userPrincipalName": "ap@acme.com",
+                                      "ipAddress": "45.147.230.88"}},
+             "targetResources": [{"displayName": "EvilApp",
+                                  "modifiedProperties": [
+                                      {"displayName": "ConsentAction.Permissions",
+                                       "newValue": "Mail.ReadWrite"}]}]}]
+    from postmortem.persistence import _flatten, parse_entra_audit
+    events = parse_entra_audit([_flatten(r) for r in rows])
+    out = analyze_persistence({"entra_audit": events},
+                              attacker_ips={"45.147.230.88"})
+    joined = " ".join(out["warnings"])
+    assert "90 days" in joined and "14" in joined
+
+
+def test_the_persistence_report_copy_is_json_serialisable(tmp_path):
+    # strip_private cleans two named lists. Anything added to the persistence
+    # output that carries a parsed datetime and is not one of them kills
+    # json.dumps at the very end of a multi-hour run, after every expensive
+    # stage has already completed.
+    import json as _j
+    from postmortem.persistence import (parse_entra_audit, analyze_persistence,
+                                        strip_private, _flatten)
+
+    rows = [{"activityDisplayName": a,
+             "activityDateTime": "2026-08-27T10:00:00Z",
+             "initiatedBy": {"user": {"userPrincipalName": "ap@acme.com",
+                                      "ipAddress": "45.147.230.88"}},
+             "targetResources": [{"displayName": "evil.example"}]}
+            for a in ("Set domain authentication", "Consent to application",
+                      "Add a partner cross-tenant access setting",
+                      "Invite external user", "Add member to role")]
+    out = analyze_persistence(
+        {"entra_audit": parse_entra_audit([_flatten(r) for r in rows])},
+        attacker_ips={"45.147.230.88"})
+    _j.dumps(strip_private(out))        # must not raise
+
+
+def test_a_tenant_wide_mechanism_sorts_above_everything_else(tmp_path):
+    from postmortem.persistence import (parse_entra_audit, analyze_persistence,
+                                        remediation_plan, _flatten)
+
+    rows = [{"activityDisplayName": a,
+             "activityDateTime": "2026-08-27T1%d:00:00Z" % i,
+             "initiatedBy": {"user": {"userPrincipalName": "ap@acme.com",
+                                      "ipAddress": "45.147.230.88"}},
+             "targetResources": [{"displayName": "x"}]}
+            for i, a in enumerate(("Consent to application",
+                                   "Add member to role",
+                                   "Set domain authentication"))]
+    out = analyze_persistence(
+        {"entra_audit": parse_entra_audit([_flatten(r) for r in rows])},
+        attacker_ips={"45.147.230.88"})
+    assert out["findings"][0]["kind"] == "federation"
+    assert out["tenant_wide_count"] == 1
+    acts = remediation_plan(out)
+    assert acts and acts[0]["kind"] == "federation"

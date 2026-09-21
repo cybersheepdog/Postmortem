@@ -1,5 +1,5 @@
 {
- "build_id": "a6f7672f19",
+ "build_id": "47baba8858",
  "file_count": 30,
  "files": {
   "__init__.py": "b69826ca1e0da639de6ec1e60334fc6e097fdc46884daa281e7ff792af7e69e6",
@@ -21,12 +21,12 @@
   "models.py": "506abb31c084a5db6ae97eb3a06a064204fc9b830454cc54aaabb81d87bdd13a",
   "netcheck.py": "7ab37b0a95644e611d11c4e2450ae21a1ee7b69bdead1ee969594a21135b1f0a",
   "parsing.py": "4214e3d7628ee61e033ca2c35e119b9a56daa59f722fa71c50b8017f62b6db4a",
-  "persistence.py": "bfe074bc71f8225ec221c2a7f54d83977473b337aff497414e3378f949aaccaa",
+  "persistence.py": "7850b2d992500e7ef739a23b333439f9f1cb5bee1d7cacb5a0d713079beac097",
   "qr_scan.py": "c0a23037081d68f932483be9889494e672a298d3eabc8e7a90c58403d7abdc22",
-  "reporting.py": "50065d5406120dd3c300b2f66fe4ea5c95e1a84225581873f987a23a83fe55b6",
+  "reporting.py": "c7e485c9882dadfb785e3422396844bd265a8652fbd2c04d3b50274d9b0e03ed",
   "resources.py": "6ffba02fbabd3b9fbd669622f51b2414356eefc497f4620a5845d974b3541f5b",
   "scoring.py": "c045deba1ab25ebcaf486f2c977ef02a9c2fcc22aaddf74f52b6752a63224acf",
-  "signin.py": "7f28cd668bdac9ba91e93151039d60cd8ea4e368f64b2e5cef4e53b1b34e44f4",
+  "signin.py": "7b8a5c5de6dc71379b5bc7e8bc48ffe9675be829abc161ebf81f76ad5c59c914",
   "term.py": "32d1fbfe7731eb3f4a5cdc8cb51d40acb3e907f6f474f1e67d87dec5b5fb3c48",
   "urls.py": "db2466dab9a67ad6e4c62c1d973aa22294a224438781306d6a82633a7c20f447",
   "utils.py": "7eaeeec1e74b0ef1bb4b29b0e6378e2643961378470f272a0cdaafa36ac75915",

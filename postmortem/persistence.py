@@ -79,6 +79,43 @@ _DURABILITY_SCOPES = {"offline_access"}
 # renamed several of these over the years ("Consent to application" vs "Add
 # delegated permission grant") and both spellings still appear in exports.
 _ACTIVITIES = [
+    # Identity federation. The most durable mechanism there is: the attacker
+    # federates a domain they control and can then "log in and impersonate any
+    # Microsoft 365 user and bypass all requirements for MFA as well as bypass
+    # any need to enter a valid password" (inversecos). It is not scoped to a
+    # mailbox or an account -- resetting the victim's password, revoking every
+    # token and DELETING the account all leave it working, because the
+    # attacker was never using that account's credentials.
+    ("set domain authentication", "federation", "tenant", "tenant",
+     "A domain's authentication was switched to federated. Whoever controls "
+     "the issuer can mint a token for any user in that domain."),
+    ("set federation settings on domain", "federation", "tenant", "tenant",
+     "Federation settings were changed on a domain."),
+    ("add unverified domain", "domain", "tenant", "tenant",
+     "A domain was added to the tenant. On its own this is routine; "
+     "immediately before a federation change it is the first half of a "
+     "backdoor."),
+    ("verify domain", "domain", "tenant", "tenant",
+     "A domain was verified, completing the claim on it."),
+    ("add verified domain", "domain", "tenant", "tenant",
+     "A domain was verified, completing the claim on it."),
+    # Cross-tenant synchronisation. The attacker provisions accounts straight
+    # into the victim tenant from one they own, so they can "commission a new
+    # account every time they are locked out" -- lockouts and password resets
+    # stop applying rather than being survived.
+    ("partner cross-tenant access setting", "cross_tenant",
+     "tenant", "tenant",
+     "A partner tenant was granted cross-tenant access. Accounts can be "
+     "provisioned into this tenant from one the attacker controls."),
+    ("cross-tenant access setting", "cross_tenant", "tenant", "tenant",
+     "Cross-tenant access settings were changed."),
+    ("crosstenantaccess", "cross_tenant", "tenant", "tenant",
+     "Cross-tenant access settings were changed."),
+    ("invite external user", "external_identity", "survives", "survives",
+     "An external account was invited into the tenant."),
+    ("redeem external user invite", "external_identity", "survives",
+     "survives",
+     "An external account completed an invitation and now holds access."),
     ("consent to application", "oauth_consent", "survives", "survives",
      "An application holds standing delegated access to the mailbox."),
     ("add delegated permission grant", "oauth_consent", "survives", "survives",
@@ -152,6 +189,34 @@ _REMEDIATION = {
         "Remove the added secret/certificate from the application "
         "registration, then rotate any remaining credentials.",
         "Revoking user sessions does NOT affect an application credential."),
+    "federation": (
+        "Treat as a tenant-wide compromise. List every domain and check its "
+        "issuer: Get-MgDomain | ForEach-Object { Get-MgDomainFederation"
+        "Configuration -DomainId $_.Id }. Convert any domain that should not "
+        "be federated back to managed, and audit ImmutableID/SourceAnchor "
+        "changes on privileged accounts.",
+        "NOTHING at the account level fixes this. A password reset, a token "
+        "revocation, MFA re-registration and deleting the account all leave "
+        "it working: the attacker mints tokens as the issuer and never uses "
+        "the account's credentials. AADInternals defaults its issuer to "
+        "http://any.sts/, which is worth searching for specifically."),
+    "domain": (
+        "Confirm the domain was added by your organisation. If not, remove "
+        "it, and check whether it was federated while it existed.",
+        "A domain the attacker controls is the first half of a federation "
+        "backdoor; on its own it grants nothing."),
+    "cross_tenant": (
+        "Review cross-tenant access settings: Identity > External Identities "
+        "> Cross-tenant Access Settings. Disable inbound synchronisation from "
+        "any partner tenant that is not a known business relationship, and "
+        "remove accounts provisioned by it.",
+        "Locking out or resetting a provisioned account does not help: the "
+        "attacker provisions another from the tenant they control."),
+    "external_identity": (
+        "Review the external account, and remove it if the invitation was "
+        "not authorised.",
+        "An external identity holds its own credentials in another tenant, so "
+        "resetting passwords here does not affect it."),
     "service_principal": (
         "Review the application, and disable it if it was not authorised: "
         "Update-MgServicePrincipal -ServicePrincipalId <id> "
@@ -201,7 +266,13 @@ _REMEDIATION = {
         "Forwarding survives a password reset and a session revocation."),
 }
 
-_SEVERITY_ORDER = {"survives": 0, "partial": 1, "conditional": 1, "no": 2}
+# "tenant" is a tier above "survives", added once federation was modelled:
+# a consent grant survives a password reset and a token revocation but is
+# still scoped to what was consented. A federated domain is not scoped to an
+# account at all, so deleting the compromised user changes nothing. Ranking
+# the two equally would have told a reader they were comparable.
+_SEVERITY_ORDER = {"tenant": -1, "survives": 0, "partial": 1,
+                   "conditional": 1, "no": 2}
 
 
 # --------------------------------------------------------------------------
@@ -722,6 +793,10 @@ def analyze_persistence(sources, attacker_ips=(), compromise_dt=None,
     survives_both = [e for e in findings
                      if e.get("survives_password_reset") == "survives"
                      and e.get("survives_token_revocation") == "survives"]
+    # A tier above that: not scoped to an account at all, so account-level
+    # remediation is not merely insufficient, it is beside the point.
+    tenant_wide = [e for e in findings
+                   if e.get("survives_password_reset") == "tenant"]
 
     warnings = []
     if not sources:
@@ -746,6 +821,17 @@ def analyze_persistence(sources, attacker_ips=(), compromise_dt=None,
                 "an analyst to confirm each against known administrative "
                 "activity.")
 
+    # Stated whenever there is anything to revoke. Revocation reads as a
+    # checklist item without it; the lifetimes make it a deadline.
+    if findings:
+        warnings.append(
+            "Token lifetimes bound how long an unrevoked session stays "
+            "useful: a refresh token lives 90 days, a Primary Refresh Token "
+            "14, and access/ID/SAML tokens 1 hour. An attacker holding an "
+            "unrevoked refresh token has three months of access without "
+            "reauthenticating, and none of that use appears in the sign-in "
+            "log.")
+
     return {
         "available": bool(sources),
         "schema": SCHEMA,
@@ -754,6 +840,12 @@ def analyze_persistence(sources, attacker_ips=(), compromise_dt=None,
         "counts": dict(counts),
         "confirmed_count": len(confirmed),
         "survives_both_count": len(survives_both),
+        "tenant_wide_count": len(tenant_wide),
+        "tenant_wide": [
+            {"kind": e["kind"], "activity": e.get("activity", ""),
+             "time": e.get("time", ""), "targets": e.get("targets", []),
+             "by_attacker": e.get("by_attacker", False)}
+            for e in tenant_wide],
         "mfa_state": sources.get("mfa") or [],
         "risk_detections": sorted(
             (sources.get("risk_detections") or []),
