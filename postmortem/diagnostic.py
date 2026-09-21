@@ -424,6 +424,16 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "sessions": {
                 k: v for k, v in (audit_summary.get("sessions") or {}).items()
                 if isinstance(v, (int, bool))},
+            "client_profile": {
+                "system_only_ips": len((audit_summary.get("client_profile") or {})
+                                       .get("system_only_ips") or []),
+                "app_access_ips": len((audit_summary.get("client_profile") or {})
+                                      .get("app_access_ips") or []),
+                "classes": dict(Counter(
+                    c for r in ((audit_summary.get("client_profile") or {})
+                                .get("addresses") or [])
+                    for c, _n in r.get("classes", []))),
+            },
             "searches": {
                 k: v for k, v in (audit_summary.get("searches") or {}).items()
                 if isinstance(v, (int, bool))},

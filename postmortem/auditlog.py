@@ -871,6 +871,104 @@ def session_activity(events, attacker_ips, compromise_dt=None, limit=40):
     }
 
 
+# --------------------------------------------------------------------------
+# What kind of client did the reading
+#
+# ClientInfoString says how the mailbox was reached. Most of its values are a
+# person -- Outlook, OWA, a phone. Two are not: Exchange's own background
+# processes (RESTSystem, Substrate) and applications reaching the mailbox
+# through Graph or EWS on their own credentials -- an archiver, a ticketing
+# system, a journaling connector -- which read every message and never sign
+# in. Those look exactly like an attacker replaying a token, and until this
+# existed the token-replay test flagged them.
+#
+# This classifies; it does not clear. An application reading through Graph
+# is ALSO what an attacker's consent-granted app looks like, so a REST client
+# is reported with its app id for the analyst to check against the OAuth
+# grants, not excused. Only the service's own background classes are excused
+# from replay, and nothing here ever removes an address the rules named.
+# --------------------------------------------------------------------------
+_CLIENT_CLASSES = (
+    # (class, is_person, substrings matched against the lowercased string)
+    ("system", False, ("client=restsystem", "restsystem", "client=substrate",
+                       "substrate", "client=exchange;", "mailboxassistant",
+                       "client=ms-exchange-", "microsoft.exchange.")),
+    ("powershell", True, ("powershell", "remoteps", "client=exo",
+                          "exchange online powershell")),
+    ("ews", True, ("client=webservices", "exchangewebservices", "ews/")),
+    ("activesync", True, ("client=activesync", "activesync", "outlook-ios",
+                          "outlook-android", "client=outlookservice")),
+    ("mobile", True, ("outlook mobile", "client=outlook mobile", "iphone",
+                      "android", "ipad")),
+    ("owa", True, ("client=owa", "action=viaproxy")),
+    ("desktop", True, ("client=msexchangerpc", "msexchangerpc", "client=hx",
+                       "mapi", "client=outlookdesktop")),
+    ("rest", True, ("client=rest", "graph")),
+)
+
+
+def classify_client(client_info):
+    """One of system|powershell|ews|activesync|mobile|owa|desktop|rest|other."""
+    s = str(client_info or "").lower()
+    if not s:
+        return "unknown"
+    for cls, _person, needles in _CLIENT_CLASSES:
+        if any(n in s for n in needles):
+            return cls
+    return "other"
+
+
+def client_profile(events, attacker_ips):
+    """Per address: which client classes it used, and whether any is a person.
+
+    An address whose every operation came from a background class is not a
+    session anyone sat at. That is what separates a journaling connector
+    reading 10,000 messages from an intruder reading 10,000 messages.
+    """
+    attacker_ips = set(attacker_ips or ())
+    prof = {}
+    for e in events:
+        ip = e["client_ip"]
+        if not ip:
+            continue
+        cls = classify_client(e.get("client_info"))
+        p = prof.setdefault(ip, {"ip": ip, "classes": Counter(), "events": 0,
+                                 "app_ids": Counter(), "strings": Counter()})
+        p["events"] += 1
+        p["classes"][cls] += 1
+        ad = e.get("audit") or {}
+        app = str(ad.get("AppId") or ad.get("ClientAppId") or "").strip()
+        if app and cls in ("rest", "ews", "other"):
+            p["app_ids"][app] += 1
+        if e.get("client_info"):
+            p["strings"][str(e["client_info"])[:70]] += 1
+
+    out = []
+    for p in prof.values():
+        classes = dict(p["classes"])
+        person = any(cls not in ("system", "unknown") for cls in classes)
+        only_system = bool(classes) and all(cls in ("system", "unknown")
+                                            for cls in classes) \
+            and classes.get("system", 0) > 0
+        out.append({
+            "ip": p["ip"], "events": p["events"],
+            "classes": p["classes"].most_common(),
+            "person_client": person,
+            "system_only": only_system,
+            "app_ids": p["app_ids"].most_common(3),
+            "top_client": (p["strings"].most_common(1) or [("", 0)])[0][0],
+            "is_attacker": p["ip"] in attacker_ips,
+        })
+    out.sort(key=lambda r: (not r["is_attacker"], -r["events"]))
+    return {
+        "available": any(r["classes"] for r in out),
+        "addresses": out[:60],
+        "system_only_ips": sorted(r["ip"] for r in out if r["system_only"]),
+        "app_access_ips": sorted(r["ip"] for r in out
+                                 if any(c in ("rest", "ews") for c, _n in r["classes"])),
+    }
+
+
 def _ip_activity(events, attacker_ips):
     """Per-client-IP operation profile, for attribution and geolocation.
 
@@ -1290,6 +1388,7 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
         "attacker_operation_counts": Counter(
             x["operation"] for x in attacker_operations).most_common(),
         "ip_activity": _ip_activity(events, attacker_ips),
+        "client_profile": client_profile(events, attacker_ips),
         "sessions": session_activity(events, attacker_ips, compromise_dt),
         "rule_cleanup": rule_cleanup(events, attacker_ips, current_rules),
         "access_profile": access_profile(events, attacker_ips),

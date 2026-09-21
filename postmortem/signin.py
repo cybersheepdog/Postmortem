@@ -1339,10 +1339,26 @@ def find_token_replay(signin_summary, audit_summary, min_events=3):
         return {"assessed": False,
                 "reason": "No addresses were read from the sign-in export."}
 
-    replay, outside = [], 0
+    # The service's own background processes never sign in, so an address
+    # whose every operation is RESTSystem/Substrate is not replaying anything.
+    # An application reading through Graph or EWS on its own credentials
+    # does not sign in as the user either -- but that is ALSO what an
+    # attacker's consent-granted app looks like, so it is labelled, not
+    # excused: the analyst checks the app id against the OAuth grants.
+    cp = a.get("client_profile") or {}
+    system_only = set(cp.get("system_only_ips") or ())
+    app_access = set(cp.get("app_access_ips") or ())
+    by_ip = {r["ip"]: r for r in (cp.get("addresses") or [])}
+
+    replay, outside, excused = [], 0, []
     for row in activity:
         ip = str(row.get("ip") or "")
         if not ip or ip in authenticated:
+            continue
+        if ip in system_only:
+            excused.append({"ip": ip, "events": row.get("events"),
+                            "why": "every operation from an Exchange "
+                                   "background client (RESTSystem/Substrate)"})
             continue
         ops = {str(k).lower().replace(" ", "") for k, _n in (row.get("operations") or [])}
         if not (ops & _TOKEN_BEARING_OPS):
@@ -1359,8 +1375,12 @@ def find_token_replay(signin_summary, audit_summary, min_events=3):
             if ends_before or starts_after:
                 outside += 1
                 continue
+        prof = by_ip.get(ip) or {}
         replay.append({
             "ip": ip, "events": row.get("events"),
+            "app_access": ip in app_access,
+            "app_ids": [a for a, _n in (prof.get("app_ids") or [])],
+            "client": prof.get("top_client", ""),
             "users": row.get("users"), "first": rf, "last": rl,
             "is_attacker": bool(row.get("is_attacker")),
             "country": row.get("country", ""), "asn": row.get("asn", ""),
@@ -1375,12 +1395,20 @@ def find_token_replay(signin_summary, audit_summary, min_events=3):
         "replay": replay,
         "replay_count": len(replay),
         "outside_window": outside,
+        "excused_system": excused,
+        "app_access_count": sum(1 for r in replay if r["app_access"]),
         "note": ("Each address below performed mailbox operations inside the "
                  "sign-in log's own window without any authentication being "
                  "recorded for it. A token obtained by refreshing an earlier "
                  "one leaves exactly this trace: the access happens, and "
                  "Entra logs nothing. Addresses whose activity falls outside "
-                 "the sign-in window are excluded rather than claimed."),
+                 "the sign-in window are excluded rather than claimed, and so "
+                 "are addresses whose every operation came from an Exchange "
+                 "background client. An address marked APP reached the "
+                 "mailbox through Graph or EWS on an application's own "
+                 "credentials: an archiver or a ticketing system does that, "
+                 "and so does an attacker's consent-granted app -- check the "
+                 "app id against the OAuth grants."),
     }
 
 

@@ -7370,3 +7370,88 @@ def test_a_device_vouched_address_never_seeds_attribution_on_the_audit_side(tmp_
                           owner_ips=s["owner_ips"])
     assert a["derived"]["attacker_ips"] == [UAL_ATK]
     assert a["owner_vetoed_ips"] == ["198.51.100.77"]
+
+
+# --------------------------------------------------------------------------
+# ClientInfoString: the service's own background processes and applications
+# reading through Graph/EWS never sign in, and looked exactly like token
+# replay. Classified, not cleared -- an attacker's consent-granted app reads
+# through Graph too.
+# --------------------------------------------------------------------------
+def test_client_strings_classify(tmp_path):
+    from postmortem.auditlog import classify_client
+
+    assert classify_client("Client=REST;Client=RESTSystem;") == "system"
+    assert classify_client("Client=Substrate") == "system"
+    assert classify_client("Client=OWA;Action=ViaProxy") == "owa"
+    assert classify_client("Client=MSExchangeRPC") == "desktop"
+    assert classify_client("Client=WebServices;ExchangeWebServices/1.0") == "ews"
+    assert classify_client("Client=REST;") == "rest"
+    assert classify_client("Client=OutlookService;Outlook-iOS/2.0") == "activesync"
+    assert classify_client("") == "unknown"
+
+
+def test_a_system_only_address_is_excused_from_token_replay(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.signin import find_token_replay
+
+    rows = [_urule(UAL_ATK)]
+    rows += [_uread("198.51.100.30", "<s%d@acme.com>" % i,
+                    ClientInfoString="Client=REST;Client=RESTSystem;",
+                    when="2026-08-27T10:%02d:00" % i) for i in range(6)]
+    rows += [_uread("45.147.230.99", "<r%d@acme.com>" % i,
+                    ClientInfoString="Client=OWA;Action=ViaProxy",
+                    when="2026-08-27T11:%02d:00" % i) for i in range(6)]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert "198.51.100.30" in a["client_profile"]["system_only_ips"]
+
+    out = find_token_replay(
+        {"available": True, "all_signin_ips": ["203.0.113.10"],
+         "coverage": {"first_event": "2026-08-27 09:00:00",
+                      "last_event": "2026-08-27 19:00:00"}}, a)
+    assert [r["ip"] for r in out["replay"]] == ["45.147.230.99"]
+    assert [e["ip"] for e in out["excused_system"]] == ["198.51.100.30"]
+
+
+def test_an_application_reading_through_graph_is_labelled_not_excused(tmp_path):
+    # The archiver and the attacker's consent-granted app look the same
+    # here. Reported with the app id; the OAuth grants decide.
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.signin import find_token_replay
+
+    rows = [_urule(UAL_ATK)]
+    rows += [_uread("198.51.100.40", "<g%d@acme.com>" % i,
+                    ClientInfoString="Client=REST;", AppId="1111-aaaa",
+                    when="2026-08-27T10:%02d:00" % i) for i in range(6)]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    out = find_token_replay(
+        {"available": True, "all_signin_ips": ["203.0.113.10"],
+         "coverage": {"first_event": "2026-08-27 09:00:00",
+                      "last_event": "2026-08-27 19:00:00"}}, a)
+    assert out["replay_count"] == 1 and out["app_access_count"] == 1
+    r = out["replay"][0]
+    assert r["app_access"] is True and r["app_ids"] == ["1111-aaaa"]
+
+
+def test_a_person_client_from_the_same_address_makes_it_not_system_only(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uread("198.51.100.30", "<a@acme.com>",
+                   ClientInfoString="Client=REST;Client=RESTSystem;"),
+            _uread("198.51.100.30", "<b@acme.com>",
+                   ClientInfoString="Client=OWA;Action=ViaProxy",
+                   when="2026-08-27T10:05:00")]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert "198.51.100.30" not in a["client_profile"]["system_only_ips"]
+
+
+def test_a_rule_named_address_is_never_excused_by_its_client(tmp_path):
+    # Nothing here removes an address the rules named.
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uread(UAL_ATK, "<a@acme.com>",
+                   ClientInfoString="Client=REST;Client=RESTSystem;")]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert UAL_ATK in a["derived"]["attacker_ips"]
