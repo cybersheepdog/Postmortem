@@ -638,6 +638,123 @@ def delegate_access(events, known_delegates=(), attacker_ips=()):
     }
 
 
+def session_ips(events, attacker_ips, owner_ips=()):
+    """Every address that shares an authenticated session with an attacker one.
+
+    Exchange stamps each operation with the SessionId of the logon it ran
+    under. A residential-proxy attacker rotates addresses mid-session; keyed
+    on IP, the same session fragments into one attributed piece and several
+    unattributed ones. Keyed on session, an address seen in a session that
+    also contains a known attacker address is the attacker's -- it is the
+    same logon.
+
+    Owner addresses are never pulled in this way: if the owner's own machine
+    somehow shares a SessionId with an attacker address, that is a finding to
+    show, not a reason to relabel the owner.
+    """
+    attacker_ips = set(attacker_ips or ())
+    owner = set(owner_ips or ())
+    by_session = {}
+    for e in events:
+        sid = e.get("session_id")
+        if sid and e["client_ip"]:
+            by_session.setdefault(sid, set()).add(e["client_ip"])
+    found = set()
+    for sid, ips in by_session.items():
+        if ips & attacker_ips:
+            found |= ips
+    return (found - attacker_ips) - owner
+
+
+def session_activity(events, attacker_ips, compromise_dt=None, limit=40):
+    """The investigation as an analyst reads it: one row per logon session.
+
+    Five hundred flat audit rows say nothing; "session 3, 14:02-14:47, from
+    45.x, read 130, deleted 29, created a rule" says everything. Sessions
+    are the unit an intruder actually works in, and the unit a client can
+    follow.
+    """
+    attacker_ips = set(attacker_ips or ())
+    groups = {}
+    unsessioned = 0
+    for e in events:
+        sid = e.get("session_id")
+        if not sid:
+            unsessioned += 1
+            continue
+        g = groups.setdefault(sid, {
+            "session_id": sid, "user": e["user"], "ips": set(), "events": 0,
+            "operations": Counter(), "first": None, "last": None,
+            "reads": 0, "sync_reads": 0, "throttled": 0, "deletes": 0,
+            "sends": 0, "rules": 0, "files": 0, "folders": Counter(),
+            "client_info": Counter(),
+        })
+        g["events"] += 1
+        g["operations"][e["operation"]] += 1
+        if e["client_ip"]:
+            g["ips"].add(e["client_ip"])
+        ts = e["timestamp"]
+        if ts:
+            g["first"] = ts if g["first"] is None or ts < g["first"] else g["first"]
+            g["last"] = ts if g["last"] is None or ts > g["last"] else g["last"]
+        op = e["op_lower"]
+        if op == "mailitemsaccessed":
+            g["reads"] += 1
+            if e.get("access_type") == "sync":
+                g["sync_reads"] += 1
+            if e.get("throttled"):
+                g["throttled"] += 1
+            for f in e.get("folders") or []:
+                g["folders"][f] += 1
+        elif op in ("harddelete", "softdelete", "movetodeleteditems"):
+            g["deletes"] += 1
+        elif op in ("send", "sendas", "sendonbehalf"):
+            g["sends"] += 1
+        elif op in _RULE_OPS:
+            g["rules"] += 1
+        elif op in _FILE_OPS:
+            g["files"] += 1
+        if e.get("client_info"):
+            g["client_info"][e["client_info"][:60]] += 1
+
+    rows = []
+    for g in groups.values():
+        atk = bool(g["ips"] & attacker_ips)
+        post = bool(g["first"] and compromise_dt and g["first"] >= compromise_dt)
+        rows.append({
+            "session_id": g["session_id"],
+            "user": g["user"],
+            "ips": sorted(g["ips"]),
+            "rotated": len(g["ips"]) > 1,
+            "is_attacker": atk,
+            "post_compromise": post,
+            "first": g["first"].strftime("%Y-%m-%dT%H:%M:%SZ") if g["first"] else "",
+            "last": g["last"].strftime("%Y-%m-%dT%H:%M:%SZ") if g["last"] else "",
+            "minutes": int((g["last"] - g["first"]).total_seconds() // 60)
+                       if (g["first"] and g["last"]) else 0,
+            "events": g["events"],
+            "reads": g["reads"], "sync_reads": g["sync_reads"],
+            "throttled": g["throttled"], "deletes": g["deletes"],
+            "sends": g["sends"], "rules": g["rules"], "files": g["files"],
+            "top_operations": g["operations"].most_common(5),
+            "folders": g["folders"].most_common(4),
+            "client": (g["client_info"].most_common(1) or [("", 0)])[0][0],
+        })
+    # Attacker sessions first, then anything post-compromise, then by start.
+    rows.sort(key=lambda r: (not r["is_attacker"], not r["post_compromise"],
+                             r["first"]))
+    attacker_rows = [r for r in rows if r["is_attacker"]]
+    return {
+        "available": bool(groups),
+        "sessions_total": len(groups),
+        "unsessioned_events": unsessioned,
+        "attacker_sessions": len(attacker_rows),
+        "rotated_sessions": sum(1 for r in attacker_rows if r["rotated"]),
+        "sessions": rows[:limit],
+        "attacker": attacker_rows[:limit],
+    }
+
+
 def _ip_activity(events, attacker_ips):
     """Per-client-IP operation profile, for attribution and geolocation.
 
@@ -913,6 +1030,13 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
     owner_vetoed = sorted(attacker_ips & _owner)
     attacker_ips -= _owner
 
+    # Fourth route to an attacker address, and the one that defeats address
+    # rotation: any other address in a session that already contains an
+    # attacker one. Seeded here so the message index, exposure scope and
+    # per-address activity below all read the widened set once.
+    from_session = session_ips(events, attacker_ips, _owner)
+    attacker_ips |= from_session
+
     # Addresses that sent a message the investigator named as the attacker's.
     # Seeded here for the same reason as the block above: everything below
     # reads the set once, so a late addition would be invisible to it.
@@ -960,6 +1084,7 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
         # the subject established and which the rules did. Two independent
         # derivations of the same fact are worth more than one merged list.
         "attacker_ips_from_subject": sorted(subject_ips),
+        "attacker_ips_from_session": sorted(from_session),
         "attacker_sends": subject_sends,
         "attacker_send_count": len(subject_sends),
     }
@@ -983,6 +1108,7 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
         "attacker_operation_counts": Counter(
             x["operation"] for x in attacker_operations).most_common(),
         "ip_activity": _ip_activity(events, attacker_ips),
+        "sessions": session_activity(events, attacker_ips, compromise_dt),
         "access_profile": access_profile(events, attacker_ips),
         "file_activity": file_activity(events, attacker_ips, compromise_dt),
         "delegate_access": delegate_access(events, known_delegates,

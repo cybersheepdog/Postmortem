@@ -6535,3 +6535,94 @@ def test_the_exposure_csv_is_one_row_per_message_read(tmp_path):
     assert rows[0]["throttled"] == "yes" and rows[0]["access_type"] == "sync"
     assert rows[1]["in_corpus"] == "no"
     assert list(rows[0].keys()) == EXPOSURE_COLUMNS
+
+
+# --------------------------------------------------------------------------
+# Sessions. Exchange stamps each operation with the SessionId of the logon it
+# ran under. A residential-proxy attacker rotates addresses mid-session;
+# keyed on IP the same logon fragments into one attributed piece and several
+# unattributed ones. Keyed on session it is one thing.
+# --------------------------------------------------------------------------
+ROTATED = "45.147.230.89"
+
+
+def test_an_address_sharing_a_session_with_the_attacker_is_the_attacker(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),                                        # seeds UAL_ATK
+            _uread(UAL_ATK, "<m1@acme.com>", session="sess-A",
+                   when="2026-08-27T10:00:00"),
+            _uread(ROTATED, "<m2@acme.com>", session="sess-A",      # same logon, new IP
+                   when="2026-08-27T10:05:00"),
+            _uread("198.51.100.20", "<m3@acme.com>", session="sess-B",  # unrelated
+                   when="2026-08-27T11:00:00")]
+    out = analyze_audit_log(_audit_file(tmp_path, rows))
+    d = out["derived"]
+    assert ROTATED in d["attacker_ips"]
+    assert d["attacker_ips_from_session"] == [ROTATED]
+    assert "198.51.100.20" not in d["attacker_ips"]
+    # and the message read from the rotated address is now attributed
+    hit = out["message_index"]["by_message_id"]["<m2@acme.com>"][0]
+    assert hit["by_attacker"] is True
+
+
+def test_the_owner_is_never_pulled_in_by_a_shared_session(tmp_path):
+    # If the owner's own machine somehow shares a SessionId with an attacker
+    # address, that is a finding to show, not a reason to relabel the owner.
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uread(UAL_ATK, "<m1@acme.com>", session="sess-A"),
+            _uread(UAL_OWNER, "<m2@acme.com>", session="sess-A")]
+    out = analyze_audit_log(_audit_file(tmp_path, rows), owner_ips=[UAL_OWNER])
+    assert UAL_OWNER not in out["derived"]["attacker_ips"]
+    assert out["derived"]["attacker_ips_from_session"] == []
+
+
+def test_events_without_a_session_id_are_not_grouped_together(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uread(UAL_ATK, "<m1@acme.com>", session=""),
+            _uread("198.51.100.20", "<m2@acme.com>", session="")]
+    out = analyze_audit_log(_audit_file(tmp_path, rows))
+    assert "198.51.100.20" not in out["derived"]["attacker_ips"]
+    assert out["sessions"]["unsessioned_events"] >= 2
+
+
+def test_the_session_view_summarises_what_each_logon_did(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK, when="2026-08-27T09:00:00")]
+    rows[0] = json.loads(json.dumps(rows[0]))
+    ad = json.loads(rows[0]["AuditData"]); ad["SessionId"] = "sess-A"
+    rows[0]["AuditData"] = json.dumps(ad)
+    rows += [_uread(UAL_ATK, "<m%d@acme.com>" % i, session="sess-A",
+                    access="Sync" if i < 3 else "Bind", throttled=(i == 9),
+                    when="2026-08-27T09:%02d:00" % (i + 1)) for i in range(10)]
+    rows += [_uev("HardDelete", UAL_ATK, when="2026-08-27T09:30:00", SessionId="sess-A",
+                  AffectedItems=[{"InternetMessageId": "<m1@acme.com>"}]),
+             _uev("Send", UAL_ATK, when="2026-08-27T09:40:00", SessionId="sess-A",
+                  Item={"InternetMessageId": "<s1@acme.com>", "Subject": "Remit"}),
+             _uev("FileDownloaded", UAL_ATK, when="2026-08-27T09:45:00",
+                  SessionId="sess-A", ObjectId="https://t/x/a.xlsx")]
+    s = analyze_audit_log(_audit_file(tmp_path, rows))["sessions"]
+    assert s["available"] and s["attacker_sessions"] == 1
+    r = s["attacker"][0]
+    assert r["session_id"] == "sess-A" and r["is_attacker"] is True
+    assert r["reads"] == 10 and r["sync_reads"] == 3 and r["throttled"] == 1
+    assert r["deletes"] == 1 and r["sends"] == 1 and r["rules"] == 1 and r["files"] == 1
+    assert r["minutes"] == 45
+    assert r["rotated"] is False
+
+
+def test_attacker_sessions_sort_first(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_uread("198.51.100.20", "<a@acme.com>", session="sess-owner",
+                   when="2026-08-27T08:00:00"),
+            _urule(UAL_ATK, when="2026-08-27T09:00:00"),
+            _uread(UAL_ATK, "<b@acme.com>", session="sess-atk",
+                   when="2026-08-27T10:00:00")]
+    s = analyze_audit_log(_audit_file(tmp_path, rows))["sessions"]
+    assert s["sessions"][0]["session_id"] == "sess-atk"

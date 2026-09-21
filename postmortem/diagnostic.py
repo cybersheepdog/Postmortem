@@ -413,6 +413,12 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
                                         or {}).get("principals") or []),
             "delegate_unknown": (audit_summary.get("delegate_access")
                                  or {}).get("unknown_count", 0),
+            "sessions": {
+                k: v for k, v in (audit_summary.get("sessions") or {}).items()
+                if isinstance(v, (int, bool))},
+            "attacker_ips_from_session": len(
+                (audit_summary.get("derived") or {}).get(
+                    "attacker_ips_from_session") or []),
             "containment_supplied": bool(audit_summary.get("containment_date")),
             "response_events": audit_summary.get("response_events", 0),
             "owner_vetoed": len(audit_summary.get("owner_vetoed_ips") or []),

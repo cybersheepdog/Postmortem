@@ -537,7 +537,7 @@ from postmortem.reporting import (  # noqa: E402
     print_persistence, print_remediation, print_mes_manifest,
     print_directory, print_message_trace, print_notification_scope,
     print_token_replay, print_file_activity, print_delegate_access,
-    print_case_answers,
+    print_case_answers, print_sessions,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -2064,6 +2064,7 @@ def main():
             for _k in ("_first_dt", "_last_dt"):
                 (audit_summary.get("coverage") or {}).pop(_k, None)
             print_audit_summary(audit_summary, audit_warnings)
+            print_sessions(audit_summary.get('sessions'))
             print_file_activity(audit_summary.get('file_activity'))
             print_delegate_access(audit_summary.get('delegate_access'))
 
