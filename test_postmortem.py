@@ -7679,3 +7679,171 @@ def test_signin_summary_exposes_per_user_countries(tmp_path):
     assert uc["ana@acme.com"]["US"] == 1
     assert uc["ana@acme.com"]["_n"] == _MIN_HISTORY + 1
     assert "newbie@acme.com" not in uc, "too little history to be a baseline"
+
+
+# --------------------------------------------------------------------------
+# A sign-in export that stopped at a page cap looks like a round number
+# --------------------------------------------------------------------------
+def _fake_files(sizes):
+    files = ["f%02d.json" % i for i in range(len(sizes))]
+    records = [(f, {}) for f, n in zip(files, sizes) for _ in range(n)]
+    return files, records
+
+
+def test_every_file_at_the_same_page_cap_is_suspected():
+    from postmortem.signin import export_truncation
+
+    t = export_truncation(*_fake_files([1000] * 5))
+    assert t["suspected"] is True and t["all_at_cap"] is True
+    assert t["page_cap"] == 1000 and t["files_at_cap"] == 5
+
+
+def test_a_paged_export_with_a_partial_last_file_is_not_suspected():
+    from postmortem.signin import export_truncation
+
+    # Four full pages and a short tail: that is what following nextLink
+    # into one file per page looks like.
+    t = export_truncation(*_fake_files([1000, 1000, 1000, 1000, 217]))
+    assert t["suspected"] is False
+    assert t["files_at_cap"] == 4
+
+
+def test_one_round_file_among_many_is_a_coincidence():
+    from postmortem.signin import export_truncation
+
+    t = export_truncation(*_fake_files([812, 1000, 433, 1211, 90]))
+    assert t["suspected"] is False
+
+
+def test_nearly_all_at_cap_and_none_larger_is_suspected():
+    from postmortem.signin import export_truncation
+
+    # A per-day export where most days hit the cap, no day exceeds it, and
+    # the short day is in the middle: the cap, not the tenant, set the
+    # ceiling. (A short LAST file is the honest paged shape, tested above.)
+    t = export_truncation(*_fake_files([1000] * 4 + [640] + [1000] * 5))
+    assert t["suspected"] is True and t["all_at_cap"] is False
+
+
+def test_a_single_file_export_is_never_suspected_on_size_alone():
+    from postmortem.signin import export_truncation
+
+    assert export_truncation(*_fake_files([1000]))["suspected"] is False
+
+
+def test_the_summary_carries_and_warns_on_truncation(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    d = tmp_path / "s"
+    d.mkdir()
+    for i in range(3):
+        rows = [_si("u%d@acme.com" % (i * 500 + k), "203.0.113.%d" % (k % 200 + 1),
+                    "2026-08-%02dT09:%02d:00" % (1 + i, k % 60))
+                for k in range(500)]
+        (d / ("p%d.json" % i)).write_text(json.dumps(rows), encoding="utf-8")
+    s = analyze_signin_logs(str(d))
+    tr = s["coverage"]["truncation"]
+    assert tr["suspected"] is True and tr["page_cap"] == 500
+    assert any("page cap" in w for w in s["warnings"])
+
+
+# --------------------------------------------------------------------------
+# D1: two scores, both named wherever either is shown
+# --------------------------------------------------------------------------
+def test_the_terminal_top_list_names_both_scores(capsys):
+    from postmortem.reporting import print_summary
+
+    hi_priority = _msg(path="a.eml", subject="a", is_inbound=True)
+    hi_priority.score, hi_priority.scenario_score, hi_priority.tier = 40, 3, 2
+    hi_initial = _msg(path="b.eml", subject="b", is_inbound=True)
+    hi_initial.score, hi_initial.scenario_score, hi_initial.tier = 5, 31, 1
+    print_summary([hi_priority, hi_initial], [], {})
+    out = capsys.readouterr().out
+    assert "PRIORITY  40 | INITIAL   3" in out
+    assert "PRIORITY   5 | INITIAL  31" in out
+    assert "SCORE  40" not in out, "the bare label hid which score it was"
+    assert "priority_score and initial_email_score" in out
+
+
+def test_tier_one_below_the_fold_is_counted(capsys):
+    from postmortem.reporting import print_summary
+
+    rows = []
+    for i in range(22):
+        r = _msg(path="p%02d.eml" % i, subject="s%d" % i, is_inbound=True)
+        r.score, r.scenario_score, r.tier = 50 - i, 0, 3
+        rows.append(r)
+    low = _msg(path="tier1.eml", subject="lure", is_inbound=True)
+    low.score, low.scenario_score, low.tier = 1, 33, 1
+    rows.append(low)
+    print_summary(rows, [], {})
+    out = capsys.readouterr().out
+    assert "1 more Tier 1 message(s) rank below the top 20" in out
+
+
+def test_html_candidates_table_labels_both_scores():
+    from postmortem import reporting
+    import inspect
+
+    src = inspect.getsource(reporting)
+    assert 'title="Initial-email score' in src
+    assert 'title="Priority score' in src
+    assert '>Init</th>' not in src
+
+
+# --------------------------------------------------------------------------
+# Three readability nits from the v84 diagnostic
+# --------------------------------------------------------------------------
+def test_a_stray_bracket_never_reaches_the_domain():
+    from postmortem.utils import normalize_email, domain_of
+
+    assert normalize_email("<a@b.example>>") == "a@b.example"
+    assert normalize_email("a@b.example>") == "a@b.example"
+    assert domain_of("a@b.example>") == "b.example"
+    assert domain_of("<<a@b.example>>") == "b.example"
+
+
+def test_reply_to_mismatch_names_a_clean_domain():
+    from postmortem.scoring import run_scenario_analysis
+    from postmortem.models import Anchors
+
+    r = _msg(sender_email="a@acme.com", sender_domain="acme.com",
+             auth={"reply_to": "Ops <ops@evil.example>>"})
+    run_scenario_analysis([r], {"acme.com"}, Anchors())
+    assert r.reply_to_address == "ops@evil.example"
+    hit = [i for i in r.indicators if i.startswith("Reply-To domain")]
+    assert hit and "(evil.example)" in hit[0], hit
+    assert ">)" not in hit[0]
+
+
+def test_auth_failure_with_no_sender_domain_is_named_not_blank():
+    from postmortem.scoring import apply_baseline_modifiers
+
+    r = _msg(sender_email="", sender_domain="",
+             auth={"dmarc_fail": True, "spf_fail": True, "dkim_fail": True})
+    lines = []
+
+    def add(text, weight, **kw):
+        lines.append(text)
+
+    baseline = {"domain_counts": {}, "established": set(),
+                "auth_seen": {"": 50}, "auth_pass": {"": 50}}
+    apply_baseline_modifiers(r, 10, baseline, add)
+    assert lines, "a hard failure still scores"
+    assert "Authentication failed for " not in [
+        x for x in lines if x.endswith("for ")]
+    assert any("no parseable sender domain" in x for x in lines), lines
+    assert not any("normally authenticates" in x for x in lines), \
+        "the empty key must not pool into a baseline"
+
+
+def test_diagnostic_coverage_warnings_are_counted_by_severity():
+    from postmortem import diagnostic
+
+    audit = {"coverage": {}, "coverage_warnings": [
+        {"severity": "high", "text": "a"}, {"severity": "high", "text": "b"},
+        {"severity": "medium", "text": "c"}]}
+    doc = diagnostic.build([], verdict={}, audit_summary=audit, manifest={})
+    assert doc["audit_log"]["coverage_warnings"] == {"high": 2, "medium": 1}
+    text = diagnostic.render(doc)
+    assert "high=2" in text and "medium=1" in text

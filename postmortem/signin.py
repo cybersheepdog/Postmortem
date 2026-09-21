@@ -246,6 +246,56 @@ def load(path, progress=None):
     return files, records
 
 
+# Request page sizes at which an exporter stops if it does not follow the
+# @odata.nextLink. Graph signIns pages at 1000 by default; MES and other
+# scripts sometimes write 500 or 5000 per call.
+_PAGE_CAPS = (500, 999, 1000, 5000, 10000)
+
+
+def export_truncation(files, records):
+    """Did the exporter stop at a page boundary rather than at the data?
+
+    A sign-in export that is exactly N files of exactly 1000 records is far
+    more likely to be an exporter honouring a per-request cap than a tenant
+    that happened to sign in a round number of times. Every file at the same
+    cap -- including the last one, which a paged export would normally leave
+    partial -- is the tell. The tool cannot see what was not exported, so
+    this cannot confirm truncation; it says when the shape demands a check.
+    """
+    per_file = Counter(src for src, _f in records)
+    if not per_file:
+        return {"checked": False}
+    sizes = sorted(per_file.values())
+    # Files in export order, so "the last file is the short one" -- the
+    # honest paged shape -- can be told from "a file in the middle is".
+    order = [os.path.basename(f) for f in files if os.path.basename(f) in per_file]
+    last = order[-1] if order else None
+    at_cap = Counter(n for n in sizes if n in _PAGE_CAPS)
+    cap, cap_files = (at_cap.most_common(1)[0] if at_cap else (0, 0))
+    out = {
+        "checked": True,
+        "files": len(per_file),
+        "min_records": sizes[0],
+        "max_records": sizes[-1],
+        "page_cap": cap,
+        "files_at_cap": cap_files,
+        "all_at_cap": bool(cap) and cap_files == len(per_file),
+        "suspected": False,
+    }
+    # One file at exactly 1000 is a coincidence; every file at 1000 is not.
+    # A file-per-page export leaves its last page partial, so "all" is the
+    # strong shape and "nearly all, none larger" the weaker one.
+    if out["all_at_cap"] and len(per_file) >= 2:
+        out["suspected"] = True
+    elif cap and cap_files >= max(2, 0.8 * len(per_file)) and sizes[-1] == cap:
+        short = [f for f, n in per_file.items() if n != cap]
+        # Exactly one short file and it is the last one written: that is
+        # a paged export ending on a partial page, not a cap.
+        if not (len(short) == 1 and short[0] == last):
+            out["suspected"] = True
+    return out
+
+
 # --------------------------------------------------------------------------
 # Detection
 # --------------------------------------------------------------------------
@@ -1000,6 +1050,7 @@ def analyze_signin_logs(path, devices=None):
     files, records = load(path)
     if not records:
         return {}
+    truncation = export_truncation(files, records)
 
     have_transfer = sum(1 for _s, f in records if get(f, "transfer", ""))
     have_protocol = sum(1 for _s, f in records if get(f, "protocol", ""))
@@ -1135,6 +1186,17 @@ def analyze_signin_logs(path, devices=None):
                for g in groups if g["verdict"] == "single"]
 
     warnings = []
+    if truncation.get("suspected"):
+        warnings.append(
+            "%d of %d file(s) hold exactly %d records. That is the shape of "
+            "an exporter stopping at a per-request page cap rather than at "
+            "the end of the data: a paged export normally leaves its last "
+            "file partial. If it is, every per-user baseline, AiTM profile "
+            "and token-replay window here is built on a partial log. Check "
+            "the exporter followed @odata.nextLink, or re-export in shorter "
+            "date intervals and compare the total."
+            % (truncation["files_at_cap"], truncation["files"],
+               truncation["page_cap"]))
     if blind:
         warnings.append(
             "Neither originalTransferMethod nor authenticationProtocol is "
@@ -1242,6 +1304,7 @@ def analyze_signin_logs(path, devices=None):
             "have_transfer": have_transfer,
             "have_protocol": have_protocol,
             "blind": blind,
+            "truncation": truncation,
         },
         "device_code_records": len(hits),
         "detected_by": dict(detected_by),

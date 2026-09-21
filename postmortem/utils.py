@@ -11,19 +11,27 @@ from functools import lru_cache
 from typing import Optional
 
 
+_ADDR_IN_TEXT = re.compile(r"[^\s<>\"',;]+@[^\s<>\"',;]+")
+
+
 def normalize_email(value: str) -> str:
     if not value:
         return ""
     _, address = parseaddr(value)
     if not address:
-        address = value
-    return address.strip().lower()
+        # parseaddr gives up on a malformed header such as
+        # "Ops <ops@b.example>>"; the address inside it is still legible.
+        m = _ADDR_IN_TEXT.search(value)
+        address = m.group(0) if m else value
+    # A stray bracket ("a@b.example>") otherwise stays on the address, and
+    # from there on the domain -- which is how "(<domain>>)" reached a report.
+    return address.strip().strip("<>").strip().lower()
 
 
 def domain_of(address: str) -> str:
     if "@" not in address:
         return ""
-    return address.rsplit("@", 1)[1].lower()
+    return address.rsplit("@", 1)[1].strip("<> ").lower()
 
 
 def normalize_message_id(value: str) -> str:

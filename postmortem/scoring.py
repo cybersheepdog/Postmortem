@@ -3605,9 +3605,14 @@ def apply_baseline_modifiers(record, score, baseline, add):
 
     # A hard alignment failure is the mirror image and carries real weight.
     if state == "failed":
-        seen = (baseline.get("auth_seen") or {}).get(dom, 0)
-        passed = (baseline.get("auth_pass") or {}).get(dom, 0)
-        if seen >= CONFIG.get("baseline_enforce_min", 3) and passed / max(1, seen) >= 0.5:
+        seen = (baseline.get("auth_seen") or {}).get(dom, 0) if dom else 0
+        passed = (baseline.get("auth_pass") or {}).get(dom, 0) if dom else 0
+        # No parseable sender domain is itself worth saying; an empty name
+        # in the sentence read as a rendering bug, and the "normally
+        # authenticates" branch would have pooled every such message under
+        # one empty key.
+        label = dom or "a message with no parseable sender domain"
+        if dom and seen >= CONFIG.get("baseline_enforce_min", 3) and passed / max(1, seen) >= 0.5:
             add(f"Authentication failed for {dom}, which normally authenticates",
                 6, category="auth", source="authentication_results",
                 matched=f"{passed}/{seen} previous message(s) passed")
@@ -3617,7 +3622,7 @@ def apply_baseline_modifiers(record, score, baseline, add):
             # the base rate over 7,323 messages, while scoring +3 -- below
             # several signals with a fraction of its discriminating power.
             _afw = CONFIG.get("priority_weights", {}).get("auth_fail_hard", 5)
-            add(f"Authentication failed for {dom}", _afw,
+            add(f"Authentication failed for {label}", _afw,
                 category="auth", source="authentication_results",
                 matched=f"{passed}/{seen} previous message(s) passed")
             delta += _afw

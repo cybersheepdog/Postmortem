@@ -399,8 +399,12 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "client_ips": cov.get("client_ips", 0),
             "messages_referenced": idx.get("messages_referenced", 0),
             "events_with_message_id": idx.get("events_with_message_id", 0),
-            "coverage_warnings": [w.get("severity", "")
-                                  for w in (audit_summary.get("coverage_warnings") or [])],
+            # Counts by severity. A flat list of severity strings rendered
+            # as the single word "high" once templated, which said nothing
+            # about how many or of what kind.
+            "coverage_warnings": dict(Counter(
+                w.get("severity", "") or "unknown"
+                for w in (audit_summary.get("coverage_warnings") or []))),
             "attacker_ips": sum(1 for x in (audit_summary.get("ip_activity") or [])
                                 if x.get("is_attacker")),
             "attacker_operations": (
@@ -481,6 +485,9 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "have_transfer": cov.get("have_transfer", 0),
             "have_protocol": cov.get("have_protocol", 0),
             "accounts": cov.get("accounts", 0),
+            "truncation": {
+                k: v for k, v in (cov.get("truncation") or {}).items()
+                if isinstance(v, (int, bool))},
             "device_code_records": signin_summary.get("device_code_records", 0),
             "owner_device_ips": len(signin_summary.get("owner_device_ips") or []),
             "devices_excluded_too_new": (signin_summary.get("owner_device_evidence")
