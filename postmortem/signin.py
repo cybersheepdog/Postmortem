@@ -34,7 +34,7 @@ import json
 import os
 import re
 from collections import Counter, OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 SCHEMA = "postmortem-signin/1"
 
@@ -641,6 +641,277 @@ def _single_leg_findings(buckets, victim_ips, hits=(), limit=50):
     return out[:limit]
 
 
+# --------------------------------------------------------------------------
+# Entry vectors beyond device code
+#
+# Device code is well covered above. The two vectors that dominate current
+# caseloads were not covered at all: adversary-in-the-middle (Evilginx,
+# EvilProxy, Tycoon), where the victim types real credentials and real MFA
+# into a proxy and the attacker replays the resulting session; and legacy
+# authentication, which never asks for MFA in the first place. Neither
+# leaves anything for the device code rules to find.
+# --------------------------------------------------------------------------
+
+# ClientAppUsed values that mean legacy (basic) authentication. Conditional
+# access and MFA do not apply to these protocols, which is the whole reason
+# an attacker with a password uses them. "Other clients" is the catch-all
+# Entra uses for legacy protocols it does not name.
+_LEGACY_CLIENT_APPS = ("imap4", "pop3", "authenticated smtp", "smtp",
+                       "exchange activesync", "exchange web services",
+                       "other clients", "mapi over http", "offline address book",
+                       "exchange online powershell", "autodiscover",
+                       "reporting web services")
+# The user agent Outlook-for-Android's basic-auth path sends, and the string
+# every legacy-auth spray tool copies because Entra lets it through.
+_LEGACY_AGENTS = ("bav2ropc",)
+
+# Error codes that mean the password was RIGHT and only the second factor
+# stood in the way. A run of these for one account from one address, ending
+# in a success, is MFA fatigue: the attacker had the password and pushed
+# prompts until one was approved.
+_MFA_GATE_CODES = {"50074", "50076", "500121", "50079", "50072"}
+# Wrong password. Many of these across many accounts from one address is a
+# spray; many for one account is brute force.
+_BAD_PASSWORD_CODES = {"50126", "50053", "50055", "50057"}
+
+_AITM_FLOOR = 6
+
+
+def error_code_of(flat):
+    err = flat.get("errorcode")
+    if err in (None, ""):
+        err = flat.get("resulttype") or ""
+    s = str(err).strip()
+    return "" if s in ("0", "None") else s
+
+
+def user_profiles(records):
+    """Per-user: where and how they normally sign in, from the log itself.
+
+    No shipped list can know that this user works from two countries or
+    always uses Edge. Their own successful sign-ins can. An ASN or country
+    that first appears on the event under assessment, and accounts for a
+    small share of that user's sign-ins overall, is the outlier -- the same
+    principle as the device code client baseline.
+    """
+    prof = {}
+    for _src, f in records:
+        user = str(get(f, "user", "")).lower()
+        if not user or not succeeded(f):
+            continue
+        p = prof.setdefault(user, {"asn": Counter(), "country": Counter(),
+                                   "agent": Counter(), "n": 0})
+        p["n"] += 1
+        asn = str(get(f, "asn", ""))
+        if asn:
+            p["asn"][asn] += 1
+        c = country_of(f)
+        if c:
+            p["country"][c] += 1
+        ua = short_agent(f, 30)
+        if ua and ua != "?":
+            p["agent"][ua] += 1
+    return prof
+
+
+_MIN_HISTORY = 5
+
+
+def _is_rare(counter, key, n, share=0.05, floor=2):
+    """Rare against THIS user's history -- which has to exist first.
+
+    With no successful sign-ins on record every ASN, country and client is
+    "new", and three location signals alone reached the reporting floor on a
+    user whose only prior events were failures. Nothing is rare against
+    nothing; below the minimum the location signals stay silent and the
+    token evidence has to carry the finding on its own.
+    """
+    if not key or n < _MIN_HISTORY:
+        return False
+    seen = counter.get(key, 0)
+    return seen <= max(floor, share * n)
+
+
+def assess_aitm(flat, profiles):
+    """Score one successful sign-in on the adversary-in-the-middle profile.
+
+    The victim authenticated for real -- real password, real MFA -- through
+    a proxy, and the attacker then presented the captured session. What the
+    log shows is a SUCCESSFUL sign-in that performed no fresh authentication
+    (MFA satisfied by a claim, or an incoming session token) from a place the
+    user has never signed in from. No single field is decisive; the
+    combination is.
+    """
+    if not succeeded(flat):
+        return 0, []
+    if is_device_code(flat)[0]:
+        return 0, []                 # covered by its own rules
+    reasons, score = [], 0
+    user = str(get(flat, "user", "")).lower()
+    p = profiles.get(user) or {"asn": Counter(), "country": Counter(),
+                               "agent": Counter(), "n": 0}
+
+    if token_claim_satisfied(flat):
+        reasons.append("presented an existing session token (%s)"
+                       % str(get(flat, "token_type", ""))[:24])
+        score += 3
+    if is_single_factor(flat):
+        reasons.append("MFA satisfied by a claim, not performed")
+        score += 2
+
+    asn = str(get(flat, "asn", ""))
+    if asn and _is_rare(p["asn"], asn, p["n"]):
+        reasons.append("ASN %s not seen for this user before" % asn)
+        score += 3
+    c = country_of(flat)
+    if c and _is_rare(p["country"], c, p["n"]):
+        reasons.append("country %s not seen for this user before" % c)
+        score += 2
+    ua = short_agent(flat, 30)
+    if ua and ua != "?" and _is_rare(p["agent"], ua, p["n"]):
+        reasons.append("client %s not seen for this user before" % ua)
+        score += 1
+
+    risk = str(get(flat, "risk", "")).strip().lower()
+    if risk in ("medium", "high"):
+        reasons.append("Identity Protection risk: %s" % risk)
+        score += 2
+    return score, reasons
+
+
+def aitm_candidates(records, profiles, victim_ips, limit=50):
+    """Successful sign-ins that fit the AiTM profile, ranked."""
+    out = []
+    for _src, f in records:
+        ip = str(get(f, "ip", ""))
+        if ip and ip in victim_ips:
+            continue
+        score, reasons = assess_aitm(f, profiles)
+        if score < 3:
+            continue
+        row = _leg_row(f)
+        row.update({"user": str(get(f, "user", "")) or "(unknown)",
+                    "score": score, "reasons": reasons,
+                    "indicated": score >= _AITM_FLOOR,
+                    "_dt": parse_time(get(f, "time", ""))})
+        out.append(row)
+    out.sort(key=lambda r: (-r["score"], r.get("time") or ""))
+    return out[:limit]
+
+
+def legacy_auth(records, affected_users=(), attacker_ips=()):
+    """Sign-ins over protocols that never ask for MFA.
+
+    Every one is reported, because legacy auth should be disabled and a
+    tenant that still allows it wants to know. The ones that matter are
+    successes for an affected account, or from an attacker address.
+    """
+    affected = {u.lower() for u in (affected_users or ()) if u}
+    attacker_ips = set(attacker_ips or ())
+    rows = []
+    for _src, f in records:
+        app = str(get(f, "client_app", "")).strip().lower()
+        ua = str(get(f, "user_agent", "")).lower()
+        legacy = any(a == app or a in app for a in _LEGACY_CLIENT_APPS) \
+            or any(a in ua for a in _LEGACY_AGENTS)
+        if not legacy:
+            continue
+        user = str(get(f, "user", "")).lower()
+        ip = str(get(f, "ip", ""))
+        row = _leg_row(f)
+        row.update({
+            "user": user or "(unknown)",
+            "protocol": str(get(f, "client_app", "")) or "BAV2ROPC",
+            "ok": succeeded(f),
+            "affected_user": user in affected,
+            "from_attacker": bool(ip and ip in attacker_ips),
+        })
+        rows.append(row)
+    rows.sort(key=lambda r: (not (r["ok"] and (r["affected_user"] or r["from_attacker"])),
+                             not r["ok"], r.get("time") or ""))
+    hits = [r for r in rows if r["ok"] and (r["affected_user"] or r["from_attacker"])]
+    return {
+        "available": bool(rows),
+        "total": len(rows),
+        "successes": sum(1 for r in rows if r["ok"]),
+        "protocols": Counter(r["protocol"] for r in rows).most_common(6),
+        "indicated": hits[:50],
+        "indicated_count": len(hits),
+        "rows": rows[:50],
+    }
+
+
+def failed_login_patterns(records, window_minutes=60, fatigue_min=5,
+                          spray_min_users=5):
+    """MFA fatigue and password spray, from the failure codes.
+
+    Fatigue: for one account from one address, a run of MFA-gate failures
+    (the password was right) followed by a success. Spray: from one address,
+    wrong-password failures across many accounts inside a window.
+    """
+    span = timedelta(minutes=window_minutes)
+    by_pair = {}
+    by_ip = {}
+    for _src, f in records:
+        code = error_code_of(f)
+        user = str(get(f, "user", "")).lower()
+        ip = str(get(f, "ip", ""))
+        dt = parse_time(get(f, "time", ""))
+        if not (user and ip and dt):
+            continue
+        by_pair.setdefault((user, ip), []).append((dt, code, succeeded(f), f))
+        if code in _BAD_PASSWORD_CODES:
+            by_ip.setdefault(ip, []).append((dt, user))
+
+    fatigue = []
+    for (user, ip), evs in by_pair.items():
+        evs.sort(key=lambda x: x[0])
+        gate = [e for e in evs if e[1] in _MFA_GATE_CODES]
+        if len(gate) < fatigue_min:
+            continue
+        # a success that follows the run, within the window of its last prompt
+        last_gate = gate[-1][0]
+        after = [e for e in evs if e[2] and e[0] >= last_gate
+                 and e[0] - last_gate <= span]
+        # the prompts themselves must be dense, not spread over a month
+        dense = (gate[-1][0] - gate[0][0]) <= span * 4
+        if after and dense:
+            fatigue.append({
+                "user": user, "ip": ip,
+                "prompts": len(gate),
+                "first_prompt": gate[0][0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "last_prompt": last_gate.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "approved_at": after[0][0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "location": short_location(after[0][3]),
+                "codes": sorted({e[1] for e in gate}),
+            })
+    fatigue.sort(key=lambda r: -r["prompts"])
+
+    spray = []
+    for ip, evs in by_ip.items():
+        evs.sort(key=lambda x: x[0])
+        # sliding window: the most users hit inside any span-long stretch
+        best, best_start = 0, None
+        j = 0
+        for i in range(len(evs)):
+            while evs[i][0] - evs[j][0] > span:
+                j += 1
+            users = {u for _d, u in evs[j:i + 1]}
+            if len(users) > best:
+                best, best_start = len(users), evs[j][0]
+        if best >= spray_min_users:
+            spray.append({
+                "ip": ip, "users_hit": best, "failures": len(evs),
+                "window_start": best_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "first": evs[0][0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "last": evs[-1][0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+    spray.sort(key=lambda r: -r["users_hit"])
+    return {"available": bool(by_pair), "fatigue": fatigue[:20],
+            "fatigue_count": len(fatigue), "spray": spray[:20],
+            "spray_count": len(spray)}
+
+
 def analyze_signin_logs(path):
     """Parse an Entra sign-in export and derive what the mail side can use.
 
@@ -758,6 +1029,11 @@ def analyze_signin_logs(path):
 
     single_leg = _single_leg_findings(buckets, victim_ips, hits)
 
+    profiles = user_profiles(records)
+    aitm = aitm_candidates(records, profiles, victim_ips)
+    legacy = legacy_auth(records, affected_users, attacker_ips)
+    failures = failed_login_patterns(records)
+
     times = sorted(str(get(f, "time", "")) for _s, f in records
                    if get(f, "time", ""))
     accounts = {str(get(f, "user", "")) for _s, f in records if get(f, "user", "")}
@@ -814,6 +1090,35 @@ def analyze_signin_logs(path):
             "injected event naming the attacker's own address as the victim's "
             "would otherwise exempt it from attribution for the whole report."
             % len(forged_veto_ips))
+
+    _ai = sum(1 for r in aitm if r["indicated"])
+    if _ai:
+        warnings.append(
+            "%d successful sign-in(s) fit the adversary-in-the-middle profile: "
+            "no fresh authentication performed (a session token presented, or "
+            "MFA satisfied by a claim) from an ASN or country this account has "
+            "not signed in from before. The victim authenticated for real "
+            "through a proxy; this is the attacker replaying the result. "
+            "Corroborate with a lure carrying a link in the minutes before."
+            % _ai)
+    if legacy.get("indicated_count"):
+        warnings.append(
+            "%d successful LEGACY-protocol sign-in(s) for an affected account "
+            "or from an attacker address (%s). Legacy authentication never "
+            "asks for MFA; a password alone is enough. Disable it tenant-wide."
+            % (legacy["indicated_count"],
+               ", ".join(p for p, _n in legacy["protocols"][:3])))
+    if failures.get("fatigue_count"):
+        warnings.append(
+            "%d MFA-fatigue pattern(s): a run of MFA prompts for one account "
+            "from one address, then an approval. The password was already "
+            "known; the prompts were pushed until one was accepted."
+            % failures["fatigue_count"])
+    if failures.get("spray_count"):
+        warnings.append(
+            "%d password-spray source(s): wrong-password failures across "
+            "many accounts from one address inside an hour."
+            % failures["spray_count"])
 
     _indicated = [r for r in single_leg if r["indicated"]]
     if _indicated:
@@ -877,6 +1182,11 @@ def analyze_signin_logs(path):
         "single_leg_findings": single_leg,
         "single_leg_count": len(single_leg),
         "indicated_count": sum(1 for r in single_leg if r["indicated"]),
+        "aitm": [{k: v for k, v in r.items() if not k.startswith("_")}
+                 for r in aitm],
+        "aitm_indicated": sum(1 for r in aitm if r["indicated"]),
+        "legacy_auth": legacy,
+        "login_failures": failures,
         "earliest_token": earliest.strftime("%Y-%m-%dT%H:%M:%SZ") if earliest else "",
         "_earliest_token_dt": earliest,
         "warnings": warnings,

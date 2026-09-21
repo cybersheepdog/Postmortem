@@ -59,6 +59,40 @@ def _entry(v, s):
                   "claim rather than by the user. Assessed per record; not "
                   "corroborated by a second leg.",
                   hit=True)
+    if s.get("aitm_indicated"):
+        n = s["aitm_indicated"]
+        L = (lures.get("aitm") or {})
+        c = len(L.get("candidates") or [])
+        return _a("How did they get in",
+                  "Adversary-in-the-middle indicated (%d sign-in%s replayed a "
+                  "captured session from a new location)" % (n, "" if n == 1 else "s")
+                  + (", %d lure candidate%s in the corpus" % (c, "" if c == 1 else "s")
+                     if c else ""),
+                  INFERRED,
+                  "A successful sign-in that performed no fresh authentication, "
+                  "from an ASN or country this account had never used. The "
+                  "victim authenticated for real through a proxy; this is the "
+                  "attacker replaying the result. Confirm against the lure.",
+                  hit=True)
+    lg = s.get("legacy_auth") or {}
+    if lg.get("indicated_count"):
+        return _a("How did they get in",
+                  "Legacy authentication: %d successful sign-in%s over a "
+                  "protocol that never asks for MFA (%s)"
+                  % (lg["indicated_count"], "" if lg["indicated_count"] == 1 else "s",
+                     ", ".join(p for p, _n in lg.get("protocols", [])[:2])),
+                  OBSERVED, "A password alone was enough. Disable legacy "
+                  "authentication tenant-wide.", hit=True)
+    lf = s.get("login_failures") or {}
+    if lf.get("fatigue_count"):
+        f0 = (lf.get("fatigue") or [{}])[0]
+        return _a("How did they get in",
+                  "MFA fatigue: %d prompt%s pushed to %s until one was approved"
+                  % (f0.get("prompts", 0), "" if f0.get("prompts") == 1 else "s",
+                     f0.get("user", "the account")),
+                  OBSERVED, "The password was already known; approval came at %s "
+                  "from %s." % (f0.get("approved_at", "?"), f0.get("location", "?")),
+                  hit=True)
     tr = s.get("token_replay") or {}
     if tr.get("replay_count"):
         return _a("How did they get in",
@@ -86,8 +120,9 @@ def _entry(v, s):
                   "The sign-in log was read and shows no device code attack, no "
                   "token replay and no indicated record. The corpus scored no "
                   "initial email above the floor.",
-                  gap="Consider AiTM: look for a sign-in from a new ASN within "
-                      "minutes of a lure click. Not yet detected automatically.")
+                  gap="If the sign-in export is interactive-only, non-interactive "
+                      "sign-ins carry the replayed-session events; re-export "
+                      "with both.")
     return _a("How did they get in", "Not assessed", NA,
               gap="Get-GraphEntraSignInLogs (include non-interactive; 30-day "
                   "retention).")

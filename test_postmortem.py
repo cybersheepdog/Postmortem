@@ -6751,3 +6751,207 @@ def test_a_removed_rule_gets_its_own_remediation_row(tmp_path):
     # and the live rule row carries the name tell
     live = next(a for a in acts if a["kind"] == "inbox_rule")
     assert "throwaway" in live["detail"]
+
+
+# --------------------------------------------------------------------------
+# Entry vectors beyond device code. AiTM: the victim authenticated for real
+# through a proxy and the attacker replayed the session -- a SUCCESSFUL
+# sign-in that performed no fresh authentication, from somewhere new. Legacy
+# auth: never asks for MFA. Fatigue: prompts pushed until one is approved.
+# --------------------------------------------------------------------------
+def _si(user, ip, when, ok=True, code=None, asn="AS7018", country="US",
+        agent="Mozilla/5.0 Edg/127", **over):
+    r = {"id": "%s-%s" % (user, when), "correlationId": "c-%s" % when,
+         "createdDateTime": when, "userPrincipalName": user, "ipAddress": ip,
+         "isInteractive": True, "status": {"errorCode": 0 if ok else int(code)},
+         "autonomousSystemNumber": asn, "location": {"countryOrRegion": country},
+         "userAgent": agent, "appDisplayName": "Office 365 Exchange Online",
+         "resourceDisplayName": "Exchange"}
+    r.update(over)
+    return r
+
+
+def _si_export(tmp_path, rows, name="s"):
+    import json as _j
+    d = tmp_path / name
+    d.mkdir()
+    (d / "s.json").write_text(_j.dumps(rows), encoding="utf-8")
+    return str(d)
+
+
+def _normal_history(user="ap@acme.com", days=20):
+    return [_si(user, "203.0.113.10", "2026-08-%02dT09:00:00Z" % (1 + i))
+            for i in range(days)]
+
+
+def test_a_replayed_session_from_a_new_asn_fits_the_aitm_profile(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = _normal_history() + [
+        _si("ap@acme.com", "45.147.230.88", "2026-08-27T10:14:00Z",
+            asn="AS9009", country="NL", agent="Mozilla/5.0 Chrome/120",
+            incomingTokenType="refreshToken",
+            authenticationRequirement="singleFactorAuthentication")]
+    out = analyze_signin_logs(_si_export(tmp_path, rows))
+    assert out["aitm_indicated"] == 1
+    top = out["aitm"][0]
+    assert top["ip"] == "45.147.230.88" and top["indicated"]
+    assert any("session token" in r for r in top["reasons"])
+    assert any("ASN AS9009" in r for r in top["reasons"])
+    assert any("adversary-in-the-middle" in w for w in out["warnings"])
+
+
+def test_the_users_own_new_laptop_at_home_is_not_aitm(tmp_path):
+    # New ASN, new agent -- but a full fresh authentication was performed.
+    # Two weak reasons do not reach the floor without the token evidence.
+    from postmortem.signin import analyze_signin_logs
+
+    rows = _normal_history() + [
+        _si("ap@acme.com", "198.51.100.7", "2026-08-27T10:14:00Z",
+            asn="AS22773", agent="Mozilla/5.0 Firefox/128",
+            authenticationRequirement="multiFactorAuthentication")]
+    out = analyze_signin_logs(_si_export(tmp_path, rows))
+    assert out["aitm_indicated"] == 0
+
+
+def test_a_device_code_signin_is_not_double_counted_as_aitm(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = _normal_history() + [
+        _si("ap@acme.com", "45.147.230.88", "2026-08-27T10:14:00Z",
+            asn="AS9009", originalTransferMethod="deviceCodeFlow",
+            incomingTokenType="refreshToken",
+            authenticationRequirement="singleFactorAuthentication")]
+    out = analyze_signin_logs(_si_export(tmp_path, rows))
+    assert out["aitm_indicated"] == 0
+    assert out["device_code_records"] == 1
+
+
+def test_the_aitm_lure_join_names_the_link_that_arrived_just_before(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+    from postmortem.scoring import aitm_lure_window
+
+    rows = _normal_history() + [
+        _si("ap@acme.com", "45.147.230.88", "2026-08-27T10:14:00Z",
+            asn="AS9009", country="NL", incomingTokenType="refreshToken",
+            authenticationRequirement="singleFactorAuthentication")]
+    s = analyze_signin_logs(_si_export(tmp_path, rows))
+
+    lure = make_record(sender_email="hr@acme-portal.example",
+                       sender_domain="acme-portal.example",
+                       subject="Updated payroll policy", path="/m/lure.eml",
+                       date="Thu, 27 Aug 2026 10:02:00 +0000")
+    lure.urls = ["https://acme-portal.example/login"]
+    lure.url_domains = ["acme-portal.example"]
+    lure.url_analysis = []; lure.body = "Please review."
+    lure.attachments = []; lure.attachment_details = []; lure.authentication_results = {}
+    nolink = make_record(sender_email="a@b.example", sender_domain="b.example",
+                         subject="Lunch", path="/m/no.eml",
+                         date="Thu, 27 Aug 2026 10:05:00 +0000")
+    nolink.urls = []; nolink.url_domains = []; nolink.url_analysis = []
+    nolink.body = "x"; nolink.attachments = []; nolink.attachment_details = []
+    nolink.authentication_results = {}
+
+    out = aitm_lure_window([lure, nolink], s, 20)
+    assert out["available"] and out["signins"] == 1
+    assert [c["path"] for c in out["candidates"]] == ["/m/lure.eml"]
+    assert out["candidates"][0]["delta_seconds"] == 720
+    assert lure.signin_lure_candidate is True
+    assert any("AiTM lure" in f["signal"] for f in lure.provenance)
+
+
+def test_legacy_auth_for_an_affected_account_is_reported(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [
+        _si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+            originalTransferMethod="deviceCodeFlow"),           # makes ap@ affected
+        _si("ap@acme.com", "45.147.230.89", "2026-08-27T10:30:00Z",
+            clientAppUsed="IMAP4"),
+        _si("other@acme.com", "203.0.113.50", "2026-08-27T11:00:00Z",
+            clientAppUsed="IMAP4"),                             # not affected
+        _si("ap@acme.com", "45.147.230.90", "2026-08-27T12:00:00Z",
+            ok=False, code="50126", clientAppUsed="Authenticated SMTP"),
+    ]
+    lg = analyze_signin_logs(_si_export(tmp_path, rows))["legacy_auth"]
+    assert lg["total"] == 3 and lg["successes"] == 2
+    assert lg["indicated_count"] == 1
+    assert lg["indicated"][0]["protocol"] == "IMAP4"
+
+
+def test_bav2ropc_user_agent_is_legacy_even_without_a_client_app(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+                originalTransferMethod="deviceCodeFlow"),
+            _si("ap@acme.com", "45.147.230.89", "2026-08-27T10:30:00Z",
+                agent="BAV2ROPC")]
+    lg = analyze_signin_logs(_si_export(tmp_path, rows))["legacy_auth"]
+    assert lg["indicated_count"] == 1
+
+
+def test_mfa_fatigue_is_a_run_of_prompts_then_an_approval(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T02:%02d:00Z" % m,
+                ok=False, code="500121") for m in range(0, 24, 3)]     # 8 prompts
+    rows.append(_si("ap@acme.com", "45.147.230.88", "2026-08-27T02:26:00Z",
+                    country="NG"))
+    lf = analyze_signin_logs(_si_export(tmp_path, rows))["login_failures"]
+    assert lf["fatigue_count"] == 1
+    f = lf["fatigue"][0]
+    assert f["prompts"] == 8 and f["approved_at"].startswith("2026-08-27T02:26")
+
+
+def test_a_user_who_just_forgot_their_phone_is_not_fatigue(tmp_path):
+    # Two MFA timeouts over a week is a person; eight in twenty minutes then
+    # an approval is a campaign. Spread and count both have to be there.
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "203.0.113.10", "2026-08-%02dT09:00:00Z" % d,
+                ok=False, code="500121") for d in (1, 8)]
+    rows.append(_si("ap@acme.com", "203.0.113.10", "2026-08-08T09:05:00Z"))
+    lf = analyze_signin_logs(_si_export(tmp_path, rows))["login_failures"]
+    assert lf["fatigue_count"] == 0
+
+
+def test_password_spray_is_many_accounts_from_one_address_in_an_hour(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("u%d@acme.com" % i, "45.147.230.88",
+                "2026-08-27T03:%02d:00Z" % (i * 2), ok=False, code="50126")
+            for i in range(12)]
+    lf = analyze_signin_logs(_si_export(tmp_path, rows))["login_failures"]
+    assert lf["spray_count"] == 1
+    assert lf["spray"][0]["users_hit"] == 12
+
+
+def test_the_case_page_names_aitm_when_it_is_the_entry(tmp_path):
+    from postmortem.casepage import case_answers
+
+    v = {"signin_log": {"available": True, "aitm_indicated": 1},
+         "signin_lures": {"aitm": {"candidates": [{"path": "/m/l.eml"}]}}}
+    a = case_answers(v, [], None)[0]
+    assert "Adversary-in-the-middle" in a["answer"]
+    assert "1 lure candidate" in a["answer"]
+    assert a["provenance"] == "inferred"
+
+
+def test_a_user_with_no_history_is_not_rare_everywhere(tmp_path):
+    # Caught by rendering: with no successful sign-ins on record every ASN,
+    # country and client was "new", and three location signals alone reached
+    # the floor on an account whose only prior events were failed prompts.
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("new@acme.com", "45.147.230.88", "2026-08-27T02:%02d:00Z" % m,
+                ok=False, code="500121") for m in range(0, 9, 3)]
+    rows.append(_si("new@acme.com", "45.147.230.88", "2026-08-27T02:12:00Z",
+                    asn="AS9009", country="NL", agent="Mozilla/5.0 Chrome/120"))
+    out = analyze_signin_logs(_si_export(tmp_path, rows))
+    assert out["aitm_indicated"] == 0
+    # with token evidence it still reports, history or not
+    rows[-1]["incomingTokenType"] = "refreshToken"
+    rows[-1]["authenticationRequirement"] = "singleFactorAuthentication"
+    out2 = analyze_signin_logs(_si_export(tmp_path, rows, "t"))
+    assert out2["aitm_indicated"] == 0, "token alone is 5, still below the floor"
+    assert out2["aitm"] and out2["aitm"][0]["score"] == 5

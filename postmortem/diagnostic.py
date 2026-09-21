@@ -460,6 +460,14 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "have_protocol": cov.get("have_protocol", 0),
             "accounts": cov.get("accounts", 0),
             "device_code_records": signin_summary.get("device_code_records", 0),
+            "aitm_indicated": signin_summary.get("aitm_indicated", 0),
+            "aitm_candidates": len(signin_summary.get("aitm") or []),
+            "legacy_auth": {
+                k: v for k, v in (signin_summary.get("legacy_auth") or {}).items()
+                if isinstance(v, (int, bool))},
+            "login_failures": {
+                k: v for k, v in (signin_summary.get("login_failures") or {}).items()
+                if isinstance(v, (int, bool))},
             # Which field answered, not what it said: Microsoft's vocabulary.
             "detected_by": signin_summary.get("detected_by", {}),
             "attack_groups": signin_summary.get("attack_groups", 0),

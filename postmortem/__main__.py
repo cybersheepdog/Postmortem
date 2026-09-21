@@ -537,7 +537,7 @@ from postmortem.reporting import (  # noqa: E402
     print_persistence, print_remediation, print_mes_manifest,
     print_directory, print_message_trace, print_notification_scope,
     print_token_replay, print_file_activity, print_delegate_access,
-    print_case_answers, print_sessions,
+    print_case_answers, print_sessions, print_entry_vectors,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -2409,6 +2409,10 @@ def main():
 
     # The first page. Computed here, once everything that feeds it is in the
     # verdict, and carried into the JSON and HTML so the three agree.
+    # After scoring: the AiTM lure join needs the scored corpus.
+    if signin_summary:
+        print_entry_vectors(signin_summary, initial_verdict.get("signin_lures"))
+
     initial_verdict["case_answers"] = case_answers(initial_verdict, records, anchors)
     print_case_answers(initial_verdict["case_answers"])
 

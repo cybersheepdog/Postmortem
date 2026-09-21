@@ -2574,6 +2574,8 @@ def run_scenario_analysis(records, internal_domains, anchors: Anchors,
     # strength of the token, not of its wording.
     signin_lures = signin_lure_window(
         records, signin_summary, signin_window_minutes)
+    signin_lures["aitm"] = aitm_lure_window(
+        records, signin_summary, signin_window_minutes)
 
     for r in records:
         score_initial_email(r, scenario, anchors)
@@ -2663,6 +2665,81 @@ _DEVICE_LOGIN_URL_RE = re.compile(
 _DEVICE_CODE_LABELLED_RE = re.compile(
     r"\bcode\b[^A-Za-z0-9]{0,12}([A-Z0-9]{4}[\s-]?[A-Z0-9]{3,5})\b")
 _DEVICE_CODE_BARE_RE = re.compile(r"\b(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,9}\b")
+
+
+def aitm_lure_window(records, signin_summary, window_minutes=20):
+    """Messages carrying a link that arrived shortly before an AiTM sign-in.
+
+    Same shape as the device code join, different anchor and different lure.
+    The anchor is a successful sign-in fitting the adversary-in-the-middle
+    profile rather than a token issuance, and the lure is any message with
+    a link -- the proxy is reached by clicking, and the link carries no
+    Microsoft URL to recognise. So the join alone cannot confirm; it names
+    the candidates, and the sign-in profile carries the weight.
+    """
+    empty = {"available": False, "window_minutes": window_minutes,
+             "signins": 0, "candidates": [], "signins_without_lure": []}
+    if not signin_summary:
+        return empty
+    from postmortem.signin import parse_time
+    anchors = []
+    for r in signin_summary.get("aitm") or []:
+        if not r.get("indicated"):
+            continue
+        dt = parse_time(r.get("time", "").replace(" ", "T"))
+        if dt:
+            anchors.append((dt, r))
+    if not anchors:
+        return empty
+
+    span = timedelta(minutes=max(1, int(window_minutes)))
+    arrivals = []
+    for r in records:
+        dt = _as_utc(message_arrival_dt(r))
+        if dt is not None and getattr(r, "urls", None):
+            arrivals.append((dt, r))
+    arrivals.sort(key=lambda x: x[0])
+
+    candidates, barren, seen = [], [], set()
+    for s_dt, s in anchors:
+        s_dt = _as_utc(s_dt)
+        hit = False
+        for dt, r in arrivals:
+            if not (s_dt - span <= dt <= s_dt):
+                continue
+            hit = True
+            if r.path in seen:
+                continue
+            seen.add(r.path)
+            entry = {
+                "path": r.path,
+                "subject": getattr(r, "subject", "") or "",
+                "sender": getattr(r, "sender_email", "") or "",
+                "arrival": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "signin_time": s_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "delta_seconds": int((s_dt - dt).total_seconds()),
+                "user": s.get("user", ""),
+                "attacker_ip": s.get("ip", ""),
+                "url_domains": list(getattr(r, "url_domains", []) or [])[:4],
+                "reasons": s.get("reasons", []),
+            }
+            candidates.append(entry)
+            r.signin_lure_candidate = True
+            r.provenance = list(r.provenance) + [make_finding(
+                "Possible AiTM lure: carries a link and arrived %d second(s) "
+                "before a sign-in fitting the adversary-in-the-middle profile "
+                "for %s from %s" % (entry["delta_seconds"], s.get("user", "?"),
+                                     s.get("ip", "?")),
+                category="audit", source="entra:signin_log",
+                matched="; ".join(s.get("reasons", [])[:3]),
+                weight=0, severity="medium")]
+        if not hit:
+            barren.append({"time": s.get("time", ""), "user": s.get("user", ""),
+                           "ip": s.get("ip", "")})
+    candidates.sort(key=lambda e: e["delta_seconds"])
+    return {"available": True, "window_minutes": window_minutes,
+            "signins": len(anchors), "candidates": candidates,
+            "signins_without_lure": barren}
 
 
 def device_code_lure(record):
