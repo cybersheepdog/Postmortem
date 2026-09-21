@@ -799,6 +799,22 @@ def print_signin_analysis(signin_summary: dict):
         print(term.c(f"  First token issued:      {s['earliest_token']}"
                      "   <- true compromise T0", "red"))
 
+    _dev_ips = s.get("owner_device_ips") or []
+    _dev_why = s.get("owner_device_evidence") or {}
+    if _dev_ips:
+        print()
+        print(f"  {len(_dev_ips)} address(es) vouched for by the owner's own "
+              "registered device, and excluded from attribution:")
+        for ip in _dev_ips[:6]:
+            print(f"    {ip:<18} {_dev_why.get(ip, '')}")
+        if len(_dev_ips) > 6:
+            print(f"    ... {len(_dev_ips) - 6} more")
+    _too_new = (_dev_why or {}).get("_devices_excluded_as_too_new", 0)
+    if _too_new:
+        print(term.c(f"  {_too_new} device(s) registered after the cutoff did NOT "
+                     "vouch: a device the attacker registered must not excuse "
+                     "the attacker's address.", "yellow"))
+
     if s.get("attacker_ips"):
         print()
         print("  Attacker addresses established here (seeded into the audit-log")

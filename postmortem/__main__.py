@@ -1967,7 +1967,10 @@ def main():
         _signin_path = mes_bundle["signin_paths"][0]
     if _signin_path:
         try:
-            signin_summary = analyze_signin_logs(str(_signin_path))
+            # Registered devices vouch for the owner's own addresses -- the
+            # phone that syncs the mailbox from a new residential IP daily.
+            _devices = ((mes_bundle or {}).get('sources') or {}).get('devices') or []
+            signin_summary = analyze_signin_logs(str(_signin_path), devices=_devices)
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"[!] Could not parse sign-in logs {_signin_path}: {exc}",
                   file=sys.stderr)

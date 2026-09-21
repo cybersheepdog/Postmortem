@@ -471,6 +471,9 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "have_protocol": cov.get("have_protocol", 0),
             "accounts": cov.get("accounts", 0),
             "device_code_records": signin_summary.get("device_code_records", 0),
+            "owner_device_ips": len(signin_summary.get("owner_device_ips") or []),
+            "devices_excluded_too_new": (signin_summary.get("owner_device_evidence")
+                                         or {}).get("_devices_excluded_as_too_new", 0),
             "aitm_indicated": signin_summary.get("aitm_indicated", 0),
             "aitm_candidates": len(signin_summary.get("aitm") or []),
             "legacy_auth": {

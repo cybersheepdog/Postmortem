@@ -59,6 +59,12 @@ FIELDS = {
     "risk": ["riskLevelDuringSignIn", "RiskLevelDuringSignIn"],
     "risk_state": ["riskState", "RiskState"],
     "token_type": ["incomingTokenType", "IncomingTokenType"],
+    # deviceDetail is flattened, so its keys land at the top level.
+    "device_id": ["deviceId", "DeviceId"],
+    "device_name": ["displayName", "DeviceName", "deviceDisplayName"],
+    "trust_type": ["trustType", "TrustType"],
+    "managed": ["isManaged", "IsManaged"],
+    "compliant": ["isCompliant", "IsCompliant"],
 }
 
 _DEVICE_CODE_TRANSFER = {"devicecodeflow", "device code flow", "devicecode"}
@@ -397,6 +403,79 @@ def looks_forged(flat):
     """At least one decisive marker, and at least two in total."""
     strong, weak = forged_markers(flat)
     return bool(strong) and (len(strong) + len(weak)) >= 2
+
+
+def owner_device_addresses(records, affected_users, devices=None,
+                           compromise_dt=None, log_last=None):
+    """Addresses the affected accounts signed in from on their OWN devices.
+
+    The mobile-phone false positive: a phone syncs the mailbox by folder,
+    from a residential address that changes daily, and that reads exactly
+    like an attacker pulling the mailbox down whole. What separates them is
+    the device. A sign-in carrying a deviceId that is registered to this
+    user in the tenant -- or managed, or compliant -- is their device, and
+    every address it signed in from is theirs.
+
+    Returns (addresses, evidence) where evidence maps address -> the device
+    that vouched for it, so the report can say WHY an address was excused.
+    """
+    # Scope: the accounts under investigation when known; otherwise every
+    # account, because the vouch is per-user anyway -- a device registered
+    # to X excuses only X's addresses -- and this set is only ever used to
+    # EXCLUDE from attribution.
+    affected = {u.lower() for u in (affected_users or ()) if u}
+
+    # A device the attacker registered is persistence, and it must not
+    # vouch for the attacker's own address -- the same trap as a forged
+    # sign-in event. Devices registered after the compromise are excluded;
+    # with no compromise date, the last 30 days of the log are.
+    cutoff = compromise_dt
+    if cutoff is None and log_last is not None:
+        cutoff = log_last - timedelta(days=30)
+    registered, too_new = {}, 0
+    for d in (devices or []):
+        did = str(d.get("device_id") or "").strip().lower()
+        if not did:
+            continue
+        reg = d.get("_dt")
+        if cutoff is not None and reg is not None and reg >= cutoff:
+            too_new += 1
+            continue
+        registered[did] = d
+
+    out, why = set(), {}
+    for _src, f in records:
+        user = str(get(f, "user", "")).lower()
+        if not user or (affected and user not in affected) or not succeeded(f):
+            continue
+        ip = str(get(f, "ip", ""))
+        if not ip:
+            continue
+        # A device only vouches for a fresh, interactive authentication on
+        # it. A replayed token presented "from" a device is the attacker.
+        if token_claim_satisfied(f) and not truthy(get(f, "interactive", "")):
+            continue
+        did = str(get(f, "device_id", "")).strip().lower()
+        vouch = ""
+        if did and did in registered:
+            d = registered[did]
+            owner = str(d.get("owner") or "").lower()
+            if not owner or user in owner or owner in user:
+                vouch = "registered device %s" % (d.get("name") or did[:8])
+            else:
+                continue          # someone else's device; not the owner's
+        elif truthy(get(f, "managed", "")) or truthy(get(f, "compliant", "")):
+            vouch = "managed/compliant device%s" % (
+                " " + str(get(f, "device_name", "")) if get(f, "device_name", "") else "")
+        elif did and str(get(f, "trust_type", "")).strip().lower() in (
+                "azuread", "azure ad joined", "hybrid azure ad joined",
+                "azureadjoined", "hybridazureadjoined"):
+            vouch = "%s device" % get(f, "trust_type", "")
+        if vouch:
+            out.add(ip)
+            why.setdefault(ip, vouch)
+    why["_devices_excluded_as_too_new"] = too_new
+    return out, why
 
 
 def _victim_addresses(records, affected_users):
@@ -912,7 +991,7 @@ def failed_login_patterns(records, window_minutes=60, fatigue_min=5,
             "spray_count": len(spray)}
 
 
-def analyze_signin_logs(path):
+def analyze_signin_logs(path, devices=None):
     """Parse an Entra sign-in export and derive what the mail side can use.
 
     Shape mirrors analyze_audit_log so __main__ can treat the two the same
@@ -942,6 +1021,14 @@ def analyze_signin_logs(path):
     affected_users = sorted({str(get(f, "user", "")) for _s, f in hits
                              if get(f, "user", "")})
     victim_ips, forged_veto_ips = _victim_addresses(records, affected_users)
+    # The owner's own devices vouch for more addresses than interactive
+    # sign-ins alone: a phone that only ever syncs never signs in
+    # interactively, so its addresses never reached the veto.
+    _log_last = max((parse_time(get(f, "time", "")) for _s, f in records
+                     if get(f, "time", "")), default=None)
+    device_ips, device_why = owner_device_addresses(
+        records, affected_users, devices, compromise_dt=None, log_last=_log_last)
+    victim_ips = set(victim_ips) | device_ips
 
     groups = []
     attacker_ips = set()
@@ -1175,6 +1262,8 @@ def analyze_signin_logs(path):
         # forged records already excluded. The audit side uses this the same
         # way this module does: an owner address never seeds attribution.
         "owner_ips": sorted(victim_ips),
+        "owner_device_ips": sorted(device_ips),
+        "owner_device_evidence": device_why,
         # Every address that authenticated at all, device code or not. The
         # token-replay test needs the full set, not the device code subset.
         "all_signin_ips": sorted({str(get(f, "ip", "")) for _s, f in records

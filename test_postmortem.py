@@ -7268,3 +7268,105 @@ def test_searches_sharpen_what_was_exposed_on_the_case_page(tmp_path):
                                     "terms": [("wire", 2), ("w-2", 1)]}}}
     a = {x["question"]: x for x in case_answers(v, [], None)}["What was exposed"]
     assert "searched the mailbox for: wire, w-2" in a["detail"]
+
+
+# --------------------------------------------------------------------------
+# The owner's phone. It syncs the mailbox by folder from a residential
+# address that changes daily, and that reads exactly like an attacker
+# pulling the mailbox down whole. The device is what separates them.
+# --------------------------------------------------------------------------
+PHONE = "8f3c1a2b-0000-4000-8000-000000000001"
+
+
+def _dev(device_id=PHONE, owner="ap@acme.com", name="ap-iPhone",
+         registered="2026-01-15T10:00:00Z"):
+    from postmortem.persistence import _parse_dt
+    return {"kind": "device", "device_id": device_id, "owner": owner,
+            "name": name, "_dt": _parse_dt(registered), "time": registered}
+
+
+def test_an_address_the_owners_registered_phone_signed_in_from_is_excused(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+                originalTransferMethod="deviceCodeFlow"),        # affected
+            _si("ap@acme.com", "198.51.100.77", "2026-08-27T08:00:00Z",
+                isInteractive=False, deviceDetail={"deviceId": PHONE,
+                                                   "displayName": "ap-iPhone"})]
+    out = analyze_signin_logs(_si_export(tmp_path, rows), devices=[_dev()])
+    assert "198.51.100.77" in out["owner_device_ips"]
+    assert "198.51.100.77" in out["owner_ips"]
+    assert "registered device" in out["owner_device_evidence"]["198.51.100.77"]
+
+
+def test_someone_elses_device_does_not_vouch_for_this_users_address(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+                originalTransferMethod="deviceCodeFlow"),
+            _si("ap@acme.com", "198.51.100.77", "2026-08-27T08:00:00Z",
+                deviceDetail={"deviceId": PHONE})]
+    out = analyze_signin_logs(_si_export(tmp_path, rows),
+                              devices=[_dev(owner="mallory@acme.com")])
+    assert out["owner_device_ips"] == []
+
+
+def test_a_device_registered_after_the_cutoff_does_not_vouch(tmp_path):
+    # Persistence. A device the attacker registered must not excuse the
+    # attacker's own address -- the same trap as a forged sign-in event.
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+                originalTransferMethod="deviceCodeFlow"),
+            _si("ap@acme.com", "45.147.230.88", "2026-08-27T11:00:00Z",
+                deviceDetail={"deviceId": PHONE})]
+    out = analyze_signin_logs(
+        _si_export(tmp_path, rows),
+        devices=[_dev(registered="2026-08-27T10:30:00Z")])   # registered today
+    assert out["owner_device_ips"] == []
+    assert out["owner_device_evidence"]["_devices_excluded_as_too_new"] == 1
+
+
+def test_a_replayed_token_presented_from_a_device_is_not_the_owner(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+                originalTransferMethod="deviceCodeFlow"),
+            _si("ap@acme.com", "45.147.230.99", "2026-08-27T11:00:00Z",
+                isInteractive=False, incomingTokenType="refreshToken",
+                deviceDetail={"deviceId": PHONE})]
+    out = analyze_signin_logs(_si_export(tmp_path, rows), devices=[_dev()])
+    assert "45.147.230.99" not in out["owner_device_ips"]
+
+
+def test_a_managed_device_vouches_without_a_devices_export(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+                originalTransferMethod="deviceCodeFlow"),
+            _si("ap@acme.com", "198.51.100.77", "2026-08-27T08:00:00Z",
+                deviceDetail={"deviceId": PHONE, "isManaged": True,
+                              "displayName": "ap-laptop"})]
+    out = analyze_signin_logs(_si_export(tmp_path, rows))
+    assert "198.51.100.77" in out["owner_device_ips"]
+    assert "managed" in out["owner_device_evidence"]["198.51.100.77"]
+
+
+def test_a_device_vouched_address_never_seeds_attribution_on_the_audit_side(tmp_path):
+    # End to end: the phone's address appears on a rule event. Still
+    # reported; not the attacker.
+    from postmortem.signin import analyze_signin_logs
+    from postmortem.auditlog import analyze_audit_log
+
+    # The attacker's polling leg is not interactive; the fixture must not
+    # accidentally make the attacker's address the owner's.
+    rows = [_si("ap@acme.com", "45.147.230.88", "2026-08-27T10:00:00Z",
+                originalTransferMethod="deviceCodeFlow", isInteractive=False),
+            _si("ap@acme.com", "198.51.100.77", "2026-08-27T08:00:00Z",
+                deviceDetail={"deviceId": PHONE})]
+    s = analyze_signin_logs(_si_export(tmp_path, rows), devices=[_dev()])
+    a = analyze_audit_log(_audit_file(tmp_path, [_urule("198.51.100.77"),
+                                                  _urule(UAL_ATK)]),
+                          owner_ips=s["owner_ips"])
+    assert a["derived"]["attacker_ips"] == [UAL_ATK]
+    assert a["owner_vetoed_ips"] == ["198.51.100.77"]
