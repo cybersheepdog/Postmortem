@@ -1742,7 +1742,7 @@ def attacker_authorship(records, audit_summary, anchors=None):
         if key:
             by_id.setdefault(key, r)
 
-    attributed, in_window = [], []
+    attributed, in_window, staff = [], [], []
     for mid, hits in index.items():
         sends = [h for h in hits if h["verb"] in _SEND_VERBS]
         if not sends:
@@ -1764,8 +1764,17 @@ def attacker_authorship(records, audit_summary, anchors=None):
         if s["by_attacker"]:
             entry["basis"] = "sent from a known attacker address"
             attributed.append(entry)
+        elif s.get("staff_send"):
+            # A known delegate, from an address that is not the attacker's.
+            # Listed apart so the in-window count stops carrying the
+            # assistant's ordinary sending as "unattributed".
+            entry["basis"] = "sent by a known delegate (%s)" % s.get("actor", "")
+            staff.append(entry)
         elif compromise and s["time"] and _iso_after(s["time"], compromise):
             entry["basis"] = "sent after the compromise timestamp"
+            if s.get("delegate_send"):
+                entry["basis"] += " by %s, who holds no known delegation" % s.get("actor", "")
+                entry["unknown_delegate"] = True
             in_window.append(entry)
 
     for entry in attributed:
@@ -1776,11 +1785,15 @@ def attacker_authorship(records, audit_summary, anchors=None):
     attributed.sort(key=lambda e: e["time"])
     in_window.sort(key=lambda e: e["time"])
     corroborated = [e for e in attributed if e["burst_copies"]]
+    staff.sort(key=lambda e: e["time"])
     return {
         "attributed": attributed,
         "in_window": in_window,
         "attributed_count": len(attributed),
         "in_window_count": len(in_window),
+        "unknown_delegate_count": sum(1 for e in in_window if e.get("unknown_delegate")),
+        "staff_sends": staff[:40],
+        "staff_send_count": len(staff),
         "burst_corroborated": len(corroborated),
     }
 

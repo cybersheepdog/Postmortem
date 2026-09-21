@@ -326,6 +326,13 @@ def print_attacker_authorship(verdict: dict, limit: int = 12):
     if a.get("in_window_count"):
         print(f"  Sent after the compromise timestamp: {a['in_window_count']}"
               "   (timing, not attribution)")
+        if a.get("unknown_delegate_count"):
+            print(term.c(f"    of which sent AS the owner by someone holding no "
+                         f"known delegation: {a['unknown_delegate_count']}",
+                         "red", "bold"))
+    if a.get("staff_send_count"):
+        print(f"  Sent as the owner by a known delegate: {a['staff_send_count']}"
+              "   (staff; excluded from the count above)")
     if a.get("burst_corroborated"):
         print(f"  Also detected as a mass-mail burst:  {a['burst_corroborated']}"
               "   (corpus repetition agrees)")

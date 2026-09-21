@@ -7455,3 +7455,62 @@ def test_a_rule_named_address_is_never_excused_by_its_client(tmp_path):
                    ClientInfoString="Client=REST;Client=RESTSystem;")]
     a = analyze_audit_log(_audit_file(tmp_path, rows))
     assert UAL_ATK in a["derived"]["attacker_ips"]
+
+
+# --------------------------------------------------------------------------
+# SendAs by a known trustee. An executive assistant with SendAs, or five
+# staff on a shared mailbox, send as the owner all day. Whether the actor
+# HOLDS the delegation separates staff from an attacker using a permission
+# they granted themselves -- and only from a non-attacker address.
+# --------------------------------------------------------------------------
+def _sendas(ip, actor, mid, when="2026-08-28T10:00:00", owner="ap@acme.com"):
+    return _uev("SendAs", ip, when=when, user=actor, MailboxOwnerUPN=owner,
+                Item={"InternetMessageId": mid, "Subject": "Re: invoice"})
+
+
+def test_a_known_delegates_sendas_is_staff_not_unattributed(tmp_path):
+    from datetime import datetime as D, timezone as TZ
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.models import Anchors
+    from postmortem.scoring import attacker_authorship
+
+    rows = [_urule(UAL_ATK, when="2026-08-27T09:00:00"),
+            _sendas("203.0.113.10", "assistant@acme.com", "<a@acme.com>"),
+            _sendas("203.0.113.11", "mallory@acme.com", "<b@acme.com>"),
+            _sendas(UAL_ATK, "assistant@acme.com", "<c@acme.com>")]
+    a = analyze_audit_log(_audit_file(tmp_path, rows),
+                          known_delegates=["assistant@acme.com"])
+    out = attacker_authorship([], a, Anchors(
+        compromise_date=D(2026, 8, 27, tzinfo=TZ.utc)))
+    # staff: known delegate from a non-attacker address
+    assert out["staff_send_count"] == 1
+    assert out["staff_sends"][0]["message_id"] == "<a@acme.com>"
+    # unknown delegate, in window: flagged
+    assert out["in_window_count"] == 1 and out["unknown_delegate_count"] == 1
+    assert out["in_window"][0]["message_id"] == "<b@acme.com>"
+    assert "holds no known delegation" in out["in_window"][0]["basis"]
+    # the known delegate FROM the attacker address is the attacker
+    assert out["attributed_count"] == 1
+    assert out["attributed"][0]["message_id"] == "<c@acme.com>"
+
+
+def test_the_owners_own_send_is_neither_delegate_nor_staff(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uev("Send", "203.0.113.10", when="2026-08-28T10:00:00",
+                 Item={"InternetMessageId": "<o@acme.com>"})]
+    a = analyze_audit_log(_audit_file(tmp_path, rows),
+                          known_delegates=["assistant@acme.com"])
+    hit = a["message_index"]["by_message_id"]["<o@acme.com>"][0]
+    assert hit["delegate_send"] is False and hit["staff_send"] is False
+
+
+def test_without_a_permissions_export_no_send_is_staff(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _sendas("203.0.113.10", "assistant@acme.com", "<a@acme.com>")]
+    a = analyze_audit_log(_audit_file(tmp_path, rows))
+    hit = a["message_index"]["by_message_id"]["<a@acme.com>"][0]
+    assert hit["delegate_send"] is True and hit["staff_send"] is False

@@ -453,7 +453,8 @@ def attacker_ips_from_subjects(events, subjects, compromise_dt=None):
     return ips, matches
 
 
-def build_message_index(events, attacker_ips=(), compromise_dt=None):
+def build_message_index(events, attacker_ips=(), compromise_dt=None,
+                        known_delegates=()):
     """Map normalized Message-ID -> the audit events that touched that message.
 
     This is the join the tool was missing. Every other audit finding describes
@@ -462,6 +463,7 @@ def build_message_index(events, attacker_ips=(), compromise_dt=None):
     named item rather than inferring anything from its wording.
     """
     attacker_ips = set(attacker_ips or ())
+    known = {str(d).lower() for d in (known_delegates or ()) if d}
     index = {}
     matched_events = 0
 
@@ -469,6 +471,18 @@ def build_message_index(events, attacker_ips=(), compromise_dt=None):
         verb = _ITEM_OPS.get(e["op_lower"])
         if not verb:
             continue
+        # A send by someone other than the mailbox owner. An executive
+        # assistant with SendAs does this all day, and on a shared mailbox
+        # so do five people. Whether the actor HOLDS that delegation is what
+        # separates staff from an attacker using a permission they granted
+        # themselves -- and only a send from an address that is not the
+        # attacker's is excused by it.
+        actor = str(e["user"] or "").lower()
+        owner = str(e.get("mailbox_owner") or "").lower()
+        delegate_send = bool(e["op_lower"] in ("sendas", "sendonbehalf")
+                             and actor and owner and actor != owner)
+        staff_send = bool(delegate_send and actor in known
+                          and not (e["client_ip"] and e["client_ip"] in attacker_ips))
         found = []
         _walk_message_ids(e["audit"], found)
         if not found:
@@ -503,6 +517,9 @@ def build_message_index(events, attacker_ips=(), compromise_dt=None):
                 "session_id": e.get("session_id", ""),
                 "client_info": e.get("client_info", "")[:80],
                 "logon_type": e.get("logon_type"),
+                "delegate_send": delegate_send,
+                "staff_send": staff_send,
+                "actor": actor,
             })
 
     for key in index:
@@ -1371,7 +1388,8 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
     # Built last: it needs the attacker IPs and the compromise date derived
     # above in order to say who did each thing, not merely that it happened.
     message_index = build_message_index(
-        events, attacker_ips=attacker_ips, compromise_dt=compromise_dt)
+        events, attacker_ips=attacker_ips, compromise_dt=compromise_dt,
+        known_delegates=known_delegates)
 
     return {
         "events_parsed": len(events),
