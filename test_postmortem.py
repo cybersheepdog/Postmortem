@@ -5478,7 +5478,11 @@ def _single_leg_export(tmp_path, n=12, interactive=False, ok=True):
     return str(d)
 
 
-def test_an_interactive_only_export_says_so_instead_of_reporting_clean(tmp_path):
+def test_a_single_leg_export_is_scored_not_dismissed(tmp_path):
+    # Corrected after aadinternals: Entra records the sign-in where the
+    # authentication was INITIATED, so a phished flow can legitimately be one
+    # record carrying the attacker's address. The earlier warning told the
+    # analyst to go re-collect a second leg that may never have existed.
     from postmortem.signin import analyze_signin_logs
 
     out = analyze_signin_logs(_single_leg_export(tmp_path))
@@ -5486,8 +5490,10 @@ def test_an_interactive_only_export_says_so_instead_of_reporting_clean(tmp_path)
     assert out["attack_groups"] == 0
     joined = " ".join(out["warnings"])
     assert "single leg" in joined
-    assert "non-interactive" in joined
-    assert "not a negative" in joined
+    assert "not necessarily a collection gap" in joined
+    assert "scored individually" in joined
+    # and the records are actually assessed rather than dropped
+    assert out["single_leg_count"] == 12
 
 
 def test_tokens_issued_counts_attributed_tokens_and_says_which(tmp_path):
@@ -5720,7 +5726,7 @@ def test_outbound_mail_with_the_known_subject_is_tier_1(tmp_path):
     # own mass-mail is by definition not inbound -- so without an explicit
     # branch it lands in Tier 3 no matter what the analyst supplied.
     from postmortem.models import Anchors
-    from postmortem.scoring import annotate_forensic_signals, assign_tiers
+    from postmortem.scoring import assign_tiers
 
     sent = _subject_record("Updated remittance instructions", "acme.com",
                            "/m/sent.eml")
@@ -5776,3 +5782,261 @@ def test_a_subject_anchor_is_not_comma_split(tmp_path):
     a = build_anchors(A())
     assert a.attacker_subjects == ["Invoice 4471, revised"]
     assert a.active() is True
+
+
+def test_mes_dir_surfaces_the_unified_audit_log(tmp_path):
+    # The dispatcher recognised the UAL and reported it in the manifest, but
+    # nothing read it: --mes-dir picked up the sign-in log and the message
+    # trace while the one source every downstream attribution depends on was
+    # found, listed, and silently skipped.
+    from postmortem.mes import collect
+
+    d = tmp_path / "mes"
+    d.mkdir()
+    (d / "UnifiedAuditLog.json").write_text(json.dumps([{
+        "CreationDate": "2026-08-27T10:00:00", "Operation": "New-InboxRule",
+        "UserIds": "ap@acme.com",
+        "AuditData": json.dumps({"Operation": "New-InboxRule",
+                                 "ClientIP": "45.147.230.88"}),
+    }]), encoding="utf-8")
+
+    bundle = collect(str(d))
+    assert bundle["unified_audit_paths"], bundle.get("sources")
+    assert bundle["unified_audit_paths"][0].endswith("UnifiedAuditLog.json")
+
+
+# --------------------------------------------------------------------------
+# Single-record device code assessment.
+#
+# The two-leg rule assumed the authorising human and the polling client show
+# up in two places. aadinternals records the opposite: "from the Azure AD
+# point-of-view the login takes place where the authentication was INITIATED"
+# -- one record, the attacker's address. Requiring a split turns the attack's
+# own shape into a clean result.
+# --------------------------------------------------------------------------
+OFFICE_CLIENT = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+AZ_CLI_CLIENT = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+GRAPH_RESOURCE = "00000003-0000-0000-c000-000000000000"
+
+
+def _dc_record(app_id=OFFICE_CLIENT, **over):
+    r = {
+        "id": "r1", "correlationId": "c1",
+        "createdDateTime": "2026-08-27T10:00:00Z",
+        "userPrincipalName": "ap@acme.com", "ipAddress": "45.147.230.88",
+        "originalTransferMethod": "deviceCodeFlow",
+        "appId": app_id, "resourceId": GRAPH_RESOURCE,
+        "status": {"errorCode": 0},
+        "conditionalAccessStatus": "success",
+        "clientAppUsed": "Mobile Apps and Desktop clients",
+        "authenticationRequirement": "singleFactorAuthentication",
+    }
+    r.update(over)
+    return r
+
+
+def _flat(record):
+    from postmortem.signin import _flatten
+    return _flatten(record)
+
+
+def test_a_client_with_no_device_code_use_case_is_decisive(tmp_path):
+    # Office desktop does not authenticate by device code. Both write-ups show
+    # this client id being abused precisely because it is a family-of-client-
+    # IDs member whose refresh token redeems for Exchange and Graph, and it
+    # reads as innocuous in a log.
+    from postmortem.signin import assess_single_leg, SINGLE_RECORD_FLOOR
+
+    score, reasons = assess_single_leg(_flat(_dc_record()))
+    assert score >= SINGLE_RECORD_FLOOR, reasons
+    assert any("no device code use case" in r for r in reasons)
+
+
+def test_azure_cli_on_the_same_shape_is_not(tmp_path):
+    # The false positive this exists to prevent. Identical record in every
+    # respect except the client, and device code is what Azure CLI is FOR.
+    from postmortem.signin import assess_single_leg, SINGLE_RECORD_FLOOR
+
+    score, reasons = assess_single_leg(_flat(_dc_record(app_id=AZ_CLI_CLIENT)))
+    assert score < SINGLE_RECORD_FLOOR, (score, reasons)
+    assert not any("no device code use case" in r for r in reasons)
+
+
+def test_mfa_satisfied_by_a_claim_is_scored(tmp_path):
+    # inversecos names this twice: "Single-factor authentication (because it
+    # was as we used a token)" and "MFA requirement satisfied by claim in the
+    # token". Either says the credential presented was already minted.
+    from postmortem.signin import assess_single_leg
+
+    strong, r1 = assess_single_leg(_flat(_dc_record(app_id=AZ_CLI_CLIENT)))
+    weak, r2 = assess_single_leg(_flat(_dc_record(
+        app_id=AZ_CLI_CLIENT, authenticationRequirement="multiFactorAuthentication")))
+    assert strong > weak
+    assert any("MFA satisfied by a claim" in r for r in r1)
+
+
+def test_a_client_rare_in_this_tenant_scores_where_a_common_one_does_not(tmp_path):
+    # A shipped list cannot know this tenant runs a fleet of Teams Rooms. The
+    # tenant's own log can.
+    from postmortem.signin import assess_single_leg
+
+    odd = "99999999-1111-2222-3333-444444444444"
+    common = "88888888-1111-2222-3333-444444444444"
+    baseline = {common: 400, odd: 1}
+    total = 401
+
+    rare_score, rare_reasons = assess_single_leg(
+        _flat(_dc_record(app_id=odd)), baseline, total)
+    common_score, _ = assess_single_leg(
+        _flat(_dc_record(app_id=common)), baseline, total)
+    assert rare_score > common_score
+    assert any("rare for device code in this tenant" in r for r in rare_reasons)
+
+
+def test_the_indicated_set_is_separate_from_the_review_list(tmp_path):
+    from postmortem.signin import analyze_signin_logs
+    import json as _json
+
+    d = tmp_path / "s"
+    d.mkdir()
+    rows = [_dc_record(), dict(_dc_record(app_id=AZ_CLI_CLIENT),
+                               id="r2", correlationId="c2",
+                               ipAddress="203.0.113.5")]
+    (d / "s.json").write_text(_json.dumps(rows), encoding="utf-8")
+    out = analyze_signin_logs(str(d))
+
+    assert out["indicated_count"] == 1
+    top = out["single_leg_findings"][0]
+    assert top["indicated"] is True and top["app_id"] == OFFICE_CLIENT
+    assert any("published single-record profile" in w for w in out["warnings"])
+
+
+# --------------------------------------------------------------------------
+# Token replay.
+#
+# "Access tokens acquired using the refresh token do not appear in sign-in
+# log" -- so one device code authorisation yields silent access to Exchange,
+# SharePoint and Graph. The sign-in log structurally undercounts, and the gap
+# is the evidence: an address that acted on the mailbox and never
+# authenticated is holding a token it did not obtain here.
+# --------------------------------------------------------------------------
+def _signin_summary(ips, first="2026-08-27T00:00:00", last="2026-08-29T00:00:00"):
+    return {"available": True, "all_signin_ips": list(ips),
+            "coverage": {"first_event": first, "last_event": last}}
+
+
+def _audit_summary(rows):
+    return {"ip_activity": rows}
+
+
+def _act(ip, ops, events=20, first="2026-08-27T10:00:00",
+         last="2026-08-27T18:00:00", attacker=False):
+    return {"ip": ip, "events": events, "operations": [(o, 5) for o in ops],
+            "users": ["ap@acme.com"], "first_seen": first, "last_seen": last,
+            "is_attacker": attacker, "country": "", "asn": ""}
+
+
+def test_an_address_that_acted_without_authenticating_is_replay(tmp_path):
+    from postmortem.signin import find_token_replay
+
+    out = find_token_replay(
+        _signin_summary(["203.0.113.10"]),
+        _audit_summary([
+            _act("203.0.113.10", ["MailItemsAccessed"]),      # authenticated
+            _act("45.147.230.88", ["MailItemsAccessed", "HardDelete"]),
+        ]))
+    assert out["assessed"] is True
+    assert [r["ip"] for r in out["replay"]] == ["45.147.230.88"]
+
+
+def test_activity_outside_the_signin_window_is_excluded_not_claimed(tmp_path):
+    # The dangerous false positive: a sign-in export covering three days
+    # against a ninety-day audit log would report almost every address as
+    # unauthenticated.
+    from postmortem.signin import find_token_replay
+
+    out = find_token_replay(
+        _signin_summary(["203.0.113.10"]),
+        _audit_summary([
+            _act("198.51.100.7", ["MailItemsAccessed"],
+                 first="2026-06-01T10:00:00", last="2026-06-01T18:00:00"),
+        ]))
+    assert out["replay"] == []
+    assert out["outside_window"] == 1
+
+
+def test_non_token_bearing_activity_does_not_count(tmp_path):
+    from postmortem.signin import find_token_replay
+
+    out = find_token_replay(
+        _signin_summary(["203.0.113.10"]),
+        _audit_summary([_act("45.147.230.88", ["FileAccessed", "PageViewed"])]))
+    assert out["replay"] == []
+
+
+def test_a_handful_of_events_is_below_the_floor(tmp_path):
+    from postmortem.signin import find_token_replay
+
+    out = find_token_replay(
+        _signin_summary(["203.0.113.10"]),
+        _audit_summary([_act("45.147.230.88", ["MailItemsAccessed"], events=1)]))
+    assert out["replay"] == []
+
+
+def test_replay_needs_both_logs_and_says_which_is_missing(tmp_path):
+    from postmortem.signin import find_token_replay
+
+    for s, a in ((None, _audit_summary([])), (_signin_summary(["1.2.3.4"]), None),
+                 ({"available": False}, _audit_summary([]))):
+        out = find_token_replay(s, a)
+        assert out["assessed"] is False and out["reason"]
+
+
+def test_a_signin_export_with_no_window_cannot_be_compared(tmp_path):
+    from postmortem.signin import find_token_replay
+
+    out = find_token_replay(
+        {"available": True, "all_signin_ips": ["1.2.3.4"], "coverage": {}},
+        _audit_summary([_act("45.147.230.88", ["MailItemsAccessed"])]))
+    assert out["assessed"] is False
+    assert "window" in out["reason"]
+
+
+def test_an_expected_client_is_held_below_the_floor_not_merely_neutral(tmp_path):
+    # Caught by rendering a fixture, not by review. Azure CLI on a headless
+    # box is a non-browser client, shows as a desktop client, runs without
+    # conditional access and presents a cached token -- four signals, all
+    # innocent here. Left neutral it scored 9 and was reported as an attack,
+    # which is the exact false positive the expected list exists to prevent.
+    from postmortem.signin import assess_single_leg, SINGLE_RECORD_FLOOR
+
+    noisy = _dc_record(app_id=AZ_CLI_CLIENT,
+                       conditionalAccessStatus="notApplied",
+                       userAgent="python-requests/2.31.0")
+    score, reasons = assess_single_leg(_flat(noisy))
+    assert score < SINGLE_RECORD_FLOOR, (score, reasons)
+    # Suppressed, not hidden: it stays in the review list with its reasons.
+    assert any("routine for this client" in r for r in reasons)
+    assert len(reasons) > 1
+
+    # The same noise on a client with no device code use case still reports.
+    bad, _ = assess_single_leg(_flat(dict(noisy, appId=OFFICE_CLIENT)))
+    assert bad >= SINGLE_RECORD_FLOOR
+
+
+def test_the_signin_window_is_compared_as_time_not_as_text(tmp_path):
+    # coverage renders its stamps with a space separator; the audit log keeps
+    # the ISO "T". Compared as strings, " " sorts below "T" at the tenth
+    # character, so every audit row fell outside the window and the whole
+    # test silently excluded everything it was meant to assess.
+    from postmortem.signin import find_token_replay
+
+    out = find_token_replay(
+        {"available": True, "all_signin_ips": ["203.0.113.10"],
+         "coverage": {"first_event": "2026-08-27 10:00:00",
+                      "last_event": "2026-08-27 19:00:00"}},
+        _audit_summary([_act("45.147.230.88", ["MailItemsAccessed"],
+                             first="2026-08-27T11:00:00Z",
+                             last="2026-08-27T13:00:00Z")]))
+    assert out["outside_window"] == 0, "a space-separated window must still compare"
+    assert [r["ip"] for r in out["replay"]] == ["45.147.230.88"]

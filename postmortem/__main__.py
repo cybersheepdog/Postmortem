@@ -125,7 +125,7 @@ from postmortem.auditlog import (  # noqa: E402
     analyze_audit_log, coverage_warnings, annotate_audit_geoip,
 )
 from postmortem.signin import (
-    analyze_signin_logs, resolve_single_groups,
+    analyze_signin_logs, resolve_single_groups, find_token_replay,
 )
 from postmortem.mes import collect as collect_mes
 from postmortem.persistence import (
@@ -535,6 +535,7 @@ from postmortem.reporting import (  # noqa: E402
     print_signin_analysis, print_signin_lures,
     print_persistence, print_remediation, print_mes_manifest,
     print_directory, print_message_trace, print_notification_scope,
+    print_token_replay,
     print_attacker_authorship, print_exposure_scope, print_rule_replay,
     print_attacker_ip_activity,
     print_top_domains, top_flagged_domains,
@@ -1952,19 +1953,63 @@ def main():
                   file=sys.stderr)
 
     audit_summary = None
-    if getattr(args, "audit_log", None):
+    # The dispatcher recognises the unified audit log and reports it in the
+    # manifest, but nothing consumed it: --mes-dir picked up the sign-in log
+    # and the message trace while the UAL -- the one source every downstream
+    # attribution depends on -- was found, listed, and silently not read.
+    _audit_path = getattr(args, "audit_log", None)
+    if not _audit_path and mes_bundle and mes_bundle.get("unified_audit_paths"):
+        _audit_path = mes_bundle["unified_audit_paths"][0]
+        if len(mes_bundle["unified_audit_paths"]) > 1:
+            print(f"[i] --mes-dir holds "
+                  f"{len(mes_bundle['unified_audit_paths'])} unified audit "
+                  f"exports; using {Path(_audit_path).name}. Pass --audit-log "
+                  f"to choose another.", file=sys.stderr)
+    if _audit_path:
         try:
             audit_summary = analyze_audit_log(
-                args.audit_log,
+                _audit_path,
                 extra_attacker_ips=(signin_summary or {}).get('attacker_ips', ()),
                 anchor_dt=(signin_summary or {}).get('_earliest_token_dt'),
                 attacker_subjects=anchors.attacker_subjects,
             )
         except Exception as exc:  # noqa: BLE001 - report and continue
-            print(f"[!] Could not parse --audit-log {args.audit_log}: {exc}",
+            print(f"[!] Could not parse audit log {_audit_path}: {exc}",
                   file=sys.stderr)
             audit_summary = None
         if audit_summary:
+            # Refresh-token access leaves no sign-in record, so an address
+            # that acted on the mailbox without ever authenticating holds a
+            # token it did not obtain here. Attribution is computed once,
+            # inside analyze_audit_log, and everything downstream reads it a
+            # single time -- so the log is re-read with these addresses
+            # included rather than widened in a dict nothing would consult.
+            # Gated on there being something to add, and done before the
+            # summary is printed so the printed attribution is the final one.
+            if signin_summary:
+                signin_summary['token_replay'] = find_token_replay(
+                    signin_summary, audit_summary)
+                _replay = [r['ip'] for r in
+                           (signin_summary['token_replay'].get('replay') or [])
+                           if not r.get('is_attacker')]
+                if _replay:
+                    print(term.c(
+                        f"[i] {len(_replay)} address(es) acted on the mailbox "
+                        "without authenticating; re-reading the audit log "
+                        "with them attributed.", "yellow"), file=sys.stderr)
+                    try:
+                        audit_summary = analyze_audit_log(
+                            _audit_path,
+                            extra_attacker_ips=list(
+                                signin_summary.get('attacker_ips', ())) + _replay,
+                            anchor_dt=signin_summary.get('_earliest_token_dt'),
+                            attacker_subjects=anchors.attacker_subjects,
+                        )
+                        audit_summary['attacker_ips_from_replay'] = sorted(_replay)
+                    except Exception as exc:  # noqa: BLE001 - keep the first
+                        print(f"[!] Could not re-read the audit log: {exc}",
+                              file=sys.stderr)
+
             _merge_audit_anchors(anchors, audit_summary)
             # Computed before the private datetimes are stripped below: the
             # warnings need them, the JSON report must not carry them.
@@ -1989,8 +2034,14 @@ def main():
         signin_summary['cross_resolved'] = resolve_single_groups(
             signin_summary, (audit_summary.get('derived') or {}).get(
                 'attacker_ips', []))
+        # Recomputed against the re-read audit summary, so the reported
+        # replay set matches the attribution that was actually applied.
+        signin_summary['token_replay'] = find_token_replay(
+            signin_summary, audit_summary)
+
     if signin_summary:
         print_signin_analysis(signin_summary)
+        print_token_replay(signin_summary.get('token_replay'))
 
     # Runs last of the three: attribution here is entirely borrowed from
     # what the sign-in and audit logs established, so both must be in.

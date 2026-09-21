@@ -352,45 +352,202 @@ def _victim_addresses(records, affected_users):
     return out
 
 
-# Addresses that belong to hosting providers rather than people. Not an
-# allowlist of attackers -- a legitimate PowerShell automation runs from a
-# datacentre too -- which is exactly why this never attributes on its own.
+# --------------------------------------------------------------------------
+# Single-record assessment
+#
+# The two-leg rule assumed a phished flow shows the authorising human in one
+# place and the polling client in another. Syynimaa (aadinternals) records the
+# opposite outcome: "from the Azure AD point-of-view the login takes place
+# where the authentication was INITIATED" -- his test produced one sign-in
+# carrying the attacker VM's address, not the victim's. So a device code
+# phish can legitimately be a single record with a single IP, and requiring a
+# split turns the attack's own shape into a clean result.
+#
+# inversecos detects the same attack on one record, from a field combination
+# rather than a correlation. Those fields are what this scores.
+# --------------------------------------------------------------------------
+
+# Clients whose legitimate use of device code flow is routine. Device code
+# exists for exactly this: a shell on a headless box, a console with no
+# browser, a meeting-room display. Presence alone is worthless as evidence --
+# a real corpus carried 875 device code sign-ins across 664 accounts -- so the
+# question is never "was device code used" but "by what, and is that normal
+# HERE". Both halves matter: this list, and the per-tenant baseline below it.
+_DEVICE_CODE_EXPECTED = {
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46": "Azure CLI",
+    "1950a258-227b-4e31-a9cf-717495945fc2": "Azure PowerShell",
+}
+
+# Clients with no device code use case at all. Office desktop does not
+# authenticate this way, which is precisely why both write-ups show this
+# client id being abused: it is a family-of-client-IDs member, so its refresh
+# token redeems for Exchange, SharePoint and Graph, and it reads as innocuous
+# in a log. A device code flow claiming to be one of these is the highest
+# precision signal available from a single record.
+_DEVICE_CODE_NEVER = {
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c": "Microsoft Office",
+}
+
+# Resource identifiers worth naming when they appear on a device code flow.
+_RESOURCE_NAMES = {
+    "00000003-0000-0000-c000-000000000000": "Microsoft Graph",
+    "00000002-0000-0000-c000-000000000000": "Azure AD Graph",
+    "00000002-0000-0ff1-ce00-000000000000": "Office 365 Exchange Online",
+}
+
+# Non-browser clients. A device code flow is authorised in a browser by a
+# human; the polling half is not, and neither is a replayed token.
 _AUTOMATION_AGENTS = ("python-requests", "curl", "go-http-client", "axios",
                       "okhttp", "powershell", "libwww", "wget", "httpie",
                       "restsharp", "java/", "node-fetch")
 
+# Weight, reason. Scored rather than counted: four weak observations should
+# not outrank one decisive one, which is what a bare len(reasons) >= 2 did.
+_NEVER_CLIENT_W = 6
+_SINGLE_FACTOR_W = 3
+_TOKEN_CLAIM_W = 3
+_RARE_CLIENT_W = 3
+_DESKTOP_CLIENT_W = 1
+_AGENT_W = 2
+_CA_W = 2
+_SUCCESS_W = 1
 
-def assess_single_leg(flat):
-    """Why one lone device code leg looks wrong, on its own merits.
+# At or above this, the record is reported as an indicated attack rather than
+# a review item. Reachable by one decisive signal plus corroboration, never by
+# accumulating weak ones.
+SINGLE_RECORD_FLOOR = 6
 
-    The two-leg rule needs both halves of the flow under one correlation id:
-    the victim's interactive authentication and the attacker's polling
-    client. An export of interactive sign-ins alone contains only the first,
-    so every group has one leg, assess() finds nothing to compare, and a real
-    attack produces a clean result.
 
-    This reads the single leg directly. It is deliberately weaker and
-    deliberately quarantined -- the reasons below are suggestive, not
-    attributive, and nothing here ever reaches attacker_ips. Without
-    isInteractive to say which leg is whose, naming an address from one
-    record is the conservatism this module was built to avoid.
+def app_id_of(flat):
+    for key in ("appid", "applicationid", "clientappid"):
+        v = flat.get(key)
+        if v:
+            return str(v).strip().lower()
+    return ""
+
+
+def resource_id_of(flat):
+    for key in ("resourceid", "resourceappid"):
+        v = flat.get(key)
+        if v:
+            return str(v).strip().lower()
+    return ""
+
+
+def is_single_factor(flat):
+    """The authentication satisfied MFA without the user performing it.
+
+    inversecos calls this out twice: "Authentication Requirement:
+    Single-factor authentication (because it was as we used a token)" and
+    "MFA requirement satisfied by claim in the token". Either says the
+    credential presented was already minted, which on a device code flow is
+    the token the victim's authorisation produced.
     """
-    reasons = []
+    req = str(get(flat, "auth_req", "")).strip().lower().replace(" ", "")
+    return req in ("singlefactorauthentication", "singlefactor")
+
+
+def token_claim_satisfied(flat):
+    tok = str(get(flat, "token_type", "")).strip().lower()
+    return bool(tok) and tok not in ("none", "primaryrefreshtoken")
+
+
+def device_code_client_baseline(hits):
+    """Which client ids use device code flow in THIS tenant, and how often.
+
+    A shipped list cannot know that this tenant runs a fleet of Teams Rooms,
+    or that its developers live on Azure CLI. The tenant's own log can. A
+    client that accounts for a meaningful share of device code activity here
+    is normal here whatever it is; one that appears once among hundreds is
+    the outlier worth reading.
+    """
+    counts = Counter()
+    for _src, f in hits:
+        app = app_id_of(f) or str(get(f, "app", "")).strip().lower()
+        if app:
+            counts[app] += 1
+    return counts
+
+
+def assess_single_leg(flat, baseline=None, total=0):
+    """Score one device code record on its own merits.
+
+    Returns (score, reasons). Nothing here attributes by itself -- the caller
+    decides what a score means -- but unlike the previous version this is a
+    first-class detection path rather than a quarantined heuristic, because
+    the single-record shape is what the attack actually produces.
+    """
+    reasons, score = [], 0
+    expected_client = ""
+
+    app = app_id_of(flat)
+    app_name = str(get(flat, "app", "")).strip()
+    if app in _DEVICE_CODE_NEVER:
+        reasons.append("client has no device code use case (%s)"
+                       % _DEVICE_CODE_NEVER[app])
+        score += _NEVER_CLIENT_W
+    elif app and app in _DEVICE_CODE_EXPECTED:
+        # Not merely neutral: suppressing. Azure CLI on a headless box is a
+        # non-browser client, shows as a desktop client, runs without
+        # conditional access and presents a cached token -- four of the
+        # signals below, all of them innocent here. Left neutral it scored 9
+        # on a synthetic corpus and was reported as an attack, which is the
+        # exact false positive this list exists to prevent.
+        expected_client = _DEVICE_CODE_EXPECTED[app]
+    elif baseline and total:
+        seen = baseline.get(app or app_name.lower(), 0)
+        if seen and seen <= max(2, 0.01 * total):
+            reasons.append("client rare for device code in this tenant "
+                           "(%d of %d)" % (seen, total))
+            score += _RARE_CLIENT_W
+
+    if is_single_factor(flat):
+        reasons.append("single-factor: MFA satisfied by a claim, not by the user")
+        score += _SINGLE_FACTOR_W
+    if token_claim_satisfied(flat):
+        reasons.append("presented an existing token (%s)"
+                       % str(get(flat, "token_type", ""))[:24])
+        score += _TOKEN_CLAIM_W
+
+    client_app = str(get(flat, "client_app", "")).strip().lower()
+    if "mobile apps and desktop clients" in client_app:
+        reasons.append("client app: Mobile Apps and Desktop clients")
+        score += _DESKTOP_CLIENT_W
+
     agent = str(get(flat, "user_agent", "") or get(flat, "client_app", "")).lower()
     if agent and any(a in agent for a in _AUTOMATION_AGENTS):
         reasons.append("non-browser client (%s)" % short_agent(flat, 40))
-    if not truthy(get(flat, "interactive", "")) and get(flat, "interactive", "") != "":
-        reasons.append("non-interactive leg")
+        score += _AGENT_W
+
     ca = str(get(flat, "ca_status", "")).strip().lower()
     if ca in ("notapplied", "not applied", "disabled"):
         reasons.append("conditional access not applied")
+        score += _CA_W
+
     if succeeded(flat):
         reasons.append("token issued")
-    return reasons
+        score += _SUCCESS_W
+
+    res = resource_id_of(flat)
+    if res in _RESOURCE_NAMES:
+        reasons.append("resource: %s" % _RESOURCE_NAMES[res])
+
+    if expected_client:
+        # Held below the reporting floor. It stays in the review list with its
+        # reasons intact, so nothing is hidden -- it simply cannot be called
+        # an indicated attack on signals that are normal for this client.
+        score = min(score, SINGLE_RECORD_FLOOR - 1)
+        reasons.insert(0, "device code is routine for this client (%s)"
+                       % expected_client)
+
+    return score, reasons
 
 
-def _single_leg_findings(buckets, victim_ips, limit=50):
-    """Suspicious lone legs, ranked, never attributed."""
+def _single_leg_findings(buckets, victim_ips, hits=(), limit=50):
+    """Device code records scored individually, ranked, split by confidence."""
+    baseline = device_code_client_baseline(hits)
+    total = sum(baseline.values())
+
     out = []
     for cid, legs in buckets.items():
         if len(legs) != 1:
@@ -399,14 +556,16 @@ def _single_leg_findings(buckets, victim_ips, limit=50):
         ip = str(get(f, "ip", ""))
         if ip and ip in victim_ips:
             continue          # the account signs in interactively from here
-        reasons = assess_single_leg(f)
-        if len(reasons) < 2:
-            continue          # one weak reason is noise, not a finding
+        score, reasons = assess_single_leg(f, baseline, total)
+        if score < 3:
+            continue
         row = _leg_row(f)
-        row.update({"correlation": cid, "reasons": reasons,
+        row.update({"correlation": cid, "reasons": reasons, "score": score,
+                    "indicated": score >= SINGLE_RECORD_FLOOR,
+                    "app_id": app_id_of(f),
                     "user": str(get(f, "user", "")) or "(unknown)"})
         out.append(row)
-    out.sort(key=lambda r: (-len(r["reasons"]), r.get("time") or ""))
+    out.sort(key=lambda r: (-r["score"], r.get("time") or ""))
     return out[:limit]
 
 
@@ -514,7 +673,7 @@ def analyze_signin_logs(path):
     dated = [e["_dt"] for e in token_events if e["_dt"]]
     earliest = min(dated) if dated else None
 
-    single_leg = _single_leg_findings(buckets, victim_ips)
+    single_leg = _single_leg_findings(buckets, victim_ips, hits)
 
     times = sorted(str(get(f, "time", "")) for _s, f in records
                    if get(f, "time", ""))
@@ -538,20 +697,30 @@ def analyze_signin_logs(path):
     if hits and len(singles) >= 0.8 * max(1, len(buckets)):
         warnings.append(
             "%d of %d device code correlation groups contain a single leg. "
-            "Detection compares the victim's interactive authentication with "
-            "the attacker's polling client under one correlation id, so a "
-            "one-leg group cannot be assessed at all. This is the shape an "
-            "export of INTERACTIVE sign-ins only produces: the polling leg is "
-            "non-interactive and was never collected. Re-export including "
-            "non-interactive sign-ins (Get-GraphEntraSignInLogs collects "
-            "both) -- a clean result from this export is not a negative. "
-            "Entra retains 30 days and expiry is not retroactive."
+            "That is not necessarily a collection gap: Entra records the "
+            "sign-in where the authentication was INITIATED, so a phished "
+            "flow can produce one record carrying the attacker's address and "
+            "no second leg to compare it against. Those records are scored "
+            "individually below rather than reported as nothing. If the "
+            "export was interactive-only, re-exporting with non-interactive "
+            "sign-ins included adds the polling leg and strengthens the "
+            "result -- Entra retains 30 days, and expiry is not retroactive."
             % (len(singles), len(buckets)))
     elif hits and not attacker_ips and not unattributed:
         warnings.append(
             "Device code sign-ins are present but none shows a location split, "
             "so no attacker address was derived. A residential proxy in the "
             "victim's own country produces exactly this picture.")
+    _indicated = [r for r in single_leg if r["indicated"]]
+    if _indicated:
+        warnings.append(
+            "%d device code sign-in(s) match the published single-record "
+            "profile for device code phishing (a client with no device code "
+            "use case, or MFA satisfied by a claim rather than by the user). "
+            "These are individually assessed, not corroborated by a location "
+            "split, so they are an indication rather than a confirmation."
+            % len(_indicated))
+
     if hits and not attacker_ips and successes:
         warnings.append(
             "%d of %d device code sign-in(s) succeeded, but none is attributed "
@@ -590,11 +759,118 @@ def analyze_signin_logs(path):
         "token_events": token_events,
         "tokens_issued": len(token_events),
         "device_code_successes": successes,
+        # Every address that authenticated at all, device code or not. The
+        # token-replay test needs the full set, not the device code subset.
+        "all_signin_ips": sorted({str(get(f, "ip", "")) for _s, f in records
+                                  if get(f, "ip", "")}),
         "single_leg_findings": single_leg,
         "single_leg_count": len(single_leg),
+        "indicated_count": sum(1 for r in single_leg if r["indicated"]),
         "earliest_token": earliest.strftime("%Y-%m-%dT%H:%M:%SZ") if earliest else "",
         "_earliest_token_dt": earliest,
         "warnings": warnings,
+    }
+
+
+# Mailbox operations are the only record left when a refresh token is used:
+# "access tokens acquired using the refresh token do not appear in sign-in
+# log" (aadinternals). One device code authorisation yields a refresh token
+# to a family-of-client-IDs member, which redeems silently for Exchange,
+# SharePoint and Graph -- Syynimaa's own timeline logs a sign-in at 07:23 and
+# nothing at all for the Exchange access at 07:27.
+#
+# So the sign-in log structurally undercounts, and the gap is itself the
+# evidence: an address performing mailbox operations that never authenticated
+# is holding a token it did not obtain here.
+
+# Operations that need a token. A message trace or a service-side event can
+# carry an address that never signed in for ordinary reasons, so the test is
+# scoped to things a client does with a credential in hand.
+_TOKEN_BEARING_OPS = {
+    "mailitemsaccessed", "messagebind", "send", "sendas", "sendonbehalf",
+    "harddelete", "softdelete", "movetodeleteditems", "movetofolder", "move",
+    "update", "create", "new-inboxrule", "set-inboxrule", "updateinboxrules",
+    "add-mailboxpermission", "set-mailbox",
+}
+
+
+def find_token_replay(signin_summary, audit_summary, min_events=3):
+    """Addresses that acted on a mailbox without ever authenticating here.
+
+    Requires the sign-in export to cover the audit window. If it does not,
+    every audit address looks unauthenticated and the finding is meaningless
+    -- so coverage is checked first and the result says so rather than
+    inventing a list.
+    """
+    s, a = signin_summary or {}, audit_summary or {}
+    if not s.get("available") or not a:
+        return {"assessed": False,
+                "reason": "Needs both a sign-in log and an audit log."}
+
+    activity = a.get("ip_activity") or []
+    if not activity:
+        return {"assessed": False,
+                "reason": "The audit log yielded no per-address activity."}
+
+    cov = s.get("coverage") or {}
+    first, last = cov.get("first_event", ""), cov.get("last_event", "")
+    # coverage renders its stamps with a space separator; the audit log keeps
+    # the ISO "T". Comparing them as strings put every audit row outside the
+    # window, because " " sorts below "T" at the tenth character -- the test
+    # silently excluded everything it was meant to assess.
+    win_first, win_last = parse_time(first), parse_time(last)
+    if not (first and last):
+        return {"assessed": False,
+                "reason": "The sign-in export does not state its own window, "
+                          "so it cannot be compared against the audit log."}
+
+    authenticated = {str(ip) for ip in (s.get("all_signin_ips") or ())}
+    if not authenticated:
+        return {"assessed": False,
+                "reason": "No addresses were read from the sign-in export."}
+
+    replay, outside = [], 0
+    for row in activity:
+        ip = str(row.get("ip") or "")
+        if not ip or ip in authenticated:
+            continue
+        ops = {str(k).lower().replace(" ", "") for k, _n in (row.get("operations") or [])}
+        if not (ops & _TOKEN_BEARING_OPS):
+            continue
+        if int(row.get("events") or 0) < min_events:
+            continue
+        # Only claim it for activity the sign-in export actually covers.
+        rf = str(row.get("first_seen") or "")
+        rl = str(row.get("last_seen") or "")
+        d_first, d_last = parse_time(rf), parse_time(rl)
+        if win_first and win_last and (d_first or d_last):
+            ends_before = bool(d_last and d_last < win_first)
+            starts_after = bool(d_first and d_first > win_last)
+            if ends_before or starts_after:
+                outside += 1
+                continue
+        replay.append({
+            "ip": ip, "events": row.get("events"),
+            "users": row.get("users"), "first": rf, "last": rl,
+            "is_attacker": bool(row.get("is_attacker")),
+            "country": row.get("country", ""), "asn": row.get("asn", ""),
+            "operations": (row.get("operations") or [])[:6],
+        })
+
+    replay.sort(key=lambda r: -(r["events"] or 0))
+    return {
+        "assessed": True,
+        "signin_window": [first, last],
+        "authenticated_ips": len(authenticated),
+        "replay": replay,
+        "replay_count": len(replay),
+        "outside_window": outside,
+        "note": ("Each address below performed mailbox operations inside the "
+                 "sign-in log's own window without any authentication being "
+                 "recorded for it. A token obtained by refreshing an earlier "
+                 "one leaves exactly this trace: the access happens, and "
+                 "Entra logs nothing. Addresses whose activity falls outside "
+                 "the sign-in window are excluded rather than claimed."),
     }
 
 
