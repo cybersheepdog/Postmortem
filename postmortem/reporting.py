@@ -641,8 +641,40 @@ def print_audit_summary(audit: dict, warnings=None):
                 bits.append("deletes matching mail")
             if r.get("keywords"):
                 bits.append("keywords: " + ", ".join(r["keywords"]))
-            print(f"    {r.get('time', ''):20} {r.get('operation', '')} "
-                  f"from {r.get('client_ip', '?')} - {'; '.join(bits)}")
+            if r.get("mark_as_read"):
+                bits.append("marks as read")
+            if r.get("stop_processing"):
+                bits.append("stops other rules")
+            name = r.get("name") or ""
+            head = (f"    {r.get('time', ''):20} {r.get('operation', '')} "
+                    f"from {r.get('client_ip', '?')}")
+            if name:
+                head += f"  name={name!r}"
+            line = head + f" - {'; '.join(bits)}"
+            print(term.c(line, "red") if r.get("name_tells") else line)
+            for tell in r.get("name_tells") or []:
+                print(term.c(f"        ^ {tell}", "red", "bold"))
+
+    cu = audit.get("rule_cleanup") or {}
+    if cu.get("removed") or cu.get("created_then_gone"):
+        print()
+        print(term.c("  Rule cleanup:", "red", "bold"))
+        for r in (cu.get("removed") or [])[:8]:
+            tag = "  (attacker address)" if r.get("by_attacker") else ""
+            back = "  <- created earlier in this log" if r.get("created_earlier") else ""
+            print(term.c(f"    {r['time'][:19]:<20} {r['operation']:<20} "
+                         f"{r['name']!r}{tag}{back}", "red" if r.get("by_attacker") else "white"))
+        for r in (cu.get("created_then_gone") or [])[:8]:
+            tag = "  (attacker address)" if r.get("by_attacker") else ""
+            how = ("removal logged" if r.get("removal_logged")
+                   else "removal NOT in the log")
+            print(term.c(f"    {r['time'][:19]:<20} {'created, now absent':<20} "
+                         f"{r['name']!r}{tag}  [{how}]",
+                         "red" if r.get("by_attacker") else "white"))
+        if not cu.get("config_checked"):
+            print("    " + _wrap_indent(
+                "No Get-MailboxRules export supplied, so rules created in the "
+                "log cannot be checked against what exists now.", 4))
 
     fwd = audit.get("forwarding_rules", [])
     if fwd:

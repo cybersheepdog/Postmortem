@@ -30,6 +30,21 @@ _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[0-9A-Fa-f:]{3,}:[0-9A-Fa-f:
 
 # Inbox-rule / forwarding operations that establish attacker persistence.
 _RULE_OPS = {"new-inboxrule", "set-inboxrule", "updateinboxrules", "set-mailbox"}
+
+# Cleanup. A rule that was created and then removed or disabled inside the
+# window was used and tidied away -- stronger evidence than one still there,
+# and invisible to a check that only reads the current configuration.
+_RULE_CLEANUP_OPS = {"remove-inboxrule", "disable-inboxrule"}
+
+# Rule names attackers actually use. Ten years of these and the name is the
+# single most damning artefact more often than the action: a rule called "."
+# or "," or " " is there to be overlooked in the Outlook rules dialog, and one
+# named after the victim's own existing rule is there to be mistaken for it.
+_THROWAWAY_RULE_NAMES = {".", "..", "...", ",", ";", ":", "-", "_", "*", "a",
+                         "aa", "1", "11", "x", "xx", "z", "s", "rule", "new rule",
+                         "test", "temp", "1111", "asdf", "qwe"}
+_RULE_NAME_LEGIT_HINTS = ("junk", "spam", "newsletter", "archive", "cleanup",
+                          "clean up", "move", "filter")
 _LOGIN_OPS = {"userloggedin"}
 
 # SharePoint and OneDrive. These carry no InternetMessageId, so they never
@@ -255,6 +270,27 @@ def _rule_findings(event):
         "from": "from",
         "fromaddress": "from",
     }
+    rule_name = str(params.get("name") or params.get("identity") or "").strip()
+    mark_read = str(params.get("markasread") or "").lower() in ("true", "1")
+    stop_processing = str(params.get("stopprocessingrules") or "").lower() \
+        in ("true", "1")
+
+    # Why the NAME looks wrong, on its own. Reported as a separate list from
+    # the action so a reader can see that a rule which merely moves mail to
+    # Archive was called "." -- the action alone would not have flagged it.
+    name_tells = []
+    low = rule_name.lower()
+    if rule_name and low in _THROWAWAY_RULE_NAMES:
+        name_tells.append("throwaway name %r" % rule_name)
+    elif rule_name and len(rule_name) <= 2 and not rule_name.isalnum():
+        name_tells.append("punctuation-only name %r" % rule_name)
+    elif rule_name and rule_name != rule_name.strip():
+        name_tells.append("name padded with whitespace")
+    elif rule_name and not rule_name.strip():
+        name_tells.append("whitespace-only name")
+    elif rule_name and len(rule_name) == 1:
+        name_tells.append("single-character name %r" % rule_name)
+
     for name, value in params.items():
         if name in _FORWARD_PARAMS and value:
             # "smtp:exfil@evil.example" is the usual Set-Mailbox form.
@@ -281,12 +317,23 @@ def _rule_findings(event):
     keywords = list(dict.fromkeys(keywords))
     conditions = {k: list(dict.fromkeys(v)) for k, v in conditions.items() if v}
     hides = delete or any(h in move_to.lower() for h in _HIDDEN_FOLDERS)
-    suspicious = bool(forwards or hides or keywords)
+    # MarkAsRead on its own is how an attacker's reply lands already read, so
+    # the victim never notices a new message; StopProcessingRules put first
+    # is how the victim's own filing rules are kept off the hijacked thread.
+    # Either makes an otherwise-innocent rule worth a look; either plus a
+    # throwaway name is not innocent.
+    quiet = mark_read or stop_processing
+    suspicious = bool(forwards or hides or keywords or name_tells
+                      or (quiet and (move_to or keywords)))
     return {
         "forwards": forwards, "keywords": keywords, "move_to": move_to,
         "conditions": conditions,
         "delete": delete, "suspicious": suspicious, "keeps_copy": keeps_copy,
         "mailbox_level": bool(forwards) and event["op_lower"] == "set-mailbox",
+        "name": rule_name,
+        "name_tells": name_tells,
+        "mark_as_read": mark_read,
+        "stop_processing": stop_processing,
     }
 
 
@@ -933,9 +980,71 @@ def coverage_warnings(audit_summary, corpus_first=None, corpus_last=None,
     return out
 
 
+def rule_cleanup(events, attacker_ips, current_rules=None):
+    """Rules that were removed or disabled -- and rules that no longer exist.
+
+    Two things, both invisible to a check of the current configuration:
+
+    A Remove-InboxRule or Disable-InboxRule inside the window is the attacker
+    tidying up after use. It carries the rule's name, so it can be matched
+    back to the New-InboxRule that created it.
+
+    A New-InboxRule whose name is absent from Get-MailboxRules was created
+    AND removed, whether or not the removal was logged. That is stronger
+    evidence than a rule still present: nobody removes a rule they want.
+    """
+    attacker_ips = set(attacker_ips or ())
+    created, removed = {}, []
+    for e in events:
+        op = e["op_lower"]
+        params = _params_to_dict(e["audit"])
+        name = str(params.get("name") or params.get("identity") or "").strip()
+        if op == "new-inboxrule" and name:
+            created.setdefault(name.lower(), []).append({
+                "name": name,
+                "time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
+                if e["timestamp"] else "",
+                "client_ip": e["client_ip"], "user": e["user"],
+                "by_attacker": e["client_ip"] in attacker_ips,
+            })
+        elif op in _RULE_CLEANUP_OPS:
+            removed.append({
+                "name": name or "(unnamed)",
+                "operation": e["operation"],
+                "time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
+                if e["timestamp"] else "",
+                "client_ip": e["client_ip"], "user": e["user"],
+                "by_attacker": e["client_ip"] in attacker_ips,
+                "created_earlier": name.lower() in created if name else False,
+            })
+
+    # Created in the log, absent from the configuration export now.
+    gone = []
+    if current_rules is not None:
+        present = {str(r.get("name") or "").strip().lower()
+                   for r in current_rules if r.get("name")}
+        for key, evs in created.items():
+            if key and key not in present:
+                first = evs[0]
+                gone.append({**first, "creations": len(evs),
+                             "removal_logged": any(
+                                 r["name"].lower() == key for r in removed)})
+
+    gone.sort(key=lambda r: (not r["by_attacker"], r["time"]))
+    removed.sort(key=lambda r: (not r["by_attacker"], r["time"]))
+    return {
+        "available": bool(created or removed),
+        "config_checked": current_rules is not None,
+        "removed": removed,
+        "removed_by_attacker": sum(1 for r in removed if r["by_attacker"]),
+        "created_then_gone": gone,
+        "gone_by_attacker": sum(1 for r in gone if r["by_attacker"]),
+    }
+
+
 def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
                       attacker_subjects=(), containment_dt=None,
-                      known_delegates=(), owner_ips=()):
+                      known_delegates=(), owner_ips=(), current_rules=None):
     """Parse a UAL export and derive anchors + confirmed attacker events.
 
     Returns a summary dict with `derived` anchors and human-readable findings,
@@ -994,6 +1103,10 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
                 "conditions": f["conditions"],
                 "keeps_copy": f["keeps_copy"],
                 "mailbox_level": f["mailbox_level"],
+                "name": f["name"],
+                "name_tells": f["name_tells"],
+                "mark_as_read": f["mark_as_read"],
+                "stop_processing": f["stop_processing"],
             }
             (forwarding if (f["forwards"] and not f["keywords"] and not f["delete"] and not f["move_to"])
              else malicious_rules).append(entry)
@@ -1109,6 +1222,7 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
             x["operation"] for x in attacker_operations).most_common(),
         "ip_activity": _ip_activity(events, attacker_ips),
         "sessions": session_activity(events, attacker_ips, compromise_dt),
+        "rule_cleanup": rule_cleanup(events, attacker_ips, current_rules),
         "access_profile": access_profile(events, attacker_ips),
         "file_activity": file_activity(events, attacker_ips, compromise_dt),
         "delegate_access": delegate_access(events, known_delegates,

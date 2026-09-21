@@ -6626,3 +6626,128 @@ def test_attacker_sessions_sort_first(tmp_path):
                    when="2026-08-27T10:00:00")]
     s = analyze_audit_log(_audit_file(tmp_path, rows))["sessions"]
     assert s["sessions"][0]["session_id"] == "sess-atk"
+
+
+# --------------------------------------------------------------------------
+# Rule tells. The name is the single most damning artefact more often than
+# the action: "." is there to be overlooked in the rules dialog. MarkAsRead
+# is how the attacker's reply lands already read; StopProcessingRules put
+# first is how the owner's own filing never fires on the hijacked thread.
+# And a rule removed after use is stronger evidence than one still there.
+# --------------------------------------------------------------------------
+def _named_rule(ip, name, when="2026-08-27T09:00:00", op="New-InboxRule", **extra):
+    params = [{"Name": "Name", "Value": name}]
+    for k, v in extra.items():
+        params.append({"Name": k, "Value": v})
+    return _uev(op, ip, when=when, Parameters=params)
+
+
+def test_a_throwaway_rule_name_is_flagged_even_when_the_action_is_bland(tmp_path):
+    # Moves to Archive. Nothing in the action alone would flag it. The name is
+    # the whole finding.
+    from postmortem.auditlog import analyze_audit_log
+
+    out = analyze_audit_log(_audit_file(tmp_path, [
+        _named_rule(UAL_ATK, ".", MoveToFolder="Archive")]))
+    rules = out["malicious_rules"]
+    assert len(rules) == 1
+    assert rules[0]["name"] == "."
+    assert any("throwaway" in t for t in rules[0]["name_tells"])
+    assert UAL_ATK in out["derived"]["attacker_ips"]
+
+
+def test_a_normal_rule_name_is_not_a_tell(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    out = analyze_audit_log(_audit_file(tmp_path, [
+        _named_rule("203.0.113.10", "Newsletters to Archive",
+                    MoveToFolder="Archive")]))
+    # moves to Archive -> still reported as concealment, but no name tell
+    rules = out["malicious_rules"]
+    assert rules and rules[0]["name_tells"] == []
+
+
+def test_mark_as_read_and_stop_processing_are_carried(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    out = analyze_audit_log(_audit_file(tmp_path, [
+        _named_rule(UAL_ATK, "Invoices", SubjectContainsWords="invoice",
+                    MarkAsRead="True", StopProcessingRules="True",
+                    MoveToFolder="RSS Feeds")]))
+    r = out["malicious_rules"][0]
+    assert r["mark_as_read"] is True and r["stop_processing"] is True
+
+
+def test_quiet_flags_alone_make_a_bland_move_worth_a_look(tmp_path):
+    # A rule that moves to an ordinary folder is not suspicious. The same rule
+    # that also marks as read and stops other rules is.
+    from postmortem.auditlog import analyze_audit_log
+
+    bland = analyze_audit_log(_audit_file(tmp_path, [
+        _named_rule("203.0.113.10", "Filing", MoveToFolder="Projects")], "a.json"))
+    assert bland["malicious_rules"] == []
+    quiet = analyze_audit_log(_audit_file(tmp_path, [
+        _named_rule("203.0.113.10", "Filing", MoveToFolder="Projects",
+                    MarkAsRead="True", StopProcessingRules="True")], "b.json"))
+    assert len(quiet["malicious_rules"]) == 1
+
+
+def test_a_rule_removed_after_use_is_cleanup(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    out = analyze_audit_log(_audit_file(tmp_path, [
+        _named_rule(UAL_ATK, ".", when="2026-08-27T09:00:00", DeleteMessage="True",
+                    SubjectContainsWords="invoice"),
+        _named_rule(UAL_ATK, ".", when="2026-08-27T15:00:00", op="Remove-InboxRule"),
+    ]))
+    cu = out["rule_cleanup"]
+    assert cu["available"]
+    assert cu["removed_by_attacker"] == 1
+    assert cu["removed"][0]["created_earlier"] is True
+
+
+def test_a_rule_created_in_the_log_but_absent_now_was_removed(tmp_path):
+    # Whether or not the removal was logged. Nobody removes a rule they want.
+    from postmortem.auditlog import analyze_audit_log
+
+    out = analyze_audit_log(
+        _audit_file(tmp_path, [
+            _named_rule(UAL_ATK, ",", DeleteMessage="True",
+                        SubjectContainsWords="wire"),
+            _named_rule("203.0.113.10", "Newsletters", MoveToFolder="Archive")]),
+        current_rules=[{"name": "Newsletters"}])   # "," is not there any more
+    cu = out["rule_cleanup"]
+    assert cu["config_checked"] is True
+    gone = cu["created_then_gone"]
+    assert [g["name"] for g in gone] == [","]
+    assert gone[0]["by_attacker"] is True
+    assert gone[0]["removal_logged"] is False
+
+
+def test_without_a_rules_export_gone_cannot_be_claimed(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    out = analyze_audit_log(_audit_file(tmp_path, [
+        _named_rule(UAL_ATK, ".", DeleteMessage="True", SubjectContainsWords="x")]))
+    assert out["rule_cleanup"]["config_checked"] is False
+    assert out["rule_cleanup"]["created_then_gone"] == []
+
+
+def test_a_removed_rule_gets_its_own_remediation_row(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+    from postmortem.persistence import remediation_plan
+
+    out = analyze_audit_log(
+        _audit_file(tmp_path, [
+            _named_rule(UAL_ATK, ".", DeleteMessage="True",
+                        SubjectContainsWords="wire")]),
+        current_rules=[])
+    acts = remediation_plan(None, out)
+    kinds = [a["kind"] for a in acts]
+    assert "inbox_rule_removed" in kinds
+    row = next(a for a in acts if a["kind"] == "inbox_rule_removed")
+    assert "Nothing to remove" in row["action"]
+    assert "NOT in the audit log" in row["not_fixed_by"]
+    # and the live rule row carries the name tell
+    live = next(a for a in acts if a["kind"] == "inbox_rule")
+    assert "throwaway" in live["detail"]

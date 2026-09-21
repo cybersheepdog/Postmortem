@@ -909,18 +909,55 @@ def remediation_plan(persistence, audit_summary=None, drift=None):
     audit = audit_summary or {}
     for rule in (audit.get("malicious_rules") or []):
         fix, nofix = _REMEDIATION["inbox_rule"]
+        name = rule.get("name") or ""
+        tells = rule.get("name_tells") or []
+        detail = ""
+        if tells:
+            detail = "Rule name %r: %s." % (name, "; ".join(tells))
+        elif name:
+            detail = "Rule name %r." % name
         actions.append({
             "kind": "inbox_rule",
             "target": "%s on %s" % (
-                ", ".join(rule.get("keywords") or []) or "rule",
+                (repr(name) + " " if name else "")
+                + (", ".join(rule.get("keywords") or []) or "rule"),
                 rule.get("user", "")),
             "when": rule.get("time", ""), "by_attacker": True,
             "attribution": "created from %s" % (rule.get("client_ip") or "?"),
             "grants": "Incoming mail is hidden or destroyed before the owner "
-                      "sees it.",
-            "action": fix, "not_fixed_by": nofix, "detail": "",
+                      "sees it."
+                      + (" Marked as read, so nothing looks new."
+                         if rule.get("mark_as_read") else "")
+                      + (" Stops other rules, so the owner's own filing "
+                         "never fires." if rule.get("stop_processing") else ""),
+            "action": fix, "not_fixed_by": nofix, "detail": detail,
             "survives_password_reset": "survives",
             "survives_token_revocation": "survives",
+        })
+    for gone in ((audit.get("rule_cleanup") or {}).get("created_then_gone") or []):
+        if not gone.get("by_attacker"):
+            continue
+        actions.append({
+            "kind": "inbox_rule_removed",
+            "target": "%s on %s" % (repr(gone.get("name") or "rule"),
+                                    gone.get("user", "")),
+            "when": gone.get("time", ""), "by_attacker": True,
+            "attribution": "created from %s, no longer present"
+                           % (gone.get("client_ip") or "?"),
+            "grants": "A rule was created and then removed. Nobody removes a "
+                      "rule they want; it was used and tidied away, and the "
+                      "mail it acted on in between is what to look for.",
+            "action": "Nothing to remove. Establish what the rule did while it "
+                      "existed: search the audit log for MoveToFolder / "
+                      "HardDelete between its creation and its removal, and "
+                      "check Recoverable Items for what it destroyed.",
+            "not_fixed_by": "" if gone.get("removal_logged") else
+                            "The removal itself is NOT in the audit log, which "
+                            "means it happened outside the log window or the "
+                            "removal event was not captured.",
+            "detail": "",
+            "survives_password_reset": "no",
+            "survives_token_revocation": "no",
         })
     for fwd in (audit.get("forwarding_rules") or []):
         fix, nofix = _REMEDIATION["forwarding"]

@@ -1978,6 +1978,12 @@ def main():
         getattr(args, "containment_date", "") or "")
     # Who legitimately holds delegation, from the permissions export when
     # --mes-dir found one. A delegate read by anyone else is flagged.
+    # The rules as they exist NOW. A New-InboxRule in the log whose name is
+    # not here was created and removed.
+    _current_rules = None
+    if mes_bundle and (mes_bundle.get('sources') or {}).get('mailbox_rules') is not None:
+        _current_rules = mes_bundle['sources']['mailbox_rules']
+
     _known_delegates = []
     if mes_bundle and (mes_bundle.get('sources') or {}).get('mailbox_permissions'):
         _known_delegates = sorted({
@@ -2008,6 +2014,7 @@ def main():
                 containment_dt=_containment_dt,
                 known_delegates=_known_delegates,
                 owner_ips=(signin_summary or {}).get('owner_ips', ()),
+                current_rules=_current_rules,
             )
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"[!] Could not parse audit log {_audit_path}: {exc}",
@@ -2043,6 +2050,7 @@ def main():
                             containment_dt=_containment_dt,
                             known_delegates=_known_delegates,
                             owner_ips=signin_summary.get('owner_ips', ()),
+                            current_rules=_current_rules,
                         )
                         audit_summary['attacker_ips_from_replay'] = sorted(_replay)
                     except Exception as exc:  # noqa: BLE001 - keep the first

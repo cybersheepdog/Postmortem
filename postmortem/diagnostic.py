@@ -416,6 +416,18 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "sessions": {
                 k: v for k, v in (audit_summary.get("sessions") or {}).items()
                 if isinstance(v, (int, bool))},
+            "rules_with_name_tells": sum(
+                1 for r in (audit_summary.get("malicious_rules") or [])
+                if r.get("name_tells")),
+            "rules_mark_as_read": sum(
+                1 for r in (audit_summary.get("malicious_rules") or [])
+                if r.get("mark_as_read")),
+            "rules_stop_processing": sum(
+                1 for r in (audit_summary.get("malicious_rules") or [])
+                if r.get("stop_processing")),
+            "rule_cleanup": {
+                k: v for k, v in (audit_summary.get("rule_cleanup") or {}).items()
+                if isinstance(v, (int, bool))},
             "attacker_ips_from_session": len(
                 (audit_summary.get("derived") or {}).get(
                     "attacker_ips_from_session") or []),
