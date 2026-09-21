@@ -424,6 +424,9 @@ def build(records, verdict=None, audit_summary=None, manifest=None,
             "sessions": {
                 k: v for k, v in (audit_summary.get("sessions") or {}).items()
                 if isinstance(v, (int, bool))},
+            "searches": {
+                k: v for k, v in (audit_summary.get("searches") or {}).items()
+                if isinstance(v, (int, bool))},
             "rules_with_name_tells": sum(
                 1 for r in (audit_summary.get("malicious_rules") or [])
                 if r.get("name_tells")),

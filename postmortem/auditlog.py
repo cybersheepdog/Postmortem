@@ -685,6 +685,75 @@ def delegate_access(events, known_delegates=(), attacker_ips=()):
     }
 
 
+# --------------------------------------------------------------------------
+# What the attacker searched for
+#
+# SearchQueryInitiated (Exchange, E5) records the text a user typed into the
+# mailbox search box. From an attacker address it is intent, verbatim: no
+# other artefact says what they were LOOKING FOR rather than what they
+# happened to open. "wire", "W-2", "routing number", "invoice", the CFO's
+# name -- the search history is the attacker's own statement of purpose.
+# --------------------------------------------------------------------------
+_SEARCH_OPS = {"searchqueryinitiated", "searchqueryinitiatedexchange",
+               "searchqueryinitiatedsharepoint"}
+
+# Terms that, searched for, say the purpose was money or identity theft.
+# Not scored -- a search is reported whatever it says -- but these decide
+# which searches lead the list.
+_SEARCH_INTENT = (
+    "wire", "swift", "iban", "routing", "aba", "ach", "remit", "remittance",
+    "invoice", "payment", "bank", "account number", "w-2", "w2", "1099",
+    "payroll", "direct deposit", "ssn", "social security", "passport",
+    "password", "credential", "vpn", "mfa", "authenticator", "cfo", "ceo",
+    "controller", "treasurer", "wire instructions", "beneficiary",
+)
+
+
+def search_queries(events, attacker_ips, compromise_dt=None, limit=60):
+    """Mailbox searches, attacker ones first, intent-bearing ones on top."""
+    attacker_ips = set(attacker_ips or ())
+    rows = []
+    for e in events:
+        if e["op_lower"] not in _SEARCH_OPS:
+            continue
+        ad = e["audit"]
+        text = str(ad.get("QueryText") or ad.get("SearchQuery")
+                   or ad.get("Query") or "").strip()
+        if not text:
+            # Some exports bury it in OperationProperties.
+            for prop in (ad.get("OperationProperties") or []):
+                if isinstance(prop, dict) and str(prop.get("Name", "")).lower() \
+                        in ("querytext", "searchquery", "query"):
+                    text = str(prop.get("Value") or "").strip()
+                    break
+        if not text:
+            continue
+        low = text.lower()
+        intent = [w for w in _SEARCH_INTENT if w in low]
+        ts = e["timestamp"]
+        rows.append({
+            "time": ts.strftime("%Y-%m-%dT%H:%M:%SZ") if ts else "",
+            "user": e["user"], "client_ip": e["client_ip"],
+            "session_id": e.get("session_id", ""),
+            "query": text[:160],
+            "intent": intent,
+            "by_attacker": bool(e["client_ip"] and e["client_ip"] in attacker_ips),
+            "post_compromise": bool(ts and compromise_dt and ts >= compromise_dt),
+            "workload": e.get("workload", ""),
+        })
+    rows.sort(key=lambda r: (not r["by_attacker"], not bool(r["intent"]),
+                             not r["post_compromise"], r["time"]))
+    atk = [r for r in rows if r["by_attacker"]]
+    return {
+        "available": bool(rows),
+        "total": len(rows),
+        "attacker_searches": len(atk),
+        "attacker_intent": sum(1 for r in atk if r["intent"]),
+        "terms": Counter(w for r in atk for w in r["intent"]).most_common(10),
+        "searches": rows[:limit],
+    }
+
+
 def session_ips(events, attacker_ips, owner_ips=()):
     """Every address that shares an authenticated session with an attacker one.
 
@@ -1231,6 +1300,7 @@ def analyze_audit_log(path, extra_attacker_ips=(), anchor_dt=None,
                              if containment_dt else ""),
         "response_events": response_events,
         "owner_vetoed_ips": owner_vetoed,
+        "searches": search_queries(events, attacker_ips, compromise_dt),
         "audit_disabled_events": [
             {"time": e["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
              if e["timestamp"] else "",

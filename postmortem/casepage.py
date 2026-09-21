@@ -230,6 +230,10 @@ def _exposed(v):
         detail += " Exchange stopped logging after ~1,000 accesses in a day; " \
                   "from that point the honest scope is everything the session " \
                   "could reach."
+    sq = (v.get("audit_log") or {}).get("searches") or {}
+    if sq.get("attacker_intent"):
+        terms = ", ".join(w for w, _n in (sq.get("terms") or [])[:4])
+        detail += " The attacker searched the mailbox for: %s." % terms
     return _a("What was exposed", ans, OBSERVED, detail, hit=True)
 
 

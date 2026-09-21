@@ -7209,3 +7209,62 @@ def test_remediation_actions_carry_existence_and_attribution_grades(tmp_path):
     assert live["attribution_grade"] == "observed"     # "created from <address>"
     gone = acts["inbox_rule_removed"]
     assert gone["provenance"] == "inferred"            # known only by absence
+
+
+# --------------------------------------------------------------------------
+# SearchQueryInitiated: the attacker typing into the mailbox search box.
+# Intent, verbatim -- every other artefact says what they opened, this says
+# what they were looking for.
+# --------------------------------------------------------------------------
+def _search(ip, query, when="2026-08-27T10:00:00", user="ap@acme.com"):
+    return _uev("SearchQueryInitiated", ip, when=when, user=user,
+                QueryText=query, Workload="Exchange")
+
+
+def test_attacker_searches_are_extracted_with_intent_terms(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _search(UAL_ATK, "wire instructions", when="2026-08-27T10:01:00"),
+            _search(UAL_ATK, "W-2 2025", when="2026-08-27T10:02:00"),
+            _search(UAL_ATK, "lunch", when="2026-08-27T10:03:00"),
+            _search(UAL_OWNER, "invoice 4471", when="2026-08-27T11:00:00")]
+    s = analyze_audit_log(_audit_file(tmp_path, rows))["searches"]
+    assert s["available"] and s["total"] == 4
+    assert s["attacker_searches"] == 3 and s["attacker_intent"] == 2
+    top = s["searches"][0]
+    assert top["by_attacker"] and top["intent"]
+    assert dict(s["terms"]).get("wire") == 1
+    # the owner's own search is listed but not attributed
+    owner = [r for r in s["searches"] if r["client_ip"] == UAL_OWNER][0]
+    assert owner["by_attacker"] is False
+
+
+def test_the_query_is_found_in_operation_properties_too(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    rows = [_urule(UAL_ATK),
+            _uev("SearchQueryInitiated", UAL_ATK,
+                 OperationProperties=[{"Name": "QueryText", "Value": "routing number"}])]
+    s = analyze_audit_log(_audit_file(tmp_path, rows))["searches"]
+    assert s["attacker_searches"] == 1
+    assert "routing" in s["searches"][0]["intent"]
+
+
+def test_no_searches_in_the_log_is_unavailable_not_zero(tmp_path):
+    from postmortem.auditlog import analyze_audit_log
+
+    s = analyze_audit_log(_audit_file(tmp_path, [_urule(UAL_ATK)]))["searches"]
+    assert s["available"] is False
+
+
+def test_searches_sharpen_what_was_exposed_on_the_case_page(tmp_path):
+    from postmortem.casepage import case_answers
+
+    v = {"exposure_scope": {"available": True, "messages_read": 40,
+                            "read_by_sync": 0, "read_by_bind": 40,
+                            "read_with_attachments": 3},
+         "audit_log": {"searches": {"attacker_intent": 2,
+                                    "terms": [("wire", 2), ("w-2", 1)]}}}
+    a = {x["question"]: x for x in case_answers(v, [], None)}["What was exposed"]
+    assert "searched the mailbox for: wire, w-2" in a["detail"]
